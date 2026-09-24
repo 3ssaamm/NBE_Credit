@@ -17,6 +17,7 @@ const CONFIG = {
     TRANSACTIONS: "Transactions",
     INSTALLMENTS: "Installments",
     MONTHLY_DEBTS: "Monthly Debts",
+    DEBT_BREAKDOWN: "Debt Breakdown",
     PAYMENT_HISTORY: "Payment History",
     BANK_STATEMENT: "Bank Statement",
     RECONCILIATION: "Reconciliation"
@@ -25,13 +26,59 @@ const CONFIG = {
     PAID: "#d9ead3",       // Soft green
     DUE_SOON: "#fff2cc",   // Soft yellow
     OVERDUE: "#fce8e6",    // Soft red
+    UPCOMING: "#f8f9fa",   // Light grey
     HEADER: "#f3f3f3",     // Light neutral grey
     PRIMARY: "#1b5e20",    // NBE dark green
     PRIMARY_LIGHT: "#e8f5e9",
     TEXT_MUTED: "#555555",
-    BORDER: "#e0e0e0"
+    BORDER: "#e0e0e0",
+    ACCENT_BLUE: "#e8f0fe", // Soft blue highlight for installments
+    ROW_ALT: "#fafafa"
   }
 };
+
+// ==========================================
+// DATE & CUTOFF UTILITIES
+// ==========================================
+
+function parseDateValue(rawDate, tz) {
+  if (!rawDate) return null;
+  if (rawDate instanceof Date && !isNaN(rawDate.getTime())) return rawDate;
+  if (typeof rawDate === "number" && rawDate > 30000) {
+    const d = new Date(Math.round((rawDate - 25569) * 86400 * 1000));
+    if (!isNaN(d.getTime())) return d;
+  }
+  const s = String(rawDate).trim();
+  if (!s) return null;
+  // Try YYYY-MM-DD
+  const iso = s.match(/^(\d{4})[-\/\.](\d{1,2})[-\/\.](\d{1,2})/);
+  if (iso) {
+    const d = new Date(parseInt(iso[1], 10), parseInt(iso[2], 10) - 1, parseInt(iso[3], 10));
+    if (!isNaN(d.getTime())) return d;
+  }
+  // Try DD/MM/YYYY or DD-MM-YYYY
+  const dmy = s.match(/^(\d{1,2})[-\/\.](\d{1,2})[-\/\.](\d{4})/);
+  if (dmy) {
+    const d = new Date(parseInt(dmy[3], 10), parseInt(dmy[2], 10) - 1, parseInt(dmy[1], 10));
+    if (!isNaN(d.getTime())) return d;
+  }
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d;
+  return null;
+}
+
+function getDueDateForPurchase(purchaseDate, tz) {
+  if (!purchaseDate || isNaN(purchaseDate.getTime())) return null;
+  const targetTz = tz || "Africa/Cairo";
+  const day = parseInt(Utilities.formatDate(purchaseDate, targetTz, "d"), 10);
+  const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
+  const year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
+  // NBE Statement Cycle: Closes on the 29th of each month.
+  // Purchases made on or before the 29th are billed on this month's statement (due 25th of next month: month + 1).
+  // Purchases made on 30th or 31st roll over to next month's statement (due 25th of month + 2).
+  const monthOffset = (day <= 29) ? 1 : 2;
+  return new Date(year, month + monthOffset, 1);
+}
 
 // ==========================================
 // 1. MENU & TRIGGER SETUP
@@ -46,41 +93,13 @@ function cleanTransactionsSheet(ss) {
   const data = txSheet.getRange(2, 1, lastRow - 1, 5).getValues();
 
   const seenExact = new Set();
-  const historicalContent = new Set();
   const cleanRows = [];
   let duplicatesRemoved = 0;
 
-  // Pass 1: Identify all legitimate historical transactions (prior to September 2026)
   data.forEach(r => {
     const rawDate = r[1];
-    let dStr = "";
-    if (rawDate instanceof Date && !isNaN(rawDate.getTime())) {
-      dStr = Utilities.formatDate(rawDate, tz, "yyyy-MM-dd");
-    } else {
-      const d = new Date(rawDate);
-      dStr = !isNaN(d.getTime()) ? Utilities.formatDate(d, tz, "yyyy-MM-dd") : String(rawDate).trim();
-    }
-    const desc = String(r[2] || "").trim().toLowerCase();
-    const payer = String(r[3] || "").trim().toLowerCase();
-    const amt = parseFloat(r[4]);
-
-    if (desc && payer && !isNaN(amt) && amt > 0) {
-      if (!dStr.startsWith("2026-09")) {
-        historicalContent.add(`${desc}_${payer}_${amt.toFixed(2)}`);
-      }
-    }
-  });
-
-  // Pass 2: Filter duplicates
-  data.forEach(r => {
-    const rawDate = r[1];
-    let dStr = "";
-    if (rawDate instanceof Date && !isNaN(rawDate.getTime())) {
-      dStr = Utilities.formatDate(rawDate, tz, "yyyy-MM-dd");
-    } else {
-      const d = new Date(rawDate);
-      dStr = !isNaN(d.getTime()) ? Utilities.formatDate(d, tz, "yyyy-MM-dd") : String(rawDate).trim();
-    }
+    const d = parseDateValue(rawDate, tz);
+    const dStr = d ? Utilities.formatDate(d, tz, "yyyy-MM-dd") : String(rawDate).trim();
     const desc = String(r[2] || "").trim().toLowerCase();
     const payer = String(r[3] || "").trim().toLowerCase();
     const amt = parseFloat(r[4]);
@@ -88,16 +107,9 @@ function cleanTransactionsSheet(ss) {
     if (!desc || !payer || isNaN(amt) || amt <= 0) return;
 
     const exactKey = `${dStr}_${desc}_${payer}_${amt.toFixed(2)}`;
-    const contentKey = `${desc}_${payer}_${amt.toFixed(2)}`;
 
     // Exact duplicate seen earlier in the sheet
     if (seenExact.has(exactKey)) {
-      duplicatesRemoved++;
-      return;
-    }
-
-    // Accidental batch duplicate added with September 2026 date that copies older transaction
-    if (dStr.startsWith("2026-09") && historicalContent.has(contentKey)) {
       duplicatesRemoved++;
       return;
     }
@@ -141,11 +153,24 @@ function onOpen() {
     .addItem("📥 Process Latest Statement (Drive)", "menuProcessStatement")
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
     .addSeparator()
+    .addItem("📊 Go to Debt Breakdown Sheet", "menuGoToDebtBreakdown")
     .addItem("🧹 Clean Duplicates & Restore Debts", "menuCleanDuplicates")
     .addItem("➕ Add Assigned Charges to Transactions", "addAssignedChargesToTransactions")
     .addSeparator()
     .addItem("⏰ Setup Daily Auto-Check", "setupDailyTrigger")
     .addToUi();
+}
+
+function menuGoToDebtBreakdown() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(CONFIG.SHEETS.DEBT_BREAKDOWN);
+  if (!sheet) {
+    updateLiveDashboard();
+    sheet = ss.getSheetByName(CONFIG.SHEETS.DEBT_BREAKDOWN);
+  }
+  if (sheet) {
+    ss.setActiveSheet(sheet);
+  }
 }
 
 function onEdit(e) {
@@ -885,12 +910,12 @@ function runReconciliation(ss, tz) {
   stmtData.forEach((row, idx) => {
     const type = String(row[4]).trim();
     if (type === "DEBIT") {
-      const pDate = new Date(row[1]);
+      const pDate = parseDateValue(row[1], tz);
       stmtDebits.push({
         id: idx + 1,
         stmtRowIndex: idx,
         dateStr: String(row[1]),
-        date: isNaN(pDate.getTime()) ? null : pDate,
+        date: pDate,
         desc: String(row[3]),
         amount: parseFloat(row[5]),
         matched: false,
@@ -961,9 +986,9 @@ function runReconciliation(ss, tz) {
       const rawAmount = row[4];
       if (!rawDate || !rawAmount) return;
 
-      const pDate = new Date(rawDate);
+      const pDate = parseDateValue(rawDate, tz);
       const amt = parseFloat(rawAmount);
-      if (!isNaN(pDate.getTime()) && !isNaN(amt)) {
+      if (pDate && !isNaN(amt)) {
         txDebits.push({
           rowNum: idx + 2,
           date: pDate,
@@ -1375,14 +1400,7 @@ function calculateCardBalance(ss, tz) {
       billedBalance = parseFloat(closeVal);
     }
     const stmtDateVal = stmtSheet.getRange("B2").getValue();
-    if (stmtDateVal instanceof Date && !isNaN(stmtDateVal.getTime())) {
-      statementDate = stmtDateVal;
-    } else if (typeof stmtDateVal === "number" && stmtDateVal > 40000) {
-      statementDate = new Date(Math.round((stmtDateVal - 25569) * 86400 * 1000));
-    } else if (stmtDateVal) {
-      const d = new Date(stmtDateVal);
-      if (!isNaN(d.getTime())) statementDate = d;
-    }
+    statementDate = parseDateValue(stmtDateVal, tz);
   }
 
   // Calculate Remaining Installments Principal Blocked
@@ -1403,16 +1421,21 @@ function calculateCardBalance(ss, tz) {
     });
   }
 
-  // Calculate Unbilled New Purchases (after statement date)
+  // Calculate Unbilled New Purchases (strictly after statement cutoff)
   let unbilledNewPurchases = 0;
+  let stmtCutoff = null;
+  if (statementDate) {
+    stmtCutoff = new Date(statementDate.getFullYear(), statementDate.getMonth(), statementDate.getDate(), 23, 59, 59, 999);
+  }
+
   const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
   if (txSheet && txSheet.getLastRow() >= 2) {
     const txData = txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues();
     txData.forEach(row => {
-      const pDate = new Date(row[1]);
+      const pDate = parseDateValue(row[1], tz);
       const amt = parseFloat(row[4]);
-      if (!isNaN(pDate.getTime()) && !isNaN(amt) && amt > 0) {
-        if (statementDate && pDate > statementDate) {
+      if (pDate && !isNaN(amt) && amt > 0) {
+        if (stmtCutoff && pDate > stmtCutoff) {
           unbilledNewPurchases += amt;
         }
       }
@@ -1423,9 +1446,19 @@ function calculateCardBalance(ss, tz) {
   const historySheet = ss.getSheetByName(CONFIG.SHEETS.PAYMENT_HISTORY);
   let isCurrentBillPaid = false;
   if (historySheet && historySheet.getLastRow() >= 2) {
-    const paidMonths = historySheet.getRange(2, 1, historySheet.getLastRow() - 1, 1).getValues().flat();
+    const paidMonths = historySheet.getRange(2, 1, historySheet.getLastRow() - 1, 1).getValues().flat().map(m => {
+      if (m instanceof Date) return Utilities.formatDate(m, tz, "MMMM yyyy").toLowerCase();
+      return String(m || "").trim().toLowerCase();
+    });
+
     const currentMonthLabel = Utilities.formatDate(new Date(), tz, "MMMM yyyy").toLowerCase();
-    isCurrentBillPaid = paidMonths.some(m => String(m).trim().toLowerCase() === currentMonthLabel);
+    let stmtDueMonthLabel = "";
+    if (statementDate) {
+      const stmtDueDate = getDueDateForPurchase(statementDate, tz);
+      if (stmtDueDate) stmtDueMonthLabel = Utilities.formatDate(stmtDueDate, tz, "MMMM yyyy").toLowerCase();
+    }
+
+    isCurrentBillPaid = paidMonths.includes(currentMonthLabel) || (stmtDueMonthLabel && paidMonths.includes(stmtDueMonthLabel));
   }
 
   const effectiveBilled = isCurrentBillPaid ? 0 : billedBalance;
@@ -1436,6 +1469,7 @@ function calculateCardBalance(ss, tz) {
   return {
     creditLimit: creditLimit,
     billedBalance: billedBalance,
+    statementDate: statementDate,
     isCurrentBillPaid: isCurrentBillPaid,
     totalBlockedInstallments: totalBlockedInstallments,
     unbilledNewPurchases: unbilledNewPurchases,
@@ -1486,91 +1520,156 @@ function updateLiveDashboard() {
   }
 
   const allDebts = {};
+  const debtLineItems = [];
 
-  function addDebt(dueDate, person, amount) {
+  function addDebtItem({ dueDate, person, category, desc, installmentInfo, purchaseDate, originalAmount, amount }) {
     const sortKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
     const label = Utilities.formatDate(dueDate, tz, "MMMM yyyy");
-    if (!allDebts[sortKey]) {
-      allDebts[sortKey] = { label: label, dueDate: dueDate, total: 0, people: {} };
-    }
-    allDebts[sortKey].total += amount;
-    allDebts[sortKey].people[person] = (allDebts[sortKey].people[person] || 0) + amount;
-  }
+    const rawP = String(person || "").trim();
+    const normalizedPerson = rawP.charAt(0).toUpperCase() + rawP.slice(1);
 
-  // Cutoff calculation: 29th cutoff
-  function getDueDateForPurchase(purchaseDate) {
-    const day = parseInt(Utilities.formatDate(purchaseDate, tz, "d"), 10);
-    const month = parseInt(Utilities.formatDate(purchaseDate, tz, "M"), 10) - 1;
-    const year = parseInt(Utilities.formatDate(purchaseDate, tz, "yyyy"), 10);
-    const monthOffset = (day <= 29) ? 1 : 2;
-    return new Date(year, month + monthOffset, 1);
+    if (!allDebts[sortKey]) {
+      allDebts[sortKey] = {
+        label: label,
+        dueDate: dueDate,
+        total: 0,
+        purchasesTotal: 0,
+        installmentsTotal: 0,
+        people: {},
+        peopleBreakdown: {}
+      };
+    }
+
+    allDebts[sortKey].total += amount;
+    if (category === "Purchase") {
+      allDebts[sortKey].purchasesTotal += amount;
+    } else {
+      allDebts[sortKey].installmentsTotal += amount;
+    }
+
+    allDebts[sortKey].people[normalizedPerson] = (allDebts[sortKey].people[normalizedPerson] || 0) + amount;
+
+    if (!allDebts[sortKey].peopleBreakdown[normalizedPerson]) {
+      allDebts[sortKey].peopleBreakdown[normalizedPerson] = { purchases: 0, installments: 0, total: 0 };
+    }
+    if (category === "Purchase") {
+      allDebts[sortKey].peopleBreakdown[normalizedPerson].purchases += amount;
+    } else {
+      allDebts[sortKey].peopleBreakdown[normalizedPerson].installments += amount;
+    }
+    allDebts[sortKey].peopleBreakdown[normalizedPerson].total += amount;
+
+    debtLineItems.push({
+      sortKey: sortKey,
+      dueMonthLabel: label,
+      dueDate: dueDate,
+      person: normalizedPerson,
+      category: category,
+      desc: desc,
+      installmentInfo: installmentInfo || "-",
+      purchaseDate: purchaseDate,
+      originalAmount: originalAmount,
+      amount: amount
+    });
   }
 
   // 1. Process One-Time Payments
   if (transactionsSheet.getLastRow() >= 2) {
     const txData = transactionsSheet.getRange(2, 1, transactionsSheet.getLastRow() - 1, 5).getValues();
     txData.forEach(row => {
-      const rawDate = row[1], rawPerson = row[3], rawAmount = row[4];
+      const rawDate = row[1];
+      const desc = String(row[2] || "").trim();
+      const rawPerson = row[3];
+      const rawAmount = row[4];
       if (!rawDate || !rawPerson) return;
 
-      const purchaseDate = new Date(rawDate);
+      const purchaseDate = parseDateValue(rawDate, tz);
       const amount = parseFloat(rawAmount);
-      if (isNaN(purchaseDate.getTime()) || isNaN(amount) || amount <= 0) return;
+      if (!purchaseDate || isNaN(amount) || amount <= 0) return;
 
-      const person = String(rawPerson).trim().toLowerCase();
-      const dueDate = getDueDateForPurchase(purchaseDate);
-      addDebt(dueDate, person, amount);
+      const dueDate = getDueDateForPurchase(purchaseDate, tz);
+      if (!dueDate) return;
+
+      const rawPayerStr = String(rawPerson).trim();
+      const people = rawPayerStr.split(/[\+\,\/]/).map(p => p.trim()).filter(p => p);
+      const splitAmount = amount / Math.max(1, people.length);
+
+      people.forEach(p => {
+        addDebtItem({
+          dueDate: dueDate,
+          person: p,
+          category: "Purchase",
+          desc: desc,
+          installmentInfo: "-",
+          purchaseDate: purchaseDate,
+          originalAmount: amount,
+          amount: splitAmount
+        });
+      });
     });
   }
 
-  // 2. Process Installments (Exact NBE 55-Day Cutoff Rule)
+  // 2. Process Installments (Exact NBE Cutoff Rule)
   if (installmentsSheet.getLastRow() >= 2) {
     const instData = installmentsSheet.getRange(2, 1, installmentsSheet.getLastRow() - 1, 11).getValues();
     const newInstallmentStatuses = [];
 
     instData.forEach(row => {
       const rawDate = row[1];
+      const desc = String(row[2] || "").trim();
       const durationMonths = parseInt(row[4], 10);
       const emi = parseFloat(row[7]);
       const rawPayer = row[8];
+      const existingPaymentsMade = parseInt(row[9], 10) || 0;
+      const existingStatus = String(row[10] || "").trim().toLowerCase();
 
       if (!rawDate || isNaN(durationMonths) || durationMonths <= 0 || isNaN(emi) || emi <= 0 || !rawPayer) {
-        newInstallmentStatuses.push(["", ""]);
+        newInstallmentStatuses.push([row[9] || "", row[10] || ""]);
         return;
       }
 
-      const purchaseDate = new Date(rawDate);
-      if (isNaN(purchaseDate.getTime())) {
-        newInstallmentStatuses.push(["", ""]);
+      const purchaseDate = parseDateValue(rawDate, tz);
+      if (!purchaseDate) {
+        newInstallmentStatuses.push([row[9] || "", row[10] || ""]);
         return;
       }
 
       const rawPayerStr = String(rawPayer).trim();
-      const people = rawPayerStr.split(/[\+\,\/]/).map(p => p.trim().toLowerCase()).filter(p => p);
+      const people = rawPayerStr.split(/[\+\,\/]/).map(p => p.trim()).filter(p => p);
       const splitEmi = emi / Math.max(1, people.length);
 
-      // NBE 55-day cutoff rule
-      let firstPayDate = new Date(purchaseDate);
-      firstPayDate.setDate(purchaseDate.getDate() + 55);
+      // First installment is due in the statement cycle of the purchase date
+      const firstDueDate = getDueDateForPurchase(purchaseDate, tz);
 
-      let startMonthOffset = 0;
-      if (firstPayDate.getDate() > 29) {
-        startMonthOffset = 1;
-      }
-
-      let paymentsMade = 0;
+      let paymentsCounted = 0;
       for (let i = 0; i < durationMonths; i++) {
-        const dueMonthDate = new Date(firstPayDate.getFullYear(), firstPayDate.getMonth() + i + startMonthOffset, 1);
+        const dueMonthDate = new Date(firstDueDate.getFullYear(), firstDueDate.getMonth() + i, 1);
         const monthKey = Utilities.formatDate(dueMonthDate, tz, "MMMM yyyy").toLowerCase();
 
-        if (paidMonthsSet.has(monthKey)) paymentsMade++;
+        if (paidMonthsSet.has(monthKey)) {
+          paymentsCounted++;
+        }
 
-        people.forEach(person => {
-          addDebt(dueMonthDate, person, splitEmi);
+        const instInfo = `${i + 1} of ${durationMonths}`;
+
+        people.forEach(p => {
+          addDebtItem({
+            dueDate: dueMonthDate,
+            person: p,
+            category: "Installment",
+            desc: desc,
+            installmentInfo: instInfo,
+            purchaseDate: purchaseDate,
+            originalAmount: emi,
+            amount: splitEmi
+          });
         });
       }
 
-      newInstallmentStatuses.push([paymentsMade, (paymentsMade >= durationMonths ? "Completed" : "Ongoing")]);
+      // Preserve existing payments made if higher (e.g. from bank statement sync)
+      const finalPaymentsMade = Math.max(existingPaymentsMade, paymentsCounted);
+      const isCompleted = (finalPaymentsMade >= durationMonths) || (existingStatus === "completed");
+      newInstallmentStatuses.push([finalPaymentsMade, isCompleted ? "Completed" : "Ongoing"]);
     });
 
     if (newInstallmentStatuses.length > 0) {
@@ -1581,7 +1680,7 @@ function updateLiveDashboard() {
   // 3. Render Dashboard in 'Monthly Debts'
   debtsSheet.clear();
 
-  // Card Overview & 100k Available Balance Card
+  // Overview Card
   const cardBal = calculateCardBalance(ss, tz);
 
   debtsSheet.getRange("A1:B1").merge()
@@ -1604,7 +1703,7 @@ function updateLiveDashboard() {
   debtsSheet.getRange(2, 1, overviewRows.length, 1).setFontWeight("bold").setFontSize(10);
   debtsSheet.getRange(2, 2, overviewRows.length, 1).setFontWeight("bold").setFontSize(10).setNumberFormat("#,##0.00");
   debtsSheet.getRange("A2:B7").setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
-  debtsSheet.getRange("A3:B3").setBackground(CONFIG.COLORS.DUE_SOON); // Highlight Available Now
+  debtsSheet.getRange("A3:B3").setBackground(CONFIG.COLORS.DUE_SOON);
 
   let currentRow = 9;
 
@@ -1614,9 +1713,143 @@ function updateLiveDashboard() {
     return;
   }
 
+  // Collect and sort unique people
+  const allPeopleSet = new Set();
+  debtLineItems.forEach(it => allPeopleSet.add(it.person));
+  const sortedPeople = Array.from(allPeopleSet).sort((a, b) => {
+    if (a.toLowerCase() === "shared") return 1;
+    if (b.toLowerCase() === "shared") return -1;
+    return a.localeCompare(b);
+  });
+
   const today = new Date();
   const currentMonthSortKey = Utilities.formatDate(today, tz, "yyyy-MM");
   const todayDay = parseInt(Utilities.formatDate(today, tz, "d"), 10);
+
+  let stmtDueMonthSortKey = null;
+  if (cardBal.statementDate) {
+    const sDueDate = getDueDateForPurchase(cardBal.statementDate, tz);
+    if (sDueDate) {
+      stmtDueMonthSortKey = Utilities.formatDate(sDueDate, tz, "yyyy-MM");
+    }
+  }
+
+  // ==========================================
+  // MASTER MATRIX TABLE (DIVIDED BY PERSON IN ONE TABLE)
+  // ==========================================
+  const totalCols = 5 + sortedPeople.length;
+
+  debtsSheet.getRange(currentRow, 1, 1, totalCols).merge()
+    .setValue("📊 Master Monthly Debt Matrix (All Persons Divided in One Table)")
+    .setFontWeight("bold")
+    .setFontSize(13)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff");
+  currentRow++;
+
+  debtsSheet.getRange(currentRow, 1, 1, totalCols).merge()
+    .setValue("Complete overview of all months, due dates, bank statement bills, and individual family shares side-by-side.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  currentRow++;
+
+  const matrixHeaders = ["Due Month", "Status", "Family Total Due", "Bank Bill (EGP)", "Audit Diff (EGP)", ...sortedPeople];
+  debtsSheet.getRange(currentRow, 1, 1, matrixHeaders.length)
+    .setValues([matrixHeaders])
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.HEADER)
+    .setBorder(true, true, true, true, true, true);
+  currentRow++;
+
+  const matrixRows = [];
+  const matrixRowColors = [];
+
+  let grandTotalDebt = 0;
+  let grandBankBill = 0;
+  const personTotals = {};
+  sortedPeople.forEach(p => { personTotals[p] = 0; });
+
+  sortedKeys.forEach(key => {
+    const data = allDebts[key];
+    const monthLabel = data.label;
+    const isPaid = paidMonthsSet.has(monthLabel.toLowerCase());
+    let statusLabel = "🕒 Upcoming";
+    let statusColor = CONFIG.COLORS.UPCOMING;
+
+    if (isPaid) {
+      statusLabel = "✅ Paid";
+      statusColor = CONFIG.COLORS.PAID;
+    } else if (key < currentMonthSortKey || (key === currentMonthSortKey && todayDay > 25)) {
+      statusLabel = "🚨 Overdue";
+      statusColor = CONFIG.COLORS.OVERDUE;
+    } else if (key === currentMonthSortKey && todayDay <= 25) {
+      statusLabel = "⚠️ Due Soon (25th)";
+      statusColor = CONFIG.COLORS.DUE_SOON;
+    }
+
+    const isStatementMonth = (key === stmtDueMonthSortKey) || (!stmtDueMonthSortKey && (statusLabel.includes("Due Soon") || key === currentMonthSortKey));
+    const bankBillVal = (cardBal.billedBalance > 0 && isStatementMonth) ? cardBal.billedBalance : "";
+    const diffVal = (typeof bankBillVal === "number") ? (data.total - bankBillVal) : "";
+
+    grandTotalDebt += data.total;
+    if (typeof bankBillVal === "number") grandBankBill += bankBillVal;
+
+    const row = [
+      monthLabel,
+      statusLabel,
+      data.total,
+      bankBillVal,
+      diffVal
+    ];
+
+    sortedPeople.forEach(p => {
+      const pAmt = data.people[p] || 0;
+      row.push(pAmt);
+      personTotals[p] += pAmt;
+    });
+
+    matrixRows.push(row);
+    matrixRowColors.push(statusColor);
+  });
+
+  // Render Matrix Data Rows
+  const matrixRange = debtsSheet.getRange(currentRow, 1, matrixRows.length, totalCols);
+  matrixRange.setValues(matrixRows);
+
+  for (let r = 0; r < matrixRows.length; r++) {
+    debtsSheet.getRange(currentRow + r, 2).setBackground(matrixRowColors[r]).setFontWeight("bold");
+    if (matrixRows[r][1].includes("Paid")) {
+      debtsSheet.getRange(currentRow + r, 1).setFontLine("line-through");
+    }
+  }
+
+  // Format currency columns
+  debtsSheet.getRange(currentRow, 3, matrixRows.length, totalCols - 2).setNumberFormat("#,##0.00");
+  debtsSheet.getRange(currentRow, 1, matrixRows.length, 1).setFontWeight("bold");
+  currentRow += matrixRows.length;
+
+  // Grand Total Summary Row
+  const totalSummaryRow = ["TOTAL ALL MONTHS", "", grandTotalDebt, (grandBankBill > 0 ? grandBankBill : ""), ""];
+  sortedPeople.forEach(p => totalSummaryRow.push(personTotals[p]));
+
+  debtsSheet.getRange(currentRow, 1, 1, totalCols)
+    .setValues([totalSummaryRow])
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
+    .setBorder(true, true, true, true, true, true);
+  debtsSheet.getRange(currentRow, 3, 1, totalCols - 2).setNumberFormat("#,##0.00");
+  currentRow += 3;
+
+  // ==========================================
+  // DETAILED MONTHLY DUES CARDS (WITH SPLIT BREAKDOWN)
+  // ==========================================
+  debtsSheet.getRange(currentRow, 1, 1, 3).merge()
+    .setValue("📑 Detailed Monthly Dues (Cards & Category Breakdown)")
+    .setFontWeight("bold")
+    .setFontSize(12)
+    .setBackground(CONFIG.COLORS.HEADER);
+  currentRow += 2;
 
   sortedKeys.forEach(key => {
     const data = allDebts[key];
@@ -1638,7 +1871,7 @@ function updateLiveDashboard() {
     }
 
     // Title Row
-    const titleRange = debtsSheet.getRange(currentRow, 1, 1, 2);
+    const titleRange = debtsSheet.getRange(currentRow, 1, 1, 3);
     titleRange.merge();
     let headerText = monthLabel;
     if (isOverdue) headerText += " (OVERDUE)";
@@ -1654,42 +1887,42 @@ function updateLiveDashboard() {
 
     // Data Rows
     const rows = [];
-    const isStatementMonth = (isDueSoon || key === currentMonthSortKey);
+    const isStatementMonth = (key === stmtDueMonthSortKey) || (!stmtDueMonthSortKey && (isDueSoon || key === currentMonthSortKey));
     let bankDueOffset = -1;
 
     if (cardBal.billedBalance > 0 && isStatementMonth) {
       bankDueOffset = rows.length;
-      rows.push(["🏦 BANK STATEMENT DUE (Must Pay):", cardBal.billedBalance]);
-      rows.push(["👥 Sum of Individual Family Shares:", data.total]);
+      rows.push(["🏦 BANK STATEMENT DUE (Must Pay):", cardBal.billedBalance, "Exact statement closing balance from NBE"]);
+      rows.push(["👥 Sum of Individual Family Shares:", data.total, "Total purchases & installments in this cycle"]);
 
       const diff = data.total - cardBal.billedBalance;
       if (Math.abs(diff) < 1.00) {
-        rows.push(["⚖️ Audit & Reconciliation Status:", "✅ Matched (0.00 EGP difference)"]);
+        rows.push(["⚖️ Audit & Reconciliation Status:", "✅ Matched (0.00 EGP difference)", "All family shares perfectly match bank bill"]);
       } else if (diff > 1.00) {
-        rows.push(["⚖️ Audit Difference:", "+" + diff.toFixed(2) + " EGP (Debts exceed bank bill)"]);
-        rows.push(["ℹ️ Explanation:", "Bank applied prior month overpayment (-" + diff.toFixed(2) + " EGP)"]);
-        rows.push(["👉 What to Pay:", "Transfer " + cardBal.billedBalance.toFixed(2) + " EGP to NBE to fully settle card"]);
+        rows.push(["⚖️ Audit Difference:", "+" + diff.toFixed(2) + " EGP", "Family debts exceed bank bill (prior overpayment applied)"]);
+        rows.push(["👉 What to Pay:", cardBal.billedBalance, "Transfer billed amount to NBE to settle card"]);
       } else {
-        rows.push(["⚠️ Audit Difference:", "-" + Math.abs(diff).toFixed(2) + " EGP (Missing charges!)"]);
-        rows.push(["ℹ️ Action Needed:", "Bank bill is higher! Check 'Bank Statement' Col H for ⚠️ Unassigned charges"]);
+        rows.push(["⚠️ Audit Difference:", "-" + Math.abs(diff).toFixed(2) + " EGP", "Bank bill is higher! Check Reconciliation for unassigned items"]);
       }
     } else {
-      rows.push(["Total Bill (Purchases & EMIs):", data.total]);
+      rows.push(["Total Bill (Purchases & EMIs):", data.total, `Purchases: ${data.purchasesTotal.toFixed(2)} | EMIs: ${data.installmentsTotal.toFixed(2)}`]);
     }
 
     const personHeaderIdx = rows.length;
-    rows.push(["Person", "Owes"]);
+    rows.push(["Person", "Owes (EGP)", "Category Breakdown"]);
 
-    const sortedPeople = Object.keys(data.people).sort();
-    sortedPeople.forEach(p => {
-      const formattedName = p.charAt(0).toUpperCase() + p.slice(1);
-      rows.push([formattedName, data.people[p]]);
+    const activePeople = Object.keys(data.people).sort();
+    activePeople.forEach(p => {
+      const pTotal = data.people[p];
+      const bk = data.peopleBreakdown[p] || { purchases: 0, installments: 0 };
+      const bkStr = `Purchases: ${bk.purchases.toFixed(2)} | EMIs: ${bk.installments.toFixed(2)}`;
+      rows.push([p, pTotal, bkStr]);
     });
 
-    const dataRange = debtsSheet.getRange(currentRow, 1, rows.length, 2);
+    const dataRange = debtsSheet.getRange(currentRow, 1, rows.length, 3);
     dataRange.setValues(rows);
 
-    // Number formatting: numbers as currency #,##0.00, text as @
+    // Number formatting
     for (let r = 0; r < rows.length; r++) {
       if (typeof rows[r][1] === "number") {
         debtsSheet.getRange(currentRow + r, 2).setNumberFormat("#,##0.00");
@@ -1699,14 +1932,13 @@ function updateLiveDashboard() {
     }
 
     // Typography & Styling
-    debtsSheet.getRange(currentRow, 1, personHeaderIdx, 2).setFontWeight("bold");
-    debtsSheet.getRange(currentRow + personHeaderIdx, 1, 1, 2).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
+    debtsSheet.getRange(currentRow, 1, personHeaderIdx, 3).setFontWeight("bold");
+    debtsSheet.getRange(currentRow + personHeaderIdx, 1, 1, 3).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
 
     if (blockColor) dataRange.setBackground(blockColor);
 
-    // Prominently highlight Bank Statement Due row
     if (bankDueOffset >= 0) {
-      debtsSheet.getRange(currentRow + bankDueOffset, 1, 1, 2)
+      debtsSheet.getRange(currentRow + bankDueOffset, 1, 1, 3)
         .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
         .setFontWeight("bold")
         .setFontColor(CONFIG.COLORS.PRIMARY);
@@ -1717,5 +1949,197 @@ function updateLiveDashboard() {
     currentRow += rows.length + 1;
   });
 
-  debtsSheet.autoResizeColumns(1, 2);
+  debtsSheet.autoResizeColumns(1, totalCols);
+
+  // 4. Render Dedicated 'Debt Breakdown' Sheet
+  renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal);
+}
+
+function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal) {
+  const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.DEBT_BREAKDOWN);
+  sheet.clear();
+
+  // Banner
+  sheet.getRange("A1:J1").merge()
+    .setValue("💳 NBE Credit Card — Complete Itemized Debt Breakdown & Audit Register")
+    .setFontWeight("bold")
+    .setFontSize(13)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff");
+
+  sheet.getRange("A2:J2").merge()
+    .setValue("Every single purchase and installment installment divided by person and due month. Filter or sort by any column to audit.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+
+  let curRow = 4;
+
+  // ==========================================
+  // SECTION 1: PERSON TOTALS & DEBT COMPOSITION
+  // ==========================================
+  sheet.getRange(curRow, 1, 1, 6).merge()
+    .setValue("👥 Family Members — Debt Summary & Composition")
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setBackground(CONFIG.COLORS.HEADER);
+  curRow++;
+
+  const summaryHeaders = ["Person", "One-Time Purchases (EGP)", "Installments (EGP)", "Total Debt (EGP)", "% of Total Debt", "Due / Overdue Now (EGP)"];
+  sheet.getRange(curRow, 1, 1, summaryHeaders.length).setValues([summaryHeaders])
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.HEADER)
+    .setBorder(true, true, true, true, true, true);
+  curRow++;
+
+  const today = new Date();
+  const currentMonthSortKey = Utilities.formatDate(today, tz, "yyyy-MM");
+
+  let totalPurchasesAll = 0;
+  let totalInstallmentsAll = 0;
+  let grandTotalAll = 0;
+  let grandDueNow = 0;
+
+  const personStats = {};
+  sortedPeople.forEach(p => {
+    personStats[p] = { purchases: 0, installments: 0, total: 0, dueNow: 0 };
+  });
+
+  debtLineItems.forEach(it => {
+    if (!personStats[it.person]) {
+      personStats[it.person] = { purchases: 0, installments: 0, total: 0, dueNow: 0 };
+    }
+    const isPaid = paidMonthsSet.has(it.dueMonthLabel.toLowerCase());
+    const isDueOrOverdue = !isPaid && (it.sortKey <= currentMonthSortKey);
+
+    if (it.category === "Purchase") {
+      personStats[it.person].purchases += it.amount;
+      totalPurchasesAll += it.amount;
+    } else {
+      personStats[it.person].installments += it.amount;
+      totalInstallmentsAll += it.amount;
+    }
+    personStats[it.person].total += it.amount;
+    grandTotalAll += it.amount;
+
+    if (isDueOrOverdue) {
+      personStats[it.person].dueNow += it.amount;
+      grandDueNow += it.amount;
+    }
+  });
+
+  const sumRows = sortedPeople.map(p => {
+    const st = personStats[p];
+    const pct = grandTotalAll > 0 ? (st.total / grandTotalAll) : 0;
+    return [p, st.purchases, st.installments, st.total, pct, st.dueNow];
+  });
+
+  if (sumRows.length > 0) {
+    sheet.getRange(curRow, 1, sumRows.length, summaryHeaders.length).setValues(sumRows);
+    sheet.getRange(curRow, 2, sumRows.length, 3).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 5, sumRows.length, 1).setNumberFormat("0.0%");
+    sheet.getRange(curRow, 6, sumRows.length, 1).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 1, sumRows.length, 1).setFontWeight("bold");
+    curRow += sumRows.length;
+  }
+
+  // Family Total Row
+  const totalRow = ["FAMILY TOTAL", totalPurchasesAll, totalInstallmentsAll, grandTotalAll, 1.00, grandDueNow];
+  sheet.getRange(curRow, 1, 1, summaryHeaders.length).setValues([totalRow])
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
+    .setBorder(true, true, true, true, true, true);
+  sheet.getRange(curRow, 2, 1, 3).setNumberFormat("#,##0.00");
+  sheet.getRange(curRow, 5, 1, 1).setNumberFormat("0.0%");
+  sheet.getRange(curRow, 6, 1, 1).setNumberFormat("#,##0.00");
+  curRow += 3;
+
+  // ==========================================
+  // SECTION 2: ITEMIZED REGISTER (EVERY CHARGE ACCOUNTED FOR)
+  // ==========================================
+  sheet.getRange(curRow, 1, 1, 10).merge()
+    .setValue("📋 Itemized Dues Register (Every Single Charge Divided & Accounted For)")
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setBackground(CONFIG.COLORS.HEADER);
+  curRow++;
+
+  const itemHeaders = ["#", "Due Month", "Person", "Category", "Merchant / Description", "Installment Progress", "Purchase Date", "Person's Share (EGP)", "Original Charge (EGP)", "Month Status"];
+  sheet.getRange(curRow, 1, 1, itemHeaders.length).setValues([itemHeaders])
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.HEADER)
+    .setBorder(true, true, true, true, true, true);
+  curRow++;
+
+  const headerRowForFilter = curRow - 1;
+
+  // Sort debtLineItems: sortKey ascending, person ascending, category ("Purchase" first)
+  debtLineItems.sort((a, b) => {
+    if (a.sortKey !== b.sortKey) return a.sortKey.localeCompare(b.sortKey);
+    if (a.person !== b.person) return a.person.localeCompare(b.person);
+    if (a.category !== b.category) return a.category === "Purchase" ? -1 : 1;
+    return a.desc.localeCompare(b.desc);
+  });
+
+  const todayDay = parseInt(Utilities.formatDate(today, tz, "d"), 10);
+  const regRows = [];
+  const regRowColors = [];
+
+  debtLineItems.forEach((it, idx) => {
+    const isPaid = paidMonthsSet.has(it.dueMonthLabel.toLowerCase());
+    let statusLabel = "🕒 Upcoming";
+
+    if (isPaid) {
+      statusLabel = "✅ Paid";
+    } else if (it.sortKey < currentMonthSortKey || (it.sortKey === currentMonthSortKey && todayDay > 25)) {
+      statusLabel = "🚨 Overdue";
+    } else if (it.sortKey === currentMonthSortKey && todayDay <= 25) {
+      statusLabel = "⚠️ Due Soon (25th)";
+    }
+
+    regRows.push([
+      idx + 1,
+      it.dueMonthLabel,
+      it.person,
+      it.category === "Purchase" ? "🛒 Purchase" : "📦 Installment",
+      it.desc,
+      it.installmentInfo,
+      it.purchaseDate,
+      it.amount,
+      it.originalAmount,
+      statusLabel
+    ]);
+
+    if (it.category === "Installment") {
+      regRowColors.push(CONFIG.COLORS.ACCENT_BLUE);
+    } else if (isPaid) {
+      regRowColors.push(CONFIG.COLORS.PAID);
+    } else {
+      regRowColors.push(null);
+    }
+  });
+
+  if (regRows.length > 0) {
+    const regRange = sheet.getRange(curRow, 1, regRows.length, itemHeaders.length);
+    regRange.setValues(regRows);
+
+    sheet.getRange(curRow, 7, regRows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(curRow, 8, regRows.length, 2).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 1, regRows.length, 1).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
+
+    for (let r = 0; r < regRows.length; r++) {
+      if (regRowColors[r]) {
+        sheet.getRange(curRow + r, 1, 1, itemHeaders.length).setBackground(regRowColors[r]);
+      }
+    }
+
+    const filterRange = sheet.getRange(headerRowForFilter, 1, regRows.length + 1, itemHeaders.length);
+    try {
+      const existingFilter = sheet.getFilter();
+      if (existingFilter) existingFilter.remove();
+      filterRange.createFilter();
+    } catch (e) {}
+  }
+
+  sheet.autoResizeColumns(1, 10);
 }
