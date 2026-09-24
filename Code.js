@@ -84,69 +84,6 @@ function getDueDateForPurchase(purchaseDate, tz) {
 // 1. MENU & TRIGGER SETUP
 // ==========================================
 
-function cleanTransactionsSheet(ss) {
-  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
-  if (!txSheet || txSheet.getLastRow() < 2) return 0;
-
-  const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
-  const lastRow = txSheet.getLastRow();
-  const data = txSheet.getRange(2, 1, lastRow - 1, 5).getValues();
-
-  const seenExact = new Set();
-  const cleanRows = [];
-  let duplicatesRemoved = 0;
-
-  data.forEach(r => {
-    const rawDate = r[1];
-    const d = parseDateValue(rawDate, tz);
-    const dStr = d ? Utilities.formatDate(d, tz, "yyyy-MM-dd") : String(rawDate).trim();
-    const desc = String(r[2] || "").trim().toLowerCase();
-    const payer = String(r[3] || "").trim().toLowerCase();
-    const amt = parseFloat(r[4]);
-
-    if (!desc || !payer || isNaN(amt) || amt <= 0) return;
-
-    const exactKey = `${dStr}_${desc}_${payer}_${amt.toFixed(2)}`;
-
-    // Exact duplicate seen earlier in the sheet
-    if (seenExact.has(exactKey)) {
-      duplicatesRemoved++;
-      return;
-    }
-
-    seenExact.add(exactKey);
-    cleanRows.push(r);
-  });
-
-  if (duplicatesRemoved > 0) {
-    // Renumber IDs sequentially
-    cleanRows.forEach((r, idx) => {
-      r[0] = idx + 1;
-    });
-
-    txSheet.getRange(2, 1, lastRow - 1, 5).clearContent();
-    if (cleanRows.length > 0) {
-      txSheet.getRange(2, 1, cleanRows.length, 5).setValues(cleanRows);
-      txSheet.getRange(2, 2, cleanRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
-      txSheet.getRange(2, 5, cleanRows.length, 1).setNumberFormat("#,##0.00");
-    }
-  }
-
-  return duplicatesRemoved;
-}
-
-function menuCleanDuplicates() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const removed = cleanTransactionsSheet(ss);
-  updateLiveDashboard();
-  SpreadsheetApp.getUi().alert(
-    "Cleanup Complete",
-    `Removed ${removed} duplicate transaction(s)!\n\n` +
-    `Monthly Debts and Reconciliation have been restored to their authentic numbers.`,
-    SpreadsheetApp.getUi().ButtonSet.OK
-  );
-}
-
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("💳 NBE Tracker")
@@ -154,8 +91,6 @@ function onOpen() {
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
     .addSeparator()
     .addItem("📊 Go to Debt Breakdown Sheet", "menuGoToDebtBreakdown")
-    .addItem("🧹 Clean Duplicates & Restore Debts", "menuCleanDuplicates")
-    .addItem("➕ Add Assigned Charges to Transactions", "addAssignedChargesToTransactions")
     .addSeparator()
     .addItem("⏰ Setup Daily Auto-Check", "setupDailyTrigger")
     .addToUi();
@@ -184,11 +119,8 @@ function onEdit(e) {
 
   const validPayers = ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza", "Shared"];
 
-  // Table 2: User assigns a Payer in Column E (col 5)
-  if (col === 5) {
-    const val = String(e.value || e.range.getValue() || "").trim();
-    if (!validPayers.includes(val)) return;
-
+  // Table 2: User assigns a Payer in Column E (col 5) or Custom Note in Column F (col 6)
+  if (col === 5 || col === 6) {
     // Check that row is strictly in Table 2 (under "MISSING from Sheet")
     const lastRow = sheet.getLastRow();
     const colA = sheet.getRange(1, 1, lastRow, 1).getValues();
@@ -201,62 +133,52 @@ function onEdit(e) {
     }
     if (table2Start === -1 || row <= table2Start + 1) return;
 
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
-    if (!txSheet) return;
-
     // Read row values: Col 1 (#), Col 2 (Date), Col 3 (Desc), Col 4 (Amount), Col 5 (Payer), Col 6 (Custom Note)
     const rowValues = sheet.getRange(row, 1, 1, 6).getValues()[0];
     const rawDate = rowValues[1];
     const origDesc = String(rowValues[2] || "").trim();
     const amt = parseFloat(rowValues[3]);
-    const payer = val;
+    const payer = String(rowValues[4] || "").trim();
     const note = String(rowValues[5] || "").trim();
 
     if (isNaN(amt) || amt <= 0) return;
 
-    const dateObj = new Date(rawDate);
-    const finalDate = isNaN(dateObj.getTime()) ? new Date() : dateObj;
-    const finalDesc = note || origDesc;
+    const dateStr = String(rawDate);
+    const chargeKey = `${dateStr}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}`;
 
-    // Check if duplicate already exists in Transactions
-    const txLastRow = txSheet.getLastRow();
-    if (txLastRow >= 2) {
-      const existingTx = txSheet.getRange(2, 1, txLastRow - 1, 5).getValues();
-      const alreadyExists = existingTx.some(r => {
-        const rAmt = parseFloat(r[4]);
-        const rDesc = String(r[2] || "").trim().toLowerCase();
-        return Math.abs(rAmt - amt) < 0.05 && rDesc === finalDesc.toLowerCase();
-      });
-      if (alreadyExists) {
-        sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
-        sheet.getRange(row, 5).clearDataValidations().setValue("✅ Already in Sheet (" + payer + ")");
-        ss.toast(`Charge "${finalDesc}" is already in Transactions!`, "ℹ️ Already Recorded", 3);
-        return;
-      }
+    const scriptProps = PropertiesService.getScriptProperties();
+    let assignedMap = {};
+    try {
+      assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
+    } catch (err) {}
+
+    if (payer) {
+      assignedMap[chargeKey] = {
+        dateStr: dateStr,
+        desc: origDesc,
+        amount: amt,
+        payer: payer,
+        note: note
+      };
+      scriptProps.setProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
+
+      // Style row in Reconciliation as assigned
+      sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
+
+      // Refresh Live Dashboard and Debt Breakdown directly (WITHOUT modifying Transactions sheet!)
+      updateLiveDashboard();
+
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        `Assigned "${origDesc}" (${amt.toFixed(2)} EGP) to ${payer} directly in Debt Breakdown (⚠️ Missing from Transactions)!`,
+        "💳 Assigned to Debt Breakdown",
+        4
+      );
+    } else {
+      delete assignedMap[chargeKey];
+      scriptProps.setProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
+      sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.OVERDUE);
+      updateLiveDashboard();
     }
-
-    // Determine next ID in Transactions
-    let nextId = 1;
-    if (txLastRow >= 2) {
-      const lastIdVal = txSheet.getRange(txLastRow, 1).getValue();
-      if (!isNaN(parseInt(lastIdVal, 10))) {
-        nextId = parseInt(lastIdVal, 10) + 1;
-      }
-    }
-
-    // Append to Transactions
-    const newTxRow = [nextId, finalDate, finalDesc, payer, amt];
-    txSheet.getRange(txLastRow + 1, 1, 1, 5).setValues([newTxRow]);
-    txSheet.getRange(txLastRow + 1, 2, 1, 1).setNumberFormat("dddd, MMMM d, yyyy");
-    txSheet.getRange(txLastRow + 1, 5, 1, 1).setNumberFormat("#,##0.00");
-
-    // Mark row as Added in Reconciliation sheet
-    sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
-    sheet.getRange(row, 5).clearDataValidations().setValue("✅ Added (" + payer + ")");
-
-    // Toast notification
-    ss.toast(`Added "${finalDesc}" (${amt.toFixed(2)} EGP) for ${payer} to Transactions!`, "💳 Transaction Added", 4);
   }
 
   // Table 1: User confirms a Suggested Match in Column G (col 7)
@@ -794,10 +716,10 @@ function matchStatementInstallments(statementInstallments, sheetInstallmentRows)
 
 function syncInstallmentsFromStatement(ss, transactions) {
   const installmentsSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
-  if (!installmentsSheet || installmentsSheet.getLastRow() < 2) return;
+  if (!installmentsSheet || installmentsSheet.getLastRow() < 2) return [];
 
   const statementInstallments = transactions.filter(t => t.type === "INSTALLMENT");
-  if (statementInstallments.length === 0) return;
+  if (statementInstallments.length === 0) return [];
 
   const numRows = installmentsSheet.getLastRow() - 1;
   const range = installmentsSheet.getRange(2, 1, numRows, 11);
@@ -821,18 +743,8 @@ function syncInstallmentsFromStatement(ss, transactions) {
   });
 
   const matches = matchStatementInstallments(statementInstallments, sheetInstallmentRows);
-
-  matches.forEach(m => {
-    const instCurrent = m.stmt.instCurrent;
-    if (instCurrent != null) {
-      m.sheetRows.forEach(sh => {
-        values[sh.index][9] = instCurrent; // Payments Made (Column J)
-        values[sh.index][10] = (instCurrent >= sh.duration) ? "Completed" : "Ongoing"; // Status (Column K)
-      });
-    }
-  });
-
-  range.setValues(values);
+  // NOTE: Preserving Installments sheet untouched as user-managed input
+  return matches;
 }
 
 // ==========================================
@@ -1201,20 +1113,39 @@ function runReconciliation(ss, tz) {
       .setAllowInvalid(true)
       .build();
 
-    const missRows = missingInSheet.map((m, idx) => [
-      idx + 1,
-      m.date || m.dateStr,
-      m.desc,
-      m.amount,
-      "",
-      cleanMerchantName(m.desc)
-    ]);
+    const scriptProps = PropertiesService.getScriptProperties();
+    let assignedMap = {};
+    try {
+      assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
+    } catch (err) {}
+
+    const missRows = missingInSheet.map((m, idx) => {
+      const chargeKey = `${String(m.date || m.dateStr)}_${m.amount.toFixed(2)}_${m.desc.substring(0, 30)}`;
+      const saved = assignedMap[chargeKey];
+      const assignedPayer = (saved && saved.payer) ? saved.payer : "";
+      const note = (saved && saved.note) ? saved.note : cleanMerchantName(m.desc);
+      return [
+        idx + 1,
+        m.date || m.dateStr,
+        m.desc,
+        m.amount,
+        assignedPayer,
+        note
+      ];
+    });
 
     const missRange = reconSheet.getRange(curRow, 1, missRows.length, 6);
     missRange.setValues(missRows);
     reconSheet.getRange(curRow, 2, missRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
     reconSheet.getRange(curRow, 4, missRows.length, 1).setNumberFormat("#,##0.00");
     reconSheet.getRange(curRow, 5, missRows.length, 1).setDataValidation(payerValidation);
+
+    // Color assigned rows
+    for (let i = 0; i < missRows.length; i++) {
+      if (missRows[i][4]) {
+        reconSheet.getRange(curRow + i, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
+      }
+    }
     curRow += missRows.length + 1;
   }
 
@@ -1255,7 +1186,15 @@ function runReconciliation(ss, tz) {
       } else if (suggestedStmtIds.has(st.id)) {
         stmtRowStatus[idx] = { text: "❓ Needs Confirmation", color: CONFIG.COLORS.DUE_SOON };
       } else {
-        stmtRowStatus[idx] = { text: "⚠️ Unassigned (Not in Sheet)", color: CONFIG.COLORS.OVERDUE };
+        const cKey = `${String(st.dateStr)}_${st.amount.toFixed(2)}_${st.desc.substring(0, 30)}`;
+        const scriptProps = PropertiesService.getScriptProperties();
+        let assignedMap = {};
+        try { assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}"); } catch (e) {}
+        if (assignedMap[cKey] && assignedMap[cKey].payer) {
+          stmtRowStatus[idx] = { text: "⚠️ Unrecorded (Assigned to " + assignedMap[cKey].payer + ")", color: CONFIG.COLORS.DUE_SOON };
+        } else {
+          stmtRowStatus[idx] = { text: "⚠️ Unassigned (Not in Sheet)", color: CONFIG.COLORS.OVERDUE };
+        }
       }
     }
   });
@@ -1278,109 +1217,13 @@ function runReconciliation(ss, tz) {
 }
 
 function addAssignedChargesToTransactions() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const reconSheet = ss.getSheetByName(CONFIG.SHEETS.RECONCILIATION);
-  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
-
-  if (!reconSheet || !txSheet) return;
-
-  const lastRow = reconSheet.getLastRow();
-  if (lastRow < 5) return;
-
-  // Locate Table 2: "MISSING from Sheet"
-  const colA = reconSheet.getRange(1, 1, lastRow, 1).getValues();
-  let table2Start = -1;
-  for (let i = 0; i < colA.length; i++) {
-    if (String(colA[i][0]).includes("MISSING from Sheet")) {
-      table2Start = i + 1;
-      break;
-    }
-  }
-
-  if (table2Start === -1 || table2Start + 2 > lastRow) {
-    SpreadsheetApp.getUi().alert(
-      "No Missing Charges Found",
-      "No unassigned charges found in the Reconciliation sheet.",
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
-    return;
-  }
-
-  const startRow = table2Start + 2;
-  const numRows = lastRow - startRow + 1;
-  const data = reconSheet.getRange(startRow, 1, numRows, 6).getValues();
-  const toAdd = [];
-  const validPayers = ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza", "Shared"];
-
-  // Read existing transactions to prevent duplicates
-  const existingTx = txSheet.getLastRow() >= 2 ? txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues() : [];
-
-  data.forEach((row, idx) => {
-    const amt = parseFloat(row[3]);
-    const payer = String(row[4] || "").trim();
-    const note = String(row[5] || "").trim();
-
-    if (!isNaN(amt) && amt > 0 && validPayers.includes(payer)) {
-      const rawDate = row[1];
-      const desc = note || String(row[2]);
-      const dateObj = new Date(rawDate);
-      const finalDate = isNaN(dateObj.getTime()) ? new Date() : dateObj;
-
-      const alreadyExists = existingTx.some(r => {
-        const rAmt = parseFloat(r[4]);
-        const rDesc = String(r[2] || "").trim().toLowerCase();
-        return Math.abs(rAmt - amt) < 0.05 && rDesc === desc.toLowerCase();
-      });
-
-      if (!alreadyExists) {
-        toAdd.push({
-          date: finalDate,
-          desc: desc,
-          payer: payer,
-          amount: amt
-        });
-      }
-    }
-  });
-
-  if (toAdd.length === 0) {
-    SpreadsheetApp.getUi().alert(
-      "No New Charges Selected",
-      "Please select a name in 'Assign Payer' (Column E) for any missing charges you want to add to Transactions.",
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
-    return;
-  }
-
-  let txLastRow = txSheet.getLastRow();
-  let nextId = 1;
-  if (txLastRow >= 2) {
-    const lastIdVal = txSheet.getRange(txLastRow, 1).getValue();
-    if (!isNaN(parseInt(lastIdVal, 10))) {
-      nextId = parseInt(lastIdVal, 10) + 1;
-    }
-  }
-
-  const newRows = toAdd.map(item => [
-    nextId++,
-    item.date,
-    item.desc,
-    item.payer,
-    item.amount
-  ]);
-
-  txSheet.getRange(txLastRow + 1, 1, newRows.length, 5).setValues(newRows);
-  txSheet.getRange(txLastRow + 1, 2, newRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
-  txSheet.getRange(txLastRow + 1, 5, newRows.length, 1).setNumberFormat("#,##0.00");
-
-  updateLiveDashboard();
-
   SpreadsheetApp.getUi().alert(
-    "Charges Added Successfully",
-    `Successfully added ${toAdd.length} charge(s) to the Transactions sheet!\n` +
-    `The Reconciliation and Monthly Debts have been updated.`,
+    "Safe Mode Active",
+    "Transactions and Installments sheets are kept untouched as user-managed sheets.\n\n" +
+    "Any charges you assign in Reconciliation are automatically included in the Debt Breakdown sheet with a '⚠️ Missing from Transactions sheet' tag.",
     SpreadsheetApp.getUi().ButtonSet.OK
   );
+  updateLiveDashboard();
 }
 
 // ==========================================
@@ -1391,6 +1234,7 @@ function calculateCardBalance(ss, tz) {
   const creditLimit = CONFIG.CREDIT_LIMIT;
   let billedBalance = 0;
   let statementDate = null;
+  let statementDueDate = null;
 
   // Read latest statement closing balance if available
   const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
@@ -1401,6 +1245,12 @@ function calculateCardBalance(ss, tz) {
     }
     const stmtDateVal = stmtSheet.getRange("B2").getValue();
     statementDate = parseDateValue(stmtDateVal, tz);
+    const dueDateVal = stmtSheet.getRange("D2").getValue();
+    statementDueDate = parseDateValue(dueDateVal, tz);
+  }
+
+  if (!statementDueDate && statementDate) {
+    statementDueDate = getDueDateForPurchase(statementDate, tz);
   }
 
   // Calculate Remaining Installments Principal Blocked
@@ -1453,7 +1303,9 @@ function calculateCardBalance(ss, tz) {
 
     const currentMonthLabel = Utilities.formatDate(new Date(), tz, "MMMM yyyy").toLowerCase();
     let stmtDueMonthLabel = "";
-    if (statementDate) {
+    if (statementDueDate) {
+      stmtDueMonthLabel = Utilities.formatDate(statementDueDate, tz, "MMMM yyyy").toLowerCase();
+    } else if (statementDate) {
       const stmtDueDate = getDueDateForPurchase(statementDate, tz);
       if (stmtDueDate) stmtDueMonthLabel = Utilities.formatDate(stmtDueDate, tz, "MMMM yyyy").toLowerCase();
     }
@@ -1470,6 +1322,7 @@ function calculateCardBalance(ss, tz) {
     creditLimit: creditLimit,
     billedBalance: billedBalance,
     statementDate: statementDate,
+    statementDueDate: statementDueDate,
     isCurrentBillPaid: isCurrentBillPaid,
     totalBlockedInstallments: totalBlockedInstallments,
     unbilledNewPurchases: unbilledNewPurchases,
@@ -1497,11 +1350,16 @@ function updateLiveDashboard() {
     return;
   }
 
-  // Clean duplicate transactions if any were added
-  cleanTransactionsSheet(ss);
+  // NOTE: 'Transactions' and 'Installments' sheets are user-managed inputs.
+  // The script NEVER modifies, writes to, or cleans them.
 
   // Run reconciliation
   runReconciliation(ss, tz);
+
+  // Read Card Balance & Active Statement info
+  const cardBal = calculateCardBalance(ss, tz);
+  const activeStatementDueDate = cardBal.statementDueDate || (cardBal.statementDate ? getDueDateForPurchase(cardBal.statementDate, tz) : new Date());
+  const activeStatementSortKey = Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
 
   // Read Paid Months Set
   const paidMonthsSet = new Set();
@@ -1522,7 +1380,7 @@ function updateLiveDashboard() {
   const allDebts = {};
   const debtLineItems = [];
 
-  function addDebtItem({ dueDate, person, category, desc, installmentInfo, purchaseDate, originalAmount, amount }) {
+  function addDebtItem({ dueDate, person, category, desc, installmentInfo, purchaseDate, originalAmount, amount, isMissingFromSheet, note }) {
     const sortKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
     const label = Utilities.formatDate(dueDate, tz, "MMMM yyyy");
     const rawP = String(person || "").trim();
@@ -1535,6 +1393,7 @@ function updateLiveDashboard() {
         total: 0,
         purchasesTotal: 0,
         installmentsTotal: 0,
+        missingFromSheetTotal: 0,
         people: {},
         peopleBreakdown: {}
       };
@@ -1543,19 +1402,23 @@ function updateLiveDashboard() {
     allDebts[sortKey].total += amount;
     if (category === "Purchase") {
       allDebts[sortKey].purchasesTotal += amount;
-    } else {
+    } else if (category === "Installment") {
       allDebts[sortKey].installmentsTotal += amount;
+    } else if (category === "MissingStatementDebit" || isMissingFromSheet) {
+      allDebts[sortKey].missingFromSheetTotal += amount;
     }
 
     allDebts[sortKey].people[normalizedPerson] = (allDebts[sortKey].people[normalizedPerson] || 0) + amount;
 
     if (!allDebts[sortKey].peopleBreakdown[normalizedPerson]) {
-      allDebts[sortKey].peopleBreakdown[normalizedPerson] = { purchases: 0, installments: 0, total: 0 };
+      allDebts[sortKey].peopleBreakdown[normalizedPerson] = { purchases: 0, installments: 0, missingFromSheet: 0, total: 0 };
     }
     if (category === "Purchase") {
       allDebts[sortKey].peopleBreakdown[normalizedPerson].purchases += amount;
-    } else {
+    } else if (category === "Installment") {
       allDebts[sortKey].peopleBreakdown[normalizedPerson].installments += amount;
+    } else if (category === "MissingStatementDebit" || isMissingFromSheet) {
+      allDebts[sortKey].peopleBreakdown[normalizedPerson].missingFromSheet += amount;
     }
     allDebts[sortKey].peopleBreakdown[normalizedPerson].total += amount;
 
@@ -1569,11 +1432,14 @@ function updateLiveDashboard() {
       installmentInfo: installmentInfo || "-",
       purchaseDate: purchaseDate,
       originalAmount: originalAmount,
-      amount: amount
+      amount: amount,
+      isMissingFromSheet: !!isMissingFromSheet,
+      note: note || ""
     });
   }
 
-  // 1. Process One-Time Payments
+  // 1. Process One-Time Payments (Read-only from Transactions)
+  const existingTransactionsForDedupe = [];
   if (transactionsSheet.getLastRow() >= 2) {
     const txData = transactionsSheet.getRange(2, 1, transactionsSheet.getLastRow() - 1, 5).getValues();
     txData.forEach(row => {
@@ -1586,6 +1452,12 @@ function updateLiveDashboard() {
       const purchaseDate = parseDateValue(rawDate, tz);
       const amount = parseFloat(rawAmount);
       if (!purchaseDate || isNaN(amount) || amount <= 0) return;
+
+      existingTransactionsForDedupe.push({
+        date: purchaseDate,
+        desc: desc.toLowerCase(),
+        amount: amount
+      });
 
       const dueDate = getDueDateForPurchase(purchaseDate, tz);
       if (!dueDate) return;
@@ -1603,16 +1475,16 @@ function updateLiveDashboard() {
           installmentInfo: "-",
           purchaseDate: purchaseDate,
           originalAmount: amount,
-          amount: splitAmount
+          amount: splitAmount,
+          isMissingFromSheet: false
         });
       });
     });
   }
 
-  // 2. Process Installments (Exact NBE Cutoff Rule)
+  // 2. Process Installments (Read-only from Installments, NO WRITES)
   if (installmentsSheet.getLastRow() >= 2) {
     const instData = installmentsSheet.getRange(2, 1, installmentsSheet.getLastRow() - 1, 11).getValues();
-    const newInstallmentStatuses = [];
 
     instData.forEach(row => {
       const rawDate = row[1];
@@ -1620,19 +1492,13 @@ function updateLiveDashboard() {
       const durationMonths = parseInt(row[4], 10);
       const emi = parseFloat(row[7]);
       const rawPayer = row[8];
-      const existingPaymentsMade = parseInt(row[9], 10) || 0;
-      const existingStatus = String(row[10] || "").trim().toLowerCase();
 
       if (!rawDate || isNaN(durationMonths) || durationMonths <= 0 || isNaN(emi) || emi <= 0 || !rawPayer) {
-        newInstallmentStatuses.push([row[9] || "", row[10] || ""]);
         return;
       }
 
       const purchaseDate = parseDateValue(rawDate, tz);
-      if (!purchaseDate) {
-        newInstallmentStatuses.push([row[9] || "", row[10] || ""]);
-        return;
-      }
+      if (!purchaseDate) return;
 
       const rawPayerStr = String(rawPayer).trim();
       const people = rawPayerStr.split(/[\+\,\/]/).map(p => p.trim()).filter(p => p);
@@ -1641,15 +1507,8 @@ function updateLiveDashboard() {
       // First installment is due in the statement cycle of the purchase date
       const firstDueDate = getDueDateForPurchase(purchaseDate, tz);
 
-      let paymentsCounted = 0;
       for (let i = 0; i < durationMonths; i++) {
         const dueMonthDate = new Date(firstDueDate.getFullYear(), firstDueDate.getMonth() + i, 1);
-        const monthKey = Utilities.formatDate(dueMonthDate, tz, "MMMM yyyy").toLowerCase();
-
-        if (paidMonthsSet.has(monthKey)) {
-          paymentsCounted++;
-        }
-
         const instInfo = `${i + 1} of ${durationMonths}`;
 
         people.forEach(p => {
@@ -1661,28 +1520,67 @@ function updateLiveDashboard() {
             installmentInfo: instInfo,
             purchaseDate: purchaseDate,
             originalAmount: emi,
-            amount: splitEmi
+            amount: splitEmi,
+            isMissingFromSheet: false
           });
         });
       }
-
-      // Preserve existing payments made if higher (e.g. from bank statement sync)
-      const finalPaymentsMade = Math.max(existingPaymentsMade, paymentsCounted);
-      const isCompleted = (finalPaymentsMade >= durationMonths) || (existingStatus === "completed");
-      newInstallmentStatuses.push([finalPaymentsMade, isCompleted ? "Completed" : "Ongoing"]);
     });
-
-    if (newInstallmentStatuses.length > 0) {
-      installmentsSheet.getRange(2, 10, newInstallmentStatuses.length, 2).setValues(newInstallmentStatuses);
-    }
   }
 
-  // 3. Render Dashboard in 'Monthly Debts'
+  // 3. Process Assigned Statement Charges (Charges on Bank Statement MISSING from Transactions sheet)
+  const scriptProps = PropertiesService.getScriptProperties();
+  let assignedMap = {};
+  try {
+    assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
+  } catch (err) {}
+
+  let assignedMissingCount = 0;
+  let assignedMissingTotal = 0;
+
+  Object.keys(assignedMap).forEach(key => {
+    const item = assignedMap[key];
+    if (!item || !item.payer || !item.amount || item.amount <= 0) return;
+
+    // Check if user manually typed this into Transactions sheet already
+    const cleanDesc = cleanMerchantName(item.desc);
+    const alreadyInTx = existingTransactionsForDedupe.some(tx => {
+      return Math.abs(tx.amount - item.amount) < 0.05 && 
+             (tx.desc.includes(cleanDesc) || cleanDesc.includes(tx.desc));
+    });
+
+    if (alreadyInTx) return;
+
+    assignedMissingCount++;
+    assignedMissingTotal += item.amount;
+
+    const chargeDueDate = activeStatementDueDate;
+    const chargeDate = parseDateValue(item.dateStr, tz) || cardBal.statementDate || chargeDueDate;
+
+    const rawPayerStr = String(item.payer).trim();
+    const people = rawPayerStr.split(/[\+\,\/]/).map(p => p.trim()).filter(p => p);
+    const splitAmount = item.amount / Math.max(1, people.length);
+
+    people.forEach(p => {
+      addDebtItem({
+        dueDate: chargeDueDate,
+        person: p,
+        category: "MissingStatementDebit",
+        desc: item.desc || "Statement Charge",
+        installmentInfo: "-",
+        purchaseDate: chargeDate,
+        originalAmount: item.amount,
+        amount: splitAmount,
+        isMissingFromSheet: true,
+        note: item.note || cleanMerchantName(item.desc)
+      });
+    });
+  });
+
+  // 4. Render Dashboard in 'Monthly Debts'
   debtsSheet.clear();
 
   // Overview Card
-  const cardBal = calculateCardBalance(ss, tz);
-
   debtsSheet.getRange("A1:B1").merge()
     .setValue("💳 NBE Credit Card Overview (Limit: 100,000 EGP)")
     .setFontWeight("bold")
@@ -1725,14 +1623,6 @@ function updateLiveDashboard() {
   const today = new Date();
   const currentMonthSortKey = Utilities.formatDate(today, tz, "yyyy-MM");
   const todayDay = parseInt(Utilities.formatDate(today, tz, "d"), 10);
-
-  let stmtDueMonthSortKey = null;
-  if (cardBal.statementDate) {
-    const sDueDate = getDueDateForPurchase(cardBal.statementDate, tz);
-    if (sDueDate) {
-      stmtDueMonthSortKey = Utilities.formatDate(sDueDate, tz, "yyyy-MM");
-    }
-  }
 
   // ==========================================
   // MASTER MATRIX TABLE (DIVIDED BY PERSON IN ONE TABLE)
@@ -1788,7 +1678,7 @@ function updateLiveDashboard() {
       statusColor = CONFIG.COLORS.DUE_SOON;
     }
 
-    const isStatementMonth = (key === stmtDueMonthSortKey) || (!stmtDueMonthSortKey && (statusLabel.includes("Due Soon") || key === currentMonthSortKey));
+    const isStatementMonth = (key === activeStatementSortKey);
     const bankBillVal = (cardBal.billedBalance > 0 && isStatementMonth) ? cardBal.billedBalance : "";
     const diffVal = (typeof bankBillVal === "number") ? (data.total - bankBillVal) : "";
 
@@ -1887,13 +1777,13 @@ function updateLiveDashboard() {
 
     // Data Rows
     const rows = [];
-    const isStatementMonth = (key === stmtDueMonthSortKey) || (!stmtDueMonthSortKey && (isDueSoon || key === currentMonthSortKey));
+    const isStatementMonth = (key === activeStatementSortKey);
     let bankDueOffset = -1;
 
     if (cardBal.billedBalance > 0 && isStatementMonth) {
       bankDueOffset = rows.length;
       rows.push(["🏦 BANK STATEMENT DUE (Must Pay):", cardBal.billedBalance, "Exact statement closing balance from NBE"]);
-      rows.push(["👥 Sum of Individual Family Shares:", data.total, "Total purchases & installments in this cycle"]);
+      rows.push(["👥 Sum of Individual Family Shares:", data.total, "Total purchases, EMIs & assigned items in this cycle"]);
 
       const diff = data.total - cardBal.billedBalance;
       if (Math.abs(diff) < 1.00) {
@@ -1914,8 +1804,12 @@ function updateLiveDashboard() {
     const activePeople = Object.keys(data.people).sort();
     activePeople.forEach(p => {
       const pTotal = data.people[p];
-      const bk = data.peopleBreakdown[p] || { purchases: 0, installments: 0 };
-      const bkStr = `Purchases: ${bk.purchases.toFixed(2)} | EMIs: ${bk.installments.toFixed(2)}`;
+      const bk = data.peopleBreakdown[p] || { purchases: 0, installments: 0, missingFromSheet: 0 };
+      const bkParts = [];
+      if (bk.purchases > 0) bkParts.push(`Purchases: ${bk.purchases.toFixed(2)}`);
+      if (bk.installments > 0) bkParts.push(`EMIs: ${bk.installments.toFixed(2)}`);
+      if (bk.missingFromSheet > 0) bkParts.push(`⚠️ Missing from Sheet: ${bk.missingFromSheet.toFixed(2)}`);
+      const bkStr = bkParts.join(" | ") || `Total: ${pTotal.toFixed(2)}`;
       rows.push([p, pTotal, bkStr]);
     });
 
@@ -1951,24 +1845,42 @@ function updateLiveDashboard() {
 
   debtsSheet.autoResizeColumns(1, totalCols);
 
-  // 4. Render Dedicated 'Debt Breakdown' Sheet
-  renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal);
+  // 5. Render Dedicated 'Debt Breakdown' Sheet
+  renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeStatementDueDate, assignedMissingCount, assignedMissingTotal);
 }
 
-function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal) {
+function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeStatementDueDate, assignedMissingCount, assignedMissingTotal) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.DEBT_BREAKDOWN);
   sheet.clear();
+  sheet.setHideGridlines(false);
+
+  const activeSortKey = Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
+  const activeMonthLabel = Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
+  const activeDueDateFormatted = Utilities.formatDate(activeStatementDueDate, tz, "EEEE, MMMM d, yyyy");
+  const activeData = allDebts[activeSortKey] || {
+    label: activeMonthLabel,
+    total: 0,
+    purchasesTotal: 0,
+    installmentsTotal: 0,
+    missingFromSheetTotal: 0,
+    people: {},
+    peopleBreakdown: {}
+  };
+
+  const isCurrentPaid = paidMonthsSet.has(activeMonthLabel.toLowerCase());
+  const bankBill = cardBal.billedBalance || 0;
+  const diff = activeData.total - bankBill;
 
   // Banner
-  sheet.getRange("A1:J1").merge()
-    .setValue("💳 NBE Credit Card — Complete Itemized Debt Breakdown & Audit Register")
+  sheet.getRange("A1:I1").merge()
+    .setValue("💳 NBE Credit Card — Active Statement Debt Breakdown (" + activeMonthLabel + ")")
     .setFontWeight("bold")
-    .setFontSize(13)
+    .setFontSize(14)
     .setBackground(CONFIG.COLORS.PRIMARY)
     .setFontColor("#ffffff");
 
-  sheet.getRange("A2:J2").merge()
-    .setValue("Every single purchase and installment installment divided by person and due month. Filter or sort by any column to audit.")
+  sheet.getRange("A2:I2").merge()
+    .setValue("Active billing cycle payment breakdown for the latest uploaded statement. All debt divided by family member.")
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
@@ -1976,95 +1888,159 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   let curRow = 4;
 
   // ==========================================
-  // SECTION 1: PERSON TOTALS & DEBT COMPOSITION
+  // ACTIVE STATEMENT RECONCILIATION SUMMARY CARD
   // ==========================================
   sheet.getRange(curRow, 1, 1, 6).merge()
-    .setValue("👥 Family Members — Debt Summary & Composition")
+    .setValue("📊 Active Statement Overview & Audit Reconciliation")
     .setFontWeight("bold")
     .setFontSize(11)
     .setBackground(CONFIG.COLORS.HEADER);
   curRow++;
 
-  const summaryHeaders = ["Person", "One-Time Purchases (EGP)", "Installments (EGP)", "Total Debt (EGP)", "% of Total Debt", "Due / Overdue Now (EGP)"];
+  const stmtDateStr = cardBal.statementDate ? Utilities.formatDate(cardBal.statementDate, tz, "yyyy-MM-dd") : "N/A";
+  let statusBadge = "✅ Perfect Match (0.00 EGP difference)";
+  let statusColor = CONFIG.COLORS.PAID;
+  if (Math.abs(diff) >= 1.00) {
+    if (diff > 0) {
+      statusBadge = "ℹ️ Family debts exceed bank bill by +" + diff.toFixed(2) + " EGP";
+      statusColor = CONFIG.COLORS.DUE_SOON;
+    } else {
+      statusBadge = "⚠️ Bank bill exceeds recorded shares by -" + Math.abs(diff).toFixed(2) + " EGP (Missing items)";
+      statusColor = CONFIG.COLORS.OVERDUE;
+    }
+  }
+
+  const kpiRows = [
+    ["Statement Date:", stmtDateStr, "Bank Closing Balance (Must Pay):", bankBill, "Reconciliation Status:", statusBadge],
+    ["Payment Due Date:", activeDueDateFormatted, "Sum of Family Shares Accounted For:", activeData.total, "Audit Difference (Diff):", diff],
+    ["Active Billing Cycle:", activeMonthLabel, "Total One-Time Purchases:", activeData.purchasesTotal, "Total Monthly Installments:", activeData.installmentsTotal]
+  ];
+
+  sheet.getRange(curRow, 1, kpiRows.length, 6).setValues(kpiRows);
+  sheet.getRange(curRow, 1, kpiRows.length, 1).setFontWeight("bold").setFontSize(9);
+  sheet.getRange(curRow, 3, kpiRows.length, 1).setFontWeight("bold").setFontSize(9);
+  sheet.getRange(curRow, 5, kpiRows.length, 1).setFontWeight("bold").setFontSize(9);
+  sheet.getRange(curRow, 4, kpiRows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+  sheet.getRange(curRow + 1, 6).setNumberFormat("#,##0.00").setFontWeight("bold");
+  sheet.getRange(curRow + 2, 6).setNumberFormat("#,##0.00").setFontWeight("bold");
+  sheet.getRange(curRow, 1, kpiRows.length, 6).setBackground(CONFIG.COLORS.PRIMARY_LIGHT).setBorder(true, true, true, true, true, true);
+  sheet.getRange(curRow, 6).setBackground(statusColor);
+  curRow += kpiRows.length + 1;
+
+  if (assignedMissingCount > 0) {
+    sheet.getRange(curRow, 1, 1, 7).merge()
+      .setValue("⚠️ NOTICE: " + assignedMissingCount + " charge(s) totaling " + Utilities.formatString("%.2f", assignedMissingTotal) + " EGP are assigned from Bank Statement but MISSING from Transactions sheet!")
+      .setFontWeight("bold")
+      .setFontColor("#b71c1c")
+      .setBackground(CONFIG.COLORS.DUE_SOON);
+    curRow += 2;
+  }
+
+  // ==========================================
+  // TABLE 1: 👥 ACTIVE STATEMENT BILL (Divided by Person in One Table)
+  // ==========================================
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("👥 Active Statement Bill (" + activeMonthLabel + ") — Family Shares Divided in One Table")
+    .setFontWeight("bold")
+    .setFontSize(12)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff");
+  curRow++;
+
+  const summaryHeaders = [
+    "Person",
+    "🛒 Purchases (EGP)",
+    "📦 Installments (EGP)",
+    "⚠️ Missing from Sheet (EGP)",
+    "Total Share Due (EGP)",
+    "% of Bank Bill",
+    "Payment Status"
+  ];
+
   sheet.getRange(curRow, 1, 1, summaryHeaders.length).setValues([summaryHeaders])
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.HEADER)
     .setBorder(true, true, true, true, true, true);
   curRow++;
 
-  const today = new Date();
-  const currentMonthSortKey = Utilities.formatDate(today, tz, "yyyy-MM");
-
-  let totalPurchasesAll = 0;
-  let totalInstallmentsAll = 0;
-  let grandTotalAll = 0;
-  let grandDueNow = 0;
-
-  const personStats = {};
-  sortedPeople.forEach(p => {
-    personStats[p] = { purchases: 0, installments: 0, total: 0, dueNow: 0 };
+  const activePeople = sortedPeople.filter(p => {
+    const bk = activeData.peopleBreakdown[p];
+    return bk && bk.total > 0;
   });
 
-  debtLineItems.forEach(it => {
-    if (!personStats[it.person]) {
-      personStats[it.person] = { purchases: 0, installments: 0, total: 0, dueNow: 0 };
-    }
-    const isPaid = paidMonthsSet.has(it.dueMonthLabel.toLowerCase());
-    const isDueOrOverdue = !isPaid && (it.sortKey <= currentMonthSortKey);
-
-    if (it.category === "Purchase") {
-      personStats[it.person].purchases += it.amount;
-      totalPurchasesAll += it.amount;
-    } else {
-      personStats[it.person].installments += it.amount;
-      totalInstallmentsAll += it.amount;
-    }
-    personStats[it.person].total += it.amount;
-    grandTotalAll += it.amount;
-
-    if (isDueOrOverdue) {
-      personStats[it.person].dueNow += it.amount;
-      grandDueNow += it.amount;
-    }
-  });
-
-  const sumRows = sortedPeople.map(p => {
-    const st = personStats[p];
-    const pct = grandTotalAll > 0 ? (st.total / grandTotalAll) : 0;
-    return [p, st.purchases, st.installments, st.total, pct, st.dueNow];
+  const sumRows = activePeople.map(p => {
+    const bk = activeData.peopleBreakdown[p] || { purchases: 0, installments: 0, missingFromSheet: 0, total: 0 };
+    const pct = bankBill > 0 ? (bk.total / bankBill) : (activeData.total > 0 ? bk.total / activeData.total : 0);
+    const pStatus = isCurrentPaid ? "✅ Paid" : "🕒 Pending Payment";
+    return [
+      p,
+      bk.purchases,
+      bk.installments,
+      bk.missingFromSheet,
+      bk.total,
+      pct,
+      pStatus
+    ];
   });
 
   if (sumRows.length > 0) {
     sheet.getRange(curRow, 1, sumRows.length, summaryHeaders.length).setValues(sumRows);
-    sheet.getRange(curRow, 2, sumRows.length, 3).setNumberFormat("#,##0.00");
-    sheet.getRange(curRow, 5, sumRows.length, 1).setNumberFormat("0.0%");
-    sheet.getRange(curRow, 6, sumRows.length, 1).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 2, sumRows.length, 4).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 6, sumRows.length, 1).setNumberFormat("0.0%");
     sheet.getRange(curRow, 1, sumRows.length, 1).setFontWeight("bold");
+
+    for (let i = 0; i < sumRows.length; i++) {
+      if (sumRows[i][3] > 0) {
+        // Highlight cell in Missing column
+        sheet.getRange(curRow + i, 4).setBackground(CONFIG.COLORS.DUE_SOON).setFontWeight("bold");
+      }
+      sheet.getRange(curRow + i, 7).setBackground(isCurrentPaid ? CONFIG.COLORS.PAID : CONFIG.COLORS.UPCOMING);
+    }
     curRow += sumRows.length;
   }
 
-  // Family Total Row
-  const totalRow = ["FAMILY TOTAL", totalPurchasesAll, totalInstallmentsAll, grandTotalAll, 1.00, grandDueNow];
-  sheet.getRange(curRow, 1, 1, summaryHeaders.length).setValues([totalRow])
+  // Total Row for Active Bill
+  const totalPct = bankBill > 0 ? (activeData.total / bankBill) : 1.00;
+  const activeTotalRow = [
+    "TOTAL ACTIVE STATEMENT BILL",
+    activeData.purchasesTotal,
+    activeData.installmentsTotal,
+    activeData.missingFromSheetTotal,
+    activeData.total,
+    totalPct,
+    isCurrentPaid ? "✅ Settled with NBE" : "⚠️ Must Pay NBE"
+  ];
+
+  sheet.getRange(curRow, 1, 1, summaryHeaders.length).setValues([activeTotalRow])
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
     .setBorder(true, true, true, true, true, true);
-  sheet.getRange(curRow, 2, 1, 3).setNumberFormat("#,##0.00");
-  sheet.getRange(curRow, 5, 1, 1).setNumberFormat("0.0%");
-  sheet.getRange(curRow, 6, 1, 1).setNumberFormat("#,##0.00");
+  sheet.getRange(curRow, 2, 1, 4).setNumberFormat("#,##0.00");
+  sheet.getRange(curRow, 6, 1, 1).setNumberFormat("0.0%");
   curRow += 3;
 
   // ==========================================
-  // SECTION 2: ITEMIZED REGISTER (EVERY CHARGE ACCOUNTED FOR)
+  // TABLE 2: 📋 ACTIVE STATEMENT ITEMIZED CHARGES (Every Single Charge)
   // ==========================================
-  sheet.getRange(curRow, 1, 1, 10).merge()
-    .setValue("📋 Itemized Dues Register (Every Single Charge Divided & Accounted For)")
+  sheet.getRange(curRow, 1, 1, 9).merge()
+    .setValue("📋 Itemized Charges for " + activeMonthLabel + " Statement (Every Charge Making Up This Bill)")
     .setFontWeight("bold")
     .setFontSize(11)
     .setBackground(CONFIG.COLORS.HEADER);
   curRow++;
 
-  const itemHeaders = ["#", "Due Month", "Person", "Category", "Merchant / Description", "Installment Progress", "Purchase Date", "Person's Share (EGP)", "Original Charge (EGP)", "Month Status"];
+  const itemHeaders = [
+    "#",
+    "Person",
+    "Category",
+    "Merchant / Description",
+    "Installment Progress",
+    "Charge Date",
+    "Person's Share (EGP)",
+    "Original Amount (EGP)",
+    "Source / Audit Note"
+  ];
+
   sheet.getRange(curRow, 1, 1, itemHeaders.length).setValues([itemHeaders])
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.HEADER)
@@ -2073,73 +2049,145 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
 
   const headerRowForFilter = curRow - 1;
 
-  // Sort debtLineItems: sortKey ascending, person ascending, category ("Purchase" first)
-  debtLineItems.sort((a, b) => {
-    if (a.sortKey !== b.sortKey) return a.sortKey.localeCompare(b.sortKey);
+  // Filter items strictly for the active statement
+  const activeItems = debtLineItems.filter(it => it.sortKey === activeSortKey);
+  // Sort: Missing first (to highlight), then Installments, then Purchases
+  activeItems.sort((a, b) => {
+    if (a.isMissingFromSheet !== b.isMissingFromSheet) return a.isMissingFromSheet ? -1 : 1;
     if (a.person !== b.person) return a.person.localeCompare(b.person);
-    if (a.category !== b.category) return a.category === "Purchase" ? -1 : 1;
+    if (a.category !== b.category) return a.category === "Installment" ? -1 : 1;
     return a.desc.localeCompare(b.desc);
   });
 
-  const todayDay = parseInt(Utilities.formatDate(today, tz, "d"), 10);
   const regRows = [];
-  const regRowColors = [];
+  const regColors = [];
 
-  debtLineItems.forEach((it, idx) => {
-    const isPaid = paidMonthsSet.has(it.dueMonthLabel.toLowerCase());
-    let statusLabel = "🕒 Upcoming";
+  activeItems.forEach((it, idx) => {
+    let catLabel = "🛒 One-Time Purchase";
+    let sourceNote = "Transactions Sheet";
+    let rowColor = null;
 
-    if (isPaid) {
-      statusLabel = "✅ Paid";
-    } else if (it.sortKey < currentMonthSortKey || (it.sortKey === currentMonthSortKey && todayDay > 25)) {
-      statusLabel = "🚨 Overdue";
-    } else if (it.sortKey === currentMonthSortKey && todayDay <= 25) {
-      statusLabel = "⚠️ Due Soon (25th)";
+    if (it.isMissingFromSheet) {
+      catLabel = "⚠️ Statement Charge";
+      sourceNote = "⚠️ MISSING from Transactions sheet (Assigned from Bank Statement)";
+      rowColor = "#fff3cd"; // Alert yellow
+    } else if (it.category === "Installment") {
+      catLabel = "📦 Installment";
+      sourceNote = "Installments Sheet";
+      rowColor = CONFIG.COLORS.ACCENT_BLUE;
     }
 
     regRows.push([
       idx + 1,
-      it.dueMonthLabel,
       it.person,
-      it.category === "Purchase" ? "🛒 Purchase" : "📦 Installment",
+      catLabel,
       it.desc,
       it.installmentInfo,
       it.purchaseDate,
       it.amount,
       it.originalAmount,
-      statusLabel
+      sourceNote
     ]);
-
-    if (it.category === "Installment") {
-      regRowColors.push(CONFIG.COLORS.ACCENT_BLUE);
-    } else if (isPaid) {
-      regRowColors.push(CONFIG.COLORS.PAID);
-    } else {
-      regRowColors.push(null);
-    }
+    regColors.push(rowColor);
   });
 
   if (regRows.length > 0) {
     const regRange = sheet.getRange(curRow, 1, regRows.length, itemHeaders.length);
     regRange.setValues(regRows);
 
-    sheet.getRange(curRow, 7, regRows.length, 1).setNumberFormat("yyyy-MM-dd");
-    sheet.getRange(curRow, 8, regRows.length, 2).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 6, regRows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(curRow, 7, regRows.length, 2).setNumberFormat("#,##0.00");
     sheet.getRange(curRow, 1, regRows.length, 1).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
 
     for (let r = 0; r < regRows.length; r++) {
-      if (regRowColors[r]) {
-        sheet.getRange(curRow + r, 1, 1, itemHeaders.length).setBackground(regRowColors[r]);
+      if (regColors[r]) {
+        sheet.getRange(curRow + r, 1, 1, itemHeaders.length).setBackground(regColors[r]);
+      }
+      if (regRows[r][8].includes("MISSING")) {
+        sheet.getRange(curRow + r, 9).setFontWeight("bold").setFontColor("#b71c1c");
       }
     }
 
-    const filterRange = sheet.getRange(headerRowForFilter, 1, regRows.length + 1, itemHeaders.length);
     try {
       const existingFilter = sheet.getFilter();
       if (existingFilter) existingFilter.remove();
-      filterRange.createFilter();
+      sheet.getRange(headerRowForFilter, 1, regRows.length + 1, itemHeaders.length).createFilter();
     } catch (e) {}
+
+    curRow += regRows.length + 3;
+  } else {
+    sheet.getRange(curRow, 1, 1, 9).merge().setValue("No charges found for this statement cycle.");
+    curRow += 3;
   }
 
-  sheet.autoResizeColumns(1, 10);
+  // ==========================================
+  // SECTION 3: 📅 OTHER BILLING CYCLES (Individual Tables for Each Month)
+  // ==========================================
+  const otherKeys = Object.keys(allDebts).sort().filter(k => k !== activeSortKey);
+
+  if (otherKeys.length > 0) {
+    sheet.getRange(curRow, 1, 1, 7).merge()
+      .setValue("📅 Other Billing Cycles (Individual Monthly Tables)")
+      .setFontWeight("bold")
+      .setFontSize(13)
+      .setBackground(CONFIG.COLORS.PRIMARY)
+      .setFontColor("#ffffff");
+    curRow++;
+
+    sheet.getRange(curRow, 1, 1, 7).merge()
+      .setValue("Upcoming and previous monthly dues. Each month has its own dedicated breakdown table below.")
+      .setFontStyle("italic")
+      .setFontSize(9)
+      .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+    curRow += 2;
+
+    otherKeys.forEach(mKey => {
+      const mData = allDebts[mKey];
+      const mLabel = mData.label;
+      const isPaid = paidMonthsSet.has(mLabel.toLowerCase());
+
+      // Header Bar for this month
+      const mTitle = `📅 ${mLabel} (Due 25th) — Total Due: ${mData.total.toFixed(2)} EGP ${isPaid ? "✅ [PAID]" : "🕒 [UPCOMING]"}`;
+      sheet.getRange(curRow, 1, 1, 5).merge()
+        .setValue(mTitle)
+        .setFontWeight("bold")
+        .setFontSize(11)
+        .setBackground(isPaid ? CONFIG.COLORS.PAID : CONFIG.COLORS.HEADER);
+      curRow++;
+
+      const mHeaders = ["Person", "🛒 Purchases (EGP)", "📦 Installments (EGP)", "Total Due (EGP)", "% of Month Bill"];
+      sheet.getRange(curRow, 1, 1, mHeaders.length).setValues([mHeaders])
+        .setFontWeight("bold")
+        .setBackground(CONFIG.COLORS.HEADER)
+        .setBorder(true, true, true, true, true, true);
+      curRow++;
+
+      const mPeople = sortedPeople.filter(p => (mData.peopleBreakdown[p] && mData.peopleBreakdown[p].total > 0));
+      const mRows = mPeople.map(p => {
+        const bk = mData.peopleBreakdown[p] || { purchases: 0, installments: 0, total: 0 };
+        const pct = mData.total > 0 ? (bk.total / mData.total) : 0;
+        return [p, bk.purchases, bk.installments, bk.total, pct];
+      });
+
+      if (mRows.length > 0) {
+        sheet.getRange(curRow, 1, mRows.length, mHeaders.length).setValues(mRows);
+        sheet.getRange(curRow, 2, mRows.length, 3).setNumberFormat("#,##0.00");
+        sheet.getRange(curRow, 5, mRows.length, 1).setNumberFormat("0.0%");
+        sheet.getRange(curRow, 1, mRows.length, 1).setFontWeight("bold");
+        curRow += mRows.length;
+      }
+
+      // Total Row for this month
+      const mTotalRow = ["TOTAL (" + mLabel + ")", mData.purchasesTotal, mData.installmentsTotal, mData.total, 1.00];
+      sheet.getRange(curRow, 1, 1, mHeaders.length).setValues([mTotalRow])
+        .setFontWeight("bold")
+        .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
+        .setBorder(true, true, true, true, true, true);
+      sheet.getRange(curRow, 2, 1, 3).setNumberFormat("#,##0.00");
+      sheet.getRange(curRow, 5, 1, 1).setNumberFormat("0.0%");
+      curRow += 2;
+    });
+  }
+
+  sheet.autoResizeColumns(1, 9);
 }
