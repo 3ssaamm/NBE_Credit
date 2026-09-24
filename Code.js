@@ -117,23 +117,21 @@ function onEdit(e) {
   const row = e.range.getRow();
   if (row < 5) return;
 
-  const validPayers = ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza", "Shared"];
+  const lastRow = sheet.getLastRow();
+  const colA = sheet.getRange(1, 1, lastRow, 1).getValues();
+  let table1Start = -1;
+  let table2Start = -1;
+  let table3Start = -1;
 
-  // Table 2: User assigns a Payer in Column E (col 5) or Custom Note in Column F (col 6)
-  if (col === 5 || col === 6) {
-    // Check that row is strictly in Table 2 (under "MISSING from Sheet")
-    const lastRow = sheet.getLastRow();
-    const colA = sheet.getRange(1, 1, lastRow, 1).getValues();
-    let table2Start = -1;
-    for (let i = 0; i < colA.length; i++) {
-      if (String(colA[i][0]).includes("MISSING from Sheet")) {
-        table2Start = i + 1;
-        break;
-      }
-    }
-    if (table2Start === -1 || row <= table2Start + 1) return;
+  for (let i = 0; i < colA.length; i++) {
+    const text = String(colA[i][0] || "");
+    if (text.includes("Suggested Matches")) table1Start = i + 1;
+    if (text.includes("MISSING from Sheet")) table2Start = i + 1;
+    if (text.includes("NOT Found on Bank Statement") || text.includes("Transactions in Sheet NOT")) table3Start = i + 1;
+  }
 
-    // Read row values: Col 1 (#), Col 2 (Date), Col 3 (Desc), Col 4 (Amount), Col 5 (Payer), Col 6 (Custom Note)
+  // Case 1: Table 2 edit (Col 5 = Assign Payer, Col 6 = Custom Note)
+  if ((col === 5 || col === 6) && table2Start > 0 && row > table2Start + 1 && (table3Start === -1 || row < table3Start)) {
     const rowValues = sheet.getRange(row, 1, 1, 6).getValues()[0];
     const rawDate = rowValues[1];
     const origDesc = String(rowValues[2] || "").trim();
@@ -153,59 +151,114 @@ function onEdit(e) {
     } catch (err) {}
 
     if (payer) {
+      const isNeglected = (payer === "🚫 Neglect / Ignore" || payer.toLowerCase().includes("neglect"));
       assignedMap[chargeKey] = {
         dateStr: dateStr,
         desc: origDesc,
         amount: amt,
-        payer: payer,
+        payer: isNeglected ? "NEGLECT" : payer,
         note: note
       };
       scriptProps.setProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
 
-      // Style row in Reconciliation as assigned
-      sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
+      if (isNeglected) {
+        sheet.getRange(row, 1, 1, 6).setBackground("#eeeeee");
+        SpreadsheetApp.getActiveSpreadsheet().toast(
+          `Marked "${origDesc}" (${amt.toFixed(2)} EGP) as Neglected/Ignored!`,
+          "🚫 Charge Neglected",
+          4
+        );
+      } else {
+        sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
+        SpreadsheetApp.getActiveSpreadsheet().toast(
+          `Assigned "${origDesc}" (${amt.toFixed(2)} EGP) to ${payer} directly in Debt Breakdown (⚠️ Missing from Transactions)!`,
+          "💳 Assigned to Debt Breakdown",
+          4
+        );
+      }
 
-      // Refresh Live Dashboard and Debt Breakdown directly (WITHOUT modifying Transactions sheet!)
       updateLiveDashboard();
-
-      SpreadsheetApp.getActiveSpreadsheet().toast(
-        `Assigned "${origDesc}" (${amt.toFixed(2)} EGP) to ${payer} directly in Debt Breakdown (⚠️ Missing from Transactions)!`,
-        "💳 Assigned to Debt Breakdown",
-        4
-      );
     } else {
       delete assignedMap[chargeKey];
       scriptProps.setProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
       sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.OVERDUE);
       updateLiveDashboard();
     }
+    return;
   }
 
-  // Table 1: User confirms a Suggested Match in Column G (col 7)
-  if (col === 7 && (e.value === "TRUE" || e.range.getValue() === true)) {
-    const rowValues = sheet.getRange(row, 1, 1, 7).getValues()[0];
-    const rawDate = rowValues[1];
-    const stmtDesc = String(rowValues[2] || "").trim();
-    const amt = parseFloat(rowValues[3]);
+  // Case 2: Table 1 confirm match (Col 7 checkbox)
+  if (col === 7 && table1Start > 0 && row > table1Start + 1 && (table2Start === -1 || row < table2Start)) {
+    if (e.value === "TRUE" || e.range.getValue() === true) {
+      const rowValues = sheet.getRange(row, 1, 1, 7).getValues()[0];
+      const rawDate = rowValues[1];
+      const stmtDesc = String(rowValues[2] || "").trim();
+      const amt = parseFloat(rowValues[3]);
 
-    if (!isNaN(amt) && amt > 0) {
-      const dateStr = String(rawDate);
-      const stKey = `${dateStr}_${amt.toFixed(2)}_${stmtDesc.substring(0, 20)}`;
+      if (!isNaN(amt) && amt > 0) {
+        const dateStr = String(rawDate);
+        const stKey = `${dateStr}_${amt.toFixed(2)}_${stmtDesc.substring(0, 20)}`;
 
-      const scriptProps = PropertiesService.getScriptProperties();
-      const rawJson = scriptProps.getProperty("CONFIRMED_MATCHES") || "[]";
-      let setKeys = [];
-      try { setKeys = JSON.parse(rawJson); } catch (err) {}
-      if (!setKeys.includes(stKey)) {
-        setKeys.push(stKey);
-        scriptProps.setProperty("CONFIRMED_MATCHES", JSON.stringify(setKeys));
+        const scriptProps = PropertiesService.getScriptProperties();
+        const rawJson = scriptProps.getProperty("CONFIRMED_MATCHES") || "[]";
+        let setKeys = [];
+        try { setKeys = JSON.parse(rawJson); } catch (err) {}
+        if (!setKeys.includes(stKey)) {
+          setKeys.push(stKey);
+          scriptProps.setProperty("CONFIRMED_MATCHES", JSON.stringify(setKeys));
+        }
+
+        sheet.getRange(row, 1, 1, 7).setBackground(CONFIG.COLORS.PAID);
+        sheet.getRange(row, 7).clearDataValidations().setValue("✅ Confirmed");
+
+        const ss = SpreadsheetApp.getActiveSpreadsheet();
+        ss.toast(`Match confirmed for ${stmtDesc}!`, "💳 Match Confirmed", 3);
+        updateLiveDashboard();
       }
+    }
+    return;
+  }
 
-      sheet.getRange(row, 1, 1, 7).setBackground(CONFIG.COLORS.PAID);
-      sheet.getRange(row, 7).clearDataValidations().setValue("✅ Confirmed");
+  // Case 3: Table 3 neglect/exclude checkbox (Col 7)
+  if (col === 7 && table3Start > 0 && row > table3Start + 1) {
+    const rowValues = sheet.getRange(row, 1, 1, 8).getValues()[0];
+    const rawDate = rowValues[1];
+    const person = String(rowValues[2] || "").trim();
+    const origDesc = String(rowValues[3] || "").trim();
+    const amt = parseFloat(rowValues[4]);
+    const isChecked = (e.value === "TRUE" || e.range.getValue() === true);
 
-      const ss = SpreadsheetApp.getActiveSpreadsheet();
-      ss.toast(`Match confirmed for ${stmtDesc}!`, "💳 Match Confirmed", 3);
+    if (isNaN(amt) || amt <= 0) return;
+
+    const txKey = `${String(rawDate)}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}_${person}`;
+    const scriptProps = PropertiesService.getScriptProperties();
+    let neglectedKeys = [];
+    try {
+      neglectedKeys = JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]");
+    } catch (err) {}
+
+    if (isChecked) {
+      if (!neglectedKeys.includes(txKey)) neglectedKeys.push(txKey);
+      scriptProps.setProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
+      sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
+      sheet.getRange(row, 8).setValue("🚫 Neglected (Excluded)");
+      updateLiveDashboard();
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        `Neglected "${origDesc}" (${amt.toFixed(2)} EGP) from active calculations!`,
+        "🚫 Transaction Neglected",
+        4
+      );
+    } else {
+      neglectedKeys = neglectedKeys.filter(k => k !== txKey);
+      scriptProps.setProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
+      sheet.getRange(row, 1, 1, 8).setBackground(null);
+      sheet.getRange(row, 8).setValue("Active in Bill");
+      updateLiveDashboard();
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        `Restored "${origDesc}" (${amt.toFixed(2)} EGP) to active calculations!`,
+        "✅ Transaction Restored",
+        4
+      );
     }
   }
 }
@@ -802,6 +855,47 @@ function hasMerchantKeywordOverlap(desc1, desc2) {
          words2.some(w => words1.includes(w) || c1.includes(w));
 }
 
+function getAllUniquePayers(ss) {
+  const peopleSet = new Set();
+
+  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+  if (txSheet && txSheet.getLastRow() >= 2) {
+    const numRows = txSheet.getLastRow() - 1;
+    const vals = txSheet.getRange(2, 4, numRows, 1).getValues();
+    vals.forEach(r => {
+      const pStr = String(r[0] || "").trim();
+      if (!pStr) return;
+      pStr.split(/[\+\,\/]/).forEach(p => {
+        const name = p.trim();
+        if (name && name.toLowerCase() !== "shared") {
+          const cap = name.charAt(0).toUpperCase() + name.slice(1);
+          peopleSet.add(cap);
+        }
+      });
+    });
+  }
+
+  const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  if (instSheet && instSheet.getLastRow() >= 2) {
+    const numRows = instSheet.getLastRow() - 1;
+    const vals = instSheet.getRange(2, 9, numRows, 1).getValues();
+    vals.forEach(r => {
+      const pStr = String(r[0] || "").trim();
+      if (!pStr) return;
+      pStr.split(/[\+\,\/]/).forEach(p => {
+        const name = p.trim();
+        if (name && name.toLowerCase() !== "shared") {
+          const cap = name.charAt(0).toUpperCase() + name.slice(1);
+          peopleSet.add(cap);
+        }
+      });
+    });
+  }
+
+  const result = Array.from(peopleSet).sort((a, b) => a.localeCompare(b));
+  return result.length > 0 ? result : ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza"];
+}
+
 function runReconciliation(ss, tz) {
   const reconSheet = getOrCreateSheet(ss, CONFIG.SHEETS.RECONCILIATION);
   reconSheet.clear();
@@ -1029,8 +1123,17 @@ function runReconciliation(ss, tz) {
   const suggestedStmtIds = new Set(suggestedMatches.map(s => s.stmt.id));
   const missingInSheet = stmtDebits.filter(st => !st.matched && !suggestedStmtIds.has(st.id));
 
+  // Identify unmatched sheet transactions
+  const suggestedTxRowNums = new Set();
+  suggestedMatches.forEach(sm => {
+    sm.sheetItems.forEach(it => {
+      if (it.rowNum) suggestedTxRowNums.add(it.rowNum);
+    });
+  });
+  const unmatchedTxDebits = txDebits.filter(tx => !tx.matched && !suggestedTxRowNums.has(tx.rowNum));
+
   // 4. Render Reconciliation Sheet
-  reconSheet.getRange("A1:G1").merge()
+  reconSheet.getRange("A1:H1").merge()
     .setValue("Statement Reconciliation — Smart Audit & Discrepancies")
     .setFontWeight("bold")
     .setFontSize(14)
@@ -1041,15 +1144,17 @@ function runReconciliation(ss, tz) {
   const kpiRow = [
     "Confirmed Matched:", confirmedMatchesCount,
     "Needs Confirmation:", suggestedMatches.length,
-    "Missing in Sheet:", missingInSheet.length
+    "On Statement MISSING from Sheet:", missingInSheet.length,
+    "In Sheet NOT on Statement:", unmatchedTxDebits.length
   ];
-  reconSheet.getRange("A2:F2").setValues([kpiRow])
+  reconSheet.getRange("A2:H2").setValues([kpiRow])
     .setFontWeight("bold")
     .setFontSize(10)
     .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
   reconSheet.getRange("B2").setFontColor(CONFIG.COLORS.PRIMARY);
   reconSheet.getRange("D2").setFontColor("#b06000");
   reconSheet.getRange("F2").setFontColor("#b71c1c");
+  reconSheet.getRange("H2").setFontColor("#1565c0");
 
   let curRow = 4;
 
@@ -1088,7 +1193,7 @@ function runReconciliation(ss, tz) {
     curRow += sugRows.length + 1;
   }
 
-  // TABLE 2: ⚠️ Missing Charges from Sheet
+  // TABLE 2: ⚠️ Charges on Statement MISSING from Sheet
   reconSheet.getRange(curRow, 1, 1, 6).merge()
     .setValue("⚠️ Charges on Statement MISSING from Sheet (" + missingInSheet.length + " items)")
     .setFontWeight("bold")
@@ -1107,7 +1212,9 @@ function runReconciliation(ss, tz) {
       .setFontColor(CONFIG.COLORS.PRIMARY);
     curRow += 2;
   } else {
-    const payerOptions = ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza", "Shared"];
+    // Dynamically fetch all payers from Transactions and Installments (no "Shared")
+    const dynamicPayers = getAllUniquePayers(ss);
+    const payerOptions = [...dynamicPayers, "🚫 Neglect / Ignore"];
     const payerValidation = SpreadsheetApp.newDataValidation()
       .requireValueInList(payerOptions, true)
       .setAllowInvalid(true)
@@ -1122,7 +1229,8 @@ function runReconciliation(ss, tz) {
     const missRows = missingInSheet.map((m, idx) => {
       const chargeKey = `${String(m.date || m.dateStr)}_${m.amount.toFixed(2)}_${m.desc.substring(0, 30)}`;
       const saved = assignedMap[chargeKey];
-      const assignedPayer = (saved && saved.payer) ? saved.payer : "";
+      let assignedPayer = (saved && saved.payer) ? saved.payer : "";
+      if (assignedPayer === "NEGLECT") assignedPayer = "🚫 Neglect / Ignore";
       const note = (saved && saved.note) ? saved.note : cleanMerchantName(m.desc);
       return [
         idx + 1,
@@ -1142,11 +1250,108 @@ function runReconciliation(ss, tz) {
 
     // Color assigned rows
     for (let i = 0; i < missRows.length; i++) {
-      if (missRows[i][4]) {
+      if (missRows[i][4] === "🚫 Neglect / Ignore") {
+        reconSheet.getRange(curRow + i, 1, 1, 6).setBackground("#eeeeee");
+      } else if (missRows[i][4]) {
         reconSheet.getRange(curRow + i, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
       }
     }
     curRow += missRows.length + 1;
+  }
+
+  // TABLE 3: 📋 Transactions in Sheet NOT Found on Bank Statement
+  reconSheet.getRange(curRow, 1, 1, 8).merge()
+    .setValue("📋 Transactions in Sheet NOT Found on Bank Statement (" + unmatchedTxDebits.length + " items)")
+    .setFontWeight("bold")
+    .setBackground("#e3f2fd");
+  curRow++;
+
+  reconSheet.getRange(curRow, 1, 1, 8).merge()
+    .setValue("Charges recorded in Transactions sheet that were not billed on this statement. Check the box to Neglect/Exclude any item from active bill calculations.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  curRow++;
+
+  const unmatHeaders = [
+    "#",
+    "Purchase Date",
+    "Person",
+    "Description / Merchant",
+    "Amount (EGP)",
+    "Cycle Classification",
+    "Neglect / Exclude from Active Bill?",
+    "Status / Note"
+  ];
+
+  reconSheet.getRange(curRow, 1, 1, unmatHeaders.length).setValues([unmatHeaders])
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.HEADER);
+  curRow++;
+
+  if (unmatchedTxDebits.length === 0) {
+    reconSheet.getRange(curRow, 1, 1, 8).merge()
+      .setValue("✅ All sheet transactions are accounted for or matched with statement items!")
+      .setFontColor(CONFIG.COLORS.PRIMARY);
+    curRow += 2;
+  } else {
+    let stmtCutoff = null;
+    const stmtDateVal = stmtSheet.getRange("B2").getValue();
+    const stmtDate = parseDateValue(stmtDateVal, tz);
+    if (stmtDate) {
+      stmtCutoff = new Date(stmtDate.getFullYear(), stmtDate.getMonth(), stmtDate.getDate(), 23, 59, 59, 999);
+    }
+
+    const scriptProps = PropertiesService.getScriptProperties();
+    let neglectedKeys = [];
+    try {
+      neglectedKeys = JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]");
+    } catch (e) {}
+
+    const unmatRows = unmatchedTxDebits.map((tx, idx) => {
+      const isPostCutoff = (stmtCutoff && tx.date > stmtCutoff);
+      const cycleClass = isPostCutoff ? "📅 Post-Cutoff (Billed on Next Statement)" : "⚠️ In-Cycle (Not on Bank Statement)";
+      const txKey = `${String(tx.date)}_${tx.amount.toFixed(2)}_${tx.desc.substring(0, 30)}_${tx.person}`;
+      const isNeglected = neglectedKeys.includes(txKey);
+
+      let statusNote = "Active in Bill";
+      if (isNeglected) {
+        statusNote = "🚫 Neglected (Excluded)";
+      } else if (isPostCutoff) {
+        statusNote = "📅 Next Statement";
+      }
+
+      return [
+        idx + 1,
+        tx.date,
+        tx.person,
+        tx.desc,
+        tx.amount,
+        cycleClass,
+        isNeglected,
+        statusNote
+      ];
+    });
+
+    const unmatRange = reconSheet.getRange(curRow, 1, unmatRows.length, unmatHeaders.length);
+    unmatRange.setValues(unmatRows);
+    reconSheet.getRange(curRow, 2, unmatRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
+    reconSheet.getRange(curRow, 5, unmatRows.length, 1).setNumberFormat("#,##0.00");
+    reconSheet.getRange(curRow, 7, unmatRows.length, 1).insertCheckboxes();
+
+    for (let i = 0; i < unmatRows.length; i++) {
+      const isNeg = unmatRows[i][6];
+      const isPost = String(unmatRows[i][5]).includes("Post-Cutoff");
+      if (isNeg) {
+        reconSheet.getRange(curRow + i, 1, 1, unmatHeaders.length).setBackground("#eeeeee");
+        reconSheet.getRange(curRow + i, 4).setFontLine("line-through");
+      } else if (isPost) {
+        reconSheet.getRange(curRow + i, 1, 1, unmatHeaders.length).setBackground("#f8f9fa");
+      } else {
+        reconSheet.getRange(curRow + i, 1, 1, unmatHeaders.length).setBackground("#fff9c4"); // Soft warning yellow
+      }
+    }
+    curRow += unmatRows.length + 1;
   }
 
   // 5. Update Column H ('Assigned Payer / Status') in Bank Statement Sheet
@@ -1191,7 +1396,11 @@ function runReconciliation(ss, tz) {
         let assignedMap = {};
         try { assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}"); } catch (e) {}
         if (assignedMap[cKey] && assignedMap[cKey].payer) {
-          stmtRowStatus[idx] = { text: "⚠️ Unrecorded (Assigned to " + assignedMap[cKey].payer + ")", color: CONFIG.COLORS.DUE_SOON };
+          if (assignedMap[cKey].payer === "NEGLECT") {
+            stmtRowStatus[idx] = { text: "🚫 Neglected / Ignored", color: "#eeeeee" };
+          } else {
+            stmtRowStatus[idx] = { text: "⚠️ Unrecorded (Assigned to " + assignedMap[cKey].payer + ")", color: CONFIG.COLORS.DUE_SOON };
+          }
         } else {
           stmtRowStatus[idx] = { text: "⚠️ Unassigned (Not in Sheet)", color: CONFIG.COLORS.OVERDUE };
         }
@@ -1213,7 +1422,7 @@ function runReconciliation(ss, tz) {
   hRange.setFontSize(9);
   stmtSheet.autoResizeColumns(1, 8);
 
-  reconSheet.autoResizeColumns(1, 7);
+  reconSheet.autoResizeColumns(1, 8);
 }
 
 function addAssignedChargesToTransactions() {
@@ -1439,6 +1648,12 @@ function updateLiveDashboard() {
   }
 
   // 1. Process One-Time Payments (Read-only from Transactions)
+  const scriptProps = PropertiesService.getScriptProperties();
+  let neglectedTxKeys = new Set();
+  try {
+    neglectedTxKeys = new Set(JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]"));
+  } catch (err) {}
+
   const existingTransactionsForDedupe = [];
   if (transactionsSheet.getLastRow() >= 2) {
     const txData = transactionsSheet.getRange(2, 1, transactionsSheet.getLastRow() - 1, 5).getValues();
@@ -1452,6 +1667,13 @@ function updateLiveDashboard() {
       const purchaseDate = parseDateValue(rawDate, tz);
       const amount = parseFloat(rawAmount);
       if (!purchaseDate || isNaN(amount) || amount <= 0) return;
+
+      // Check if user neglected/excluded this transaction in Reconciliation Table 3
+      const txKey1 = `${String(purchaseDate)}_${amount.toFixed(2)}_${desc.substring(0, 30)}_${rawPerson}`;
+      const txKey2 = `${String(rawDate)}_${amount.toFixed(2)}_${desc.substring(0, 30)}_${rawPerson}`;
+      if (neglectedTxKeys.has(txKey1) || neglectedTxKeys.has(txKey2)) {
+        return;
+      }
 
       existingTransactionsForDedupe.push({
         date: purchaseDate,
@@ -1529,7 +1751,6 @@ function updateLiveDashboard() {
   }
 
   // 3. Process Assigned Statement Charges (Charges on Bank Statement MISSING from Transactions sheet)
-  const scriptProps = PropertiesService.getScriptProperties();
   let assignedMap = {};
   try {
     assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
@@ -1541,6 +1762,11 @@ function updateLiveDashboard() {
   Object.keys(assignedMap).forEach(key => {
     const item = assignedMap[key];
     if (!item || !item.payer || !item.amount || item.amount <= 0) return;
+
+    // Skip neglected / ignored statement charges
+    if (item.payer === "NEGLECT" || item.payer === "🚫 Neglect / Ignore" || String(item.payer).toUpperCase().includes("NEGLECT")) {
+      return;
+    }
 
     // Check if user manually typed this into Transactions sheet already
     const cleanDesc = cleanMerchantName(item.desc);
@@ -1611,14 +1837,15 @@ function updateLiveDashboard() {
     return;
   }
 
-  // Collect and sort unique people
-  const allPeopleSet = new Set();
-  debtLineItems.forEach(it => allPeopleSet.add(it.person));
-  const sortedPeople = Array.from(allPeopleSet).sort((a, b) => {
-    if (a.toLowerCase() === "shared") return 1;
-    if (b.toLowerCase() === "shared") return -1;
-    return a.localeCompare(b);
+  // Collect and sort unique people: combine all known sheet payers + any in debtLineItems
+  const allKnownPeople = getAllUniquePayers(ss);
+  const allPeopleSet = new Set(allKnownPeople);
+  debtLineItems.forEach(it => {
+    if (it.person && it.person.toLowerCase() !== "shared") {
+      allPeopleSet.add(it.person);
+    }
   });
+  const sortedPeople = Array.from(allPeopleSet).sort((a, b) => a.localeCompare(b));
 
   const today = new Date();
   const currentMonthSortKey = Utilities.formatDate(today, tz, "yyyy-MM");
