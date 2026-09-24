@@ -230,7 +230,12 @@ function onEdit(e) {
 
     if (isNaN(amt) || amt <= 0) return;
 
-    const txKey = `${String(rawDate)}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}_${person}`;
+    const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone() || "Africa/Cairo";
+    const pDate = parseDateValue(rawDate, tz);
+    const dStr = pDate ? Utilities.formatDate(pDate, tz, "yyyy-MM-dd") : String(rawDate);
+    const txKeyNorm = `${dStr}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}_${person}`;
+    const txKeyLegacy = `${String(rawDate)}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}_${person}`;
+
     const scriptProps = PropertiesService.getScriptProperties();
     let neglectedKeys = [];
     try {
@@ -238,7 +243,8 @@ function onEdit(e) {
     } catch (err) {}
 
     if (isChecked) {
-      if (!neglectedKeys.includes(txKey)) neglectedKeys.push(txKey);
+      if (!neglectedKeys.includes(txKeyNorm)) neglectedKeys.push(txKeyNorm);
+      if (!neglectedKeys.includes(txKeyLegacy)) neglectedKeys.push(txKeyLegacy);
       scriptProps.setProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
       sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
       sheet.getRange(row, 8).setValue("🚫 Neglected (Excluded)");
@@ -249,7 +255,7 @@ function onEdit(e) {
         4
       );
     } else {
-      neglectedKeys = neglectedKeys.filter(k => k !== txKey);
+      neglectedKeys = neglectedKeys.filter(k => k !== txKeyNorm && k !== txKeyLegacy);
       scriptProps.setProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
       sheet.getRange(row, 1, 1, 8).setBackground(null);
       sheet.getRange(row, 8).setValue("Active in Bill");
@@ -896,6 +902,60 @@ function getAllUniquePayers(ss) {
   return result.length > 0 ? result : ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza"];
 }
 
+function getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate) {
+  if (!stmtDate && !minStmtTxDate) return { start: null, end: null };
+
+  let pEnd = null;
+  let pStart = null;
+
+  if (stmtDate) {
+    pEnd = new Date(stmtDate.getFullYear(), stmtDate.getMonth(), stmtDate.getDate(), 23, 59, 59, 999);
+
+    const sYear = stmtDate.getFullYear();
+    const sMonth = stmtDate.getMonth(); // 0-indexed (0=Jan)
+    const sDay = stmtDate.getDate();
+
+    // Previous month index and year
+    const prevMonth = sMonth === 0 ? 11 : sMonth - 1;
+    const prevYear = sMonth === 0 ? sYear - 1 : sYear;
+
+    // Number of days in previous month
+    const daysInPrevMonth = new Date(sYear, sMonth, 0).getDate();
+    const prevCutoffDay = Math.min(sDay, daysInPrevMonth);
+
+    // Cycle starts the day after previous cutoff
+    let cycleStartDay = prevCutoffDay + 1;
+    let cycleStartMonth = prevMonth;
+    let cycleStartYear = prevYear;
+
+    if (cycleStartDay > daysInPrevMonth) {
+      cycleStartDay = 1;
+      cycleStartMonth = sMonth;
+      cycleStartYear = sYear;
+    }
+
+    pStart = new Date(cycleStartYear, cycleStartMonth, cycleStartDay, 0, 0, 0, 0);
+  }
+
+  // If statement transactions start earlier, expand pStart to encompass them
+  if (minStmtTxDate) {
+    const minDateStart = new Date(minStmtTxDate.getFullYear(), minStmtTxDate.getMonth(), minStmtTxDate.getDate(), 0, 0, 0, 0);
+    if (!pStart || minDateStart < pStart) {
+      pStart = minDateStart;
+    }
+  }
+
+  // If statement transactions end later, expand pEnd to encompass them
+  if (maxStmtTxDate) {
+    const maxDateEnd = new Date(maxStmtTxDate.getFullYear(), maxStmtTxDate.getMonth(), maxStmtTxDate.getDate(), 23, 59, 59, 999);
+    if (!pEnd || maxDateEnd > pEnd) {
+      pEnd = maxDateEnd;
+    }
+  }
+
+  return { start: pStart, end: pEnd };
+}
+
 function runReconciliation(ss, tz) {
   const reconSheet = getOrCreateSheet(ss, CONFIG.SHEETS.RECONCILIATION);
   reconSheet.clear();
@@ -908,15 +968,22 @@ function runReconciliation(ss, tz) {
     return;
   }
 
-  // 1. Read Statement Debits
+  // 1. Read Statement Debits & determine transaction date boundaries
   const stmtLastRow = stmtSheet.getLastRow();
   const stmtData = stmtSheet.getRange(7, 1, stmtLastRow - 6, 7).getValues();
   const stmtDebits = [];
+  let minStmtTxDate = null;
+  let maxStmtTxDate = null;
 
   stmtData.forEach((row, idx) => {
+    const pDate = parseDateValue(row[1], tz);
+    if (pDate) {
+      if (!minStmtTxDate || pDate < minStmtTxDate) minStmtTxDate = pDate;
+      if (!maxStmtTxDate || pDate > maxStmtTxDate) maxStmtTxDate = pDate;
+    }
+
     const type = String(row[4]).trim();
     if (type === "DEBIT") {
-      const pDate = parseDateValue(row[1], tz);
       stmtDebits.push({
         id: idx + 1,
         stmtRowIndex: idx,
@@ -930,6 +997,11 @@ function runReconciliation(ss, tz) {
       });
     }
   });
+
+  // Calculate Statement Period (Billing Cycle)
+  const stmtDateVal = stmtSheet.getRange("B2").getValue();
+  const stmtDate = parseDateValue(stmtDateVal, tz);
+  const stmtPeriod = getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate);
 
   // Read Installments for payer lookup on Bank Statement
   const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
@@ -982,7 +1054,7 @@ function runReconciliation(ss, tz) {
     instMatchMap[m.stmt.stmtRowIdx] = m.payerLabel;
   });
 
-  // 2. Read Sheet Transactions
+  // 2. Read Sheet Transactions (Strictly filtered to Statement Period)
   const txDebits = [];
   if (txSheet.getLastRow() >= 2) {
     const txData = txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues();
@@ -994,7 +1066,12 @@ function runReconciliation(ss, tz) {
 
       const pDate = parseDateValue(rawDate, tz);
       const amt = parseFloat(rawAmount);
-      if (pDate && !isNaN(amt)) {
+      if (pDate && !isNaN(amt) && amt > 0) {
+        // STRICT STATEMENT PERIOD FILTER:
+        // Only include sheet transactions that fall within the statement's billing period!
+        if (stmtPeriod.start && pDate < stmtPeriod.start) return;
+        if (stmtPeriod.end && pDate > stmtPeriod.end) return;
+
         txDebits.push({
           rowNum: idx + 2,
           date: pDate,
@@ -1133,8 +1210,12 @@ function runReconciliation(ss, tz) {
   const unmatchedTxDebits = txDebits.filter(tx => !tx.matched && !suggestedTxRowNums.has(tx.rowNum));
 
   // 4. Render Reconciliation Sheet
+  const periodStr = (stmtPeriod.start && stmtPeriod.end)
+    ? ` (${Utilities.formatDate(stmtPeriod.start, tz, "MMM d, yyyy")} – ${Utilities.formatDate(stmtPeriod.end, tz, "MMM d, yyyy")})`
+    : "";
+
   reconSheet.getRange("A1:H1").merge()
-    .setValue("Statement Reconciliation — Smart Audit & Discrepancies")
+    .setValue("Statement Reconciliation — Smart Audit" + periodStr)
     .setFontWeight("bold")
     .setFontSize(14)
     .setBackground(CONFIG.COLORS.PRIMARY)
@@ -1267,7 +1348,7 @@ function runReconciliation(ss, tz) {
   curRow++;
 
   reconSheet.getRange(curRow, 1, 1, 8).merge()
-    .setValue("Charges recorded in Transactions sheet that were not billed on this statement. Check the box to Neglect/Exclude any item from active bill calculations.")
+    .setValue("Charges recorded in Transactions sheet within this statement period that were not billed on this statement. Check the box to Neglect/Exclude any item from active bill calculations.")
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
@@ -1279,7 +1360,7 @@ function runReconciliation(ss, tz) {
     "Person",
     "Description / Merchant",
     "Amount (EGP)",
-    "Cycle Classification",
+    "Period Status",
     "Neglect / Exclude from Active Bill?",
     "Status / Note"
   ];
@@ -1291,17 +1372,10 @@ function runReconciliation(ss, tz) {
 
   if (unmatchedTxDebits.length === 0) {
     reconSheet.getRange(curRow, 1, 1, 8).merge()
-      .setValue("✅ All sheet transactions are accounted for or matched with statement items!")
+      .setValue("✅ All sheet transactions in this statement period are accounted for or matched with statement items!")
       .setFontColor(CONFIG.COLORS.PRIMARY);
     curRow += 2;
   } else {
-    let stmtCutoff = null;
-    const stmtDateVal = stmtSheet.getRange("B2").getValue();
-    const stmtDate = parseDateValue(stmtDateVal, tz);
-    if (stmtDate) {
-      stmtCutoff = new Date(stmtDate.getFullYear(), stmtDate.getMonth(), stmtDate.getDate(), 23, 59, 59, 999);
-    }
-
     const scriptProps = PropertiesService.getScriptProperties();
     let neglectedKeys = [];
     try {
@@ -1309,16 +1383,19 @@ function runReconciliation(ss, tz) {
     } catch (e) {}
 
     const unmatRows = unmatchedTxDebits.map((tx, idx) => {
-      const isPostCutoff = (stmtCutoff && tx.date > stmtCutoff);
-      const cycleClass = isPostCutoff ? "📅 Post-Cutoff (Billed on Next Statement)" : "⚠️ In-Cycle (Not on Bank Statement)";
-      const txKey = `${String(tx.date)}_${tx.amount.toFixed(2)}_${tx.desc.substring(0, 30)}_${tx.person}`;
-      const isNeglected = neglectedKeys.includes(txKey);
+      const isNearCutoff = (stmtPeriod.end && Math.abs((stmtPeriod.end.getTime() - tx.date.getTime()) / (1000 * 60 * 60 * 24)) <= 2);
+      const cycleClass = isNearCutoff ? "⚠️ Near Cutoff (May roll to next statement)" : "⚠️ In-Period (Not on Bank Statement)";
+
+      const dStr = Utilities.formatDate(tx.date, tz, "yyyy-MM-dd");
+      const txKeyNorm = `${dStr}_${tx.amount.toFixed(2)}_${tx.desc.substring(0, 30)}_${tx.person}`;
+      const txKeyLegacy = `${String(tx.date)}_${tx.amount.toFixed(2)}_${tx.desc.substring(0, 30)}_${tx.person}`;
+      const isNeglected = neglectedKeys.includes(txKeyNorm) || neglectedKeys.includes(txKeyLegacy);
 
       let statusNote = "Active in Bill";
       if (isNeglected) {
         statusNote = "🚫 Neglected (Excluded)";
-      } else if (isPostCutoff) {
-        statusNote = "📅 Next Statement";
+      } else if (isNearCutoff) {
+        statusNote = "⚠️ Check Next Stmt";
       }
 
       return [
@@ -1341,12 +1418,12 @@ function runReconciliation(ss, tz) {
 
     for (let i = 0; i < unmatRows.length; i++) {
       const isNeg = unmatRows[i][6];
-      const isPost = String(unmatRows[i][5]).includes("Post-Cutoff");
+      const isNear = String(unmatRows[i][5]).includes("Near Cutoff");
       if (isNeg) {
         reconSheet.getRange(curRow + i, 1, 1, unmatHeaders.length).setBackground("#eeeeee");
         reconSheet.getRange(curRow + i, 4).setFontLine("line-through");
-      } else if (isPost) {
-        reconSheet.getRange(curRow + i, 1, 1, unmatHeaders.length).setBackground("#f8f9fa");
+      } else if (isNear) {
+        reconSheet.getRange(curRow + i, 1, 1, unmatHeaders.length).setBackground("#fffde7");
       } else {
         reconSheet.getRange(curRow + i, 1, 1, unmatHeaders.length).setBackground("#fff9c4"); // Soft warning yellow
       }
@@ -1669,9 +1746,11 @@ function updateLiveDashboard() {
       if (!purchaseDate || isNaN(amount) || amount <= 0) return;
 
       // Check if user neglected/excluded this transaction in Reconciliation Table 3
+      const dStr = Utilities.formatDate(purchaseDate, tz, "yyyy-MM-dd");
+      const txKeyNorm = `${dStr}_${amount.toFixed(2)}_${desc.substring(0, 30)}_${rawPerson}`;
       const txKey1 = `${String(purchaseDate)}_${amount.toFixed(2)}_${desc.substring(0, 30)}_${rawPerson}`;
       const txKey2 = `${String(rawDate)}_${amount.toFixed(2)}_${desc.substring(0, 30)}_${rawPerson}`;
-      if (neglectedTxKeys.has(txKey1) || neglectedTxKeys.has(txKey2)) {
+      if (neglectedTxKeys.has(txKeyNorm) || neglectedTxKeys.has(txKey1) || neglectedTxKeys.has(txKey2)) {
         return;
       }
 
