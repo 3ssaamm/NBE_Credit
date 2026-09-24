@@ -43,6 +43,8 @@ function onOpen() {
     .addItem("📥 Process Latest Statement (Drive)", "menuProcessStatement")
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
     .addSeparator()
+    .addItem("➕ Add Checked Charges to Transactions", "addAssignedChargesToTransactions")
+    .addSeparator()
     .addItem("⏰ Setup Daily Auto-Check", "setupDailyTrigger")
     .addToUi();
 }
@@ -447,8 +449,59 @@ function syncInstallmentsFromStatement(ss, transactions) {
 }
 
 // ==========================================
+// ==========================================
 // 5. SMART RECONCILIATION ENGINE
 // ==========================================
+
+function cleanMerchantName(str) {
+  if (!str) return "";
+  let s = String(str).toLowerCase();
+  const noise = [
+    "fawry*", "paymob-*", "geideae*", "basata pay", "dcc markup fees-",
+    "\"mobile token\"", "mobile token", "token", "egy", "cairo", "alex",
+    "giza", "alexandria", "matrouh", "downtown", "smouha", "60 giz"
+  ];
+  noise.forEach(n => {
+    s = s.replace(new RegExp(n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), " ");
+  });
+  return s.trim();
+}
+
+function hasMerchantKeywordOverlap(desc1, desc2) {
+  const c1 = cleanMerchantName(desc1);
+  const c2 = cleanMerchantName(desc2);
+
+  const aliases = [
+    { key: "internet", terms: ["internet", "we-fbb", "we-mobile", "vodafone", "telecom", "we"] },
+    { key: "cavalli", terms: ["cavalli"] },
+    { key: "amazon", terms: ["amazon"] },
+    { key: "uber", terms: ["uber"] },
+    { key: "careem", terms: ["careem"] },
+    { key: "fathalla", terms: ["fathalla"] },
+    { key: "buffalo", terms: ["buffalo"] },
+    { key: "caribou", terms: ["caribou"] },
+    { key: "basilico", terms: ["basilico"] },
+    { key: "maria", terms: ["maria"] },
+    { key: "lail", terms: ["lail"] },
+    { key: "asteria", terms: ["asteria"] },
+    { key: "instashop", terms: ["instashop"] },
+    { key: "shein", terms: ["shein"] },
+    { key: "google", terms: ["google"] },
+    { key: "microsoft", terms: ["microsoft"] },
+    { key: "nutopia", terms: ["nutopia", "sutherland"] }
+  ];
+
+  for (const a of aliases) {
+    const has1 = a.terms.some(t => c1.includes(t));
+    const has2 = a.terms.some(t => c2.includes(t));
+    if (has1 && has2) return true;
+  }
+
+  const words1 = c1.match(/[a-z0-9]{4,}/g) || [];
+  const words2 = c2.match(/[a-z0-9]{4,}/g) || [];
+  return words1.some(w => words2.includes(w) || c2.includes(w)) ||
+         words2.some(w => words1.includes(w) || c1.includes(w));
+}
 
 function runReconciliation(ss, tz) {
   const reconSheet = getOrCreateSheet(ss, CONFIG.SHEETS.RECONCILIATION);
@@ -467,14 +520,19 @@ function runReconciliation(ss, tz) {
   const stmtData = stmtSheet.getRange(7, 1, stmtLastRow - 6, 7).getValues();
   const stmtDebits = [];
 
-  stmtData.forEach(row => {
+  stmtData.forEach((row, idx) => {
     const type = String(row[4]).trim();
     if (type === "DEBIT") {
+      const pDate = new Date(row[1]);
       stmtDebits.push({
-        dateStr: row[1],
-        desc: row[3],
+        id: idx + 1,
+        dateStr: String(row[1]),
+        date: isNaN(pDate.getTime()) ? null : pDate,
+        desc: String(row[3]),
         amount: parseFloat(row[5]),
-        matched: false
+        matched: false,
+        matchType: null,
+        matchedItems: []
       });
     }
   });
@@ -483,7 +541,7 @@ function runReconciliation(ss, tz) {
   const txDebits = [];
   if (txSheet.getLastRow() >= 2) {
     const txData = txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues();
-    txData.forEach(row => {
+    txData.forEach((row, idx) => {
       const rawDate = row[1];
       const rawPerson = row[3];
       const rawAmount = row[4];
@@ -493,6 +551,7 @@ function runReconciliation(ss, tz) {
       const amt = parseFloat(rawAmount);
       if (!isNaN(pDate.getTime()) && !isNaN(amt)) {
         txDebits.push({
+          rowNum: idx + 2,
           date: pDate,
           desc: String(row[2] || ""),
           person: String(rawPerson || ""),
@@ -503,94 +562,355 @@ function runReconciliation(ss, tz) {
     });
   }
 
-  // 3. Match Statement Debits with Sheet Transactions (Amount exact, Date within 4 days)
+  // 3. Multi-Pass Matching
+  // Pass 1: 1-to-1 Exact Match (Amount exact, Date within 5 days, Keyword Overlap)
   stmtDebits.forEach(st => {
-    const stDate = new Date(st.dateStr);
+    if (st.matched) return;
     const match = txDebits.find(tx => {
       if (tx.matched) return false;
       const amtDiff = Math.abs(tx.amount - st.amount);
       if (amtDiff > 0.05) return false;
 
-      if (!isNaN(stDate.getTime())) {
-        const daysDiff = Math.abs((tx.date.getTime() - stDate.getTime()) / (1000 * 60 * 60 * 24));
-        return daysDiff <= 4;
+      if (st.date) {
+        const daysDiff = Math.abs((tx.date.getTime() - st.date.getTime()) / (1000 * 60 * 60 * 24));
+        if (daysDiff > 5) return false;
       }
-      return true;
+
+      return hasMerchantKeywordOverlap(st.desc, tx.desc);
     });
 
     if (match) {
       st.matched = true;
+      st.matchType = "EXACT";
       match.matched = true;
+      st.matchedItems.push(match);
     }
   });
 
-  const missingInSheet = stmtDebits.filter(st => !st.matched);
+  // Pass 2: Split Matches (2 or 3 sheet items sum to 1 statement charge)
+  stmtDebits.forEach(st => {
+    if (st.matched) return;
+
+    const candidates = txDebits.filter(tx => {
+      if (tx.matched) return false;
+      if (st.date) {
+        const daysDiff = Math.abs((tx.date.getTime() - st.date.getTime()) / (1000 * 60 * 60 * 24));
+        return daysDiff <= 5;
+      }
+      return true;
+    });
+
+    // Check pairs (2-way split)
+    let foundPair = false;
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        const sum = candidates[i].amount + candidates[j].amount;
+        if (Math.abs(sum - st.amount) < 0.10) {
+          const keywordMatch = hasMerchantKeywordOverlap(st.desc, candidates[i].desc) ||
+                               hasMerchantKeywordOverlap(st.desc, candidates[j].desc);
+          if (keywordMatch) {
+            st.matched = true;
+            st.matchType = "SPLIT";
+            candidates[i].matched = true;
+            candidates[j].matched = true;
+            st.matchedItems.push(candidates[i], candidates[j]);
+            foundPair = true;
+            break;
+          }
+        }
+      }
+      if (foundPair) break;
+    }
+
+    if (foundPair) return;
+
+    // Check triplets (3-way split)
+    let foundTriplet = false;
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        for (let k = j + 1; k < candidates.length; k++) {
+          const sum = candidates[i].amount + candidates[j].amount + candidates[k].amount;
+          if (Math.abs(sum - st.amount) < 0.10) {
+            const keywordMatch = hasMerchantKeywordOverlap(st.desc, candidates[i].desc) ||
+                                 hasMerchantKeywordOverlap(st.desc, candidates[j].desc) ||
+                                 hasMerchantKeywordOverlap(st.desc, candidates[k].desc);
+            if (keywordMatch) {
+              st.matched = true;
+              st.matchType = "SPLIT";
+              candidates[i].matched = true;
+              candidates[j].matched = true;
+              candidates[k].matched = true;
+              st.matchedItems.push(candidates[i], candidates[j], candidates[k]);
+              foundTriplet = true;
+              break;
+            }
+          }
+        }
+        if (foundTriplet) break;
+      }
+      if (foundTriplet) break;
+    }
+  });
+
+  // Pass 3: Suggested Matches (Needs user confirmation)
+  const suggestedMatches = [];
+
+  stmtDebits.forEach(st => {
+    if (st.matched) return;
+
+    const nearby = txDebits.filter(tx => {
+      if (tx.matched) return false;
+      if (st.date) {
+        const daysDiff = Math.abs((tx.date.getTime() - st.date.getTime()) / (1000 * 60 * 60 * 24));
+        return daysDiff <= 3;
+      }
+      return true;
+    });
+
+    const singleAmtMatch = nearby.find(tx => Math.abs(tx.amount - st.amount) < 0.05);
+    if (singleAmtMatch) {
+      suggestedMatches.push({
+        stmt: st,
+        sheetItems: [singleAmtMatch],
+        reason: `Exact amount (${st.amount.toFixed(2)}), dates within 3 days — check shop name`
+      });
+      return;
+    }
+
+    for (let i = 0; i < nearby.length; i++) {
+      for (let j = i + 1; j < nearby.length; j++) {
+        const sum = nearby[i].amount + nearby[j].amount;
+        if (Math.abs(sum - st.amount) < 0.10) {
+          suggestedMatches.push({
+            stmt: st,
+            sheetItems: [nearby[i], nearby[j]],
+            reason: `Split sum matches ${st.amount.toFixed(2)} (${nearby[i].person} + ${nearby[j].person})`
+          });
+          return;
+        }
+      }
+    }
+  });
+
+  const suggestedStmtIds = new Set(suggestedMatches.map(s => s.stmt.id));
+  const missingInSheet = stmtDebits.filter(st => !st.matched && !suggestedStmtIds.has(st.id));
   const unmatchedInSheet = txDebits.filter(tx => !tx.matched);
 
   // 4. Render Reconciliation Sheet
-  reconSheet.getRange("A1:E1").merge()
-    .setValue("Statement Reconciliation — Missing & Discrepancies")
+  reconSheet.getRange("A1:G1").merge()
+    .setValue("Statement Reconciliation — Smart Audit & Discrepancies")
     .setFontWeight("bold")
     .setFontSize(14)
     .setBackground(CONFIG.COLORS.PRIMARY)
     .setFontColor("#ffffff");
 
-  let curRow = 3;
+  const confirmedMatchesCount = stmtDebits.filter(st => st.matched).length;
+  const kpiRow = [
+    "Confirmed Matched:", confirmedMatchesCount,
+    "Needs Confirmation:", suggestedMatches.length,
+    "Missing in Sheet:", missingInSheet.length
+  ];
+  reconSheet.getRange("A2:F2").setValues([kpiRow])
+    .setFontWeight("bold")
+    .setFontSize(10)
+    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
+  reconSheet.getRange("B2").setFontColor(CONFIG.COLORS.PRIMARY);
+  reconSheet.getRange("D2").setFontColor("#b06000");
+  reconSheet.getRange("F2").setFontColor("#b71c1c");
 
-  // Missing In Sheet Section
-  reconSheet.getRange(curRow, 1, 1, 5).merge()
+  let curRow = 4;
+
+  // TABLE 1: ❓ Suggested Matches (Needs Confirmation)
+  if (suggestedMatches.length > 0) {
+    reconSheet.getRange(curRow, 1, 1, 7).merge()
+      .setValue("❓ Suggested Matches (Check box to confirm match) — " + suggestedMatches.length + " items")
+      .setFontWeight("bold")
+      .setBackground(CONFIG.COLORS.DUE_SOON);
+    curRow++;
+
+    const sugHeaders = ["#", "Statement Date", "Statement Charge", "Amount (EGP)", "Suggested Sheet Items", "Match Reason", "Confirm Match?"];
+    reconSheet.getRange(curRow, 1, 1, 7).setValues([sugHeaders])
+      .setFontWeight("bold")
+      .setBackground(CONFIG.COLORS.HEADER);
+    curRow++;
+
+    const sugRows = suggestedMatches.map((s, idx) => {
+      const itemsDesc = s.sheetItems.map(it => `${it.desc} (${it.person}: ${it.amount.toFixed(2)})`).join(" + ");
+      return [
+        idx + 1,
+        s.stmt.dateStr,
+        s.stmt.desc,
+        s.stmt.amount,
+        itemsDesc,
+        s.reason,
+        false
+      ];
+    });
+
+    const sugRange = reconSheet.getRange(curRow, 1, sugRows.length, 7);
+    sugRange.setValues(sugRows);
+    reconSheet.getRange(curRow, 4, sugRows.length, 1).setNumberFormat("#,##0.00");
+    reconSheet.getRange(curRow, 7, sugRows.length, 1).insertCheckboxes();
+    curRow += sugRows.length + 1;
+  }
+
+  // TABLE 2: ⚠️ Missing Charges from Sheet
+  reconSheet.getRange(curRow, 1, 1, 7).merge()
     .setValue("⚠️ Charges on Statement MISSING from Sheet (" + missingInSheet.length + " items)")
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.OVERDUE);
   curRow++;
 
-  const missHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Assign To (Payer)"];
-  reconSheet.getRange(curRow, 1, 1, 5).setValues([missHeaders])
+  const missHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Assign Payer", "Custom Note", "Add to Sheet?"];
+  reconSheet.getRange(curRow, 1, 1, 7).setValues([missHeaders])
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.HEADER);
   curRow++;
 
   if (missingInSheet.length === 0) {
-    reconSheet.getRange(curRow, 1, 1, 5).merge()
+    reconSheet.getRange(curRow, 1, 1, 7).merge()
       .setValue("✅ All statement debits are successfully recorded in Transactions!")
-      .setFontColor(CONFIG.COLORS.ACCENT);
+      .setFontColor(CONFIG.COLORS.PRIMARY);
     curRow += 2;
   } else {
-    const rows = missingInSheet.map((m, i) => [i + 1, m.dateStr, m.desc, m.amount, ""]);
-    reconSheet.getRange(curRow, 1, rows.length, 5).setValues(rows);
-    reconSheet.getRange(curRow, 4, rows.length, 1).setNumberFormat("#,##0.00");
-    curRow += rows.length + 1;
+    const payerOptions = ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza", "Shared"];
+    const payerValidation = SpreadsheetApp.newDataValidation()
+      .requireValueInList(payerOptions, true)
+      .setAllowInvalid(true)
+      .build();
+
+    const missRows = missingInSheet.map((m, idx) => [
+      idx + 1,
+      m.dateStr,
+      m.desc,
+      m.amount,
+      "",
+      cleanMerchantName(m.desc),
+      false
+    ]);
+
+    const missRange = reconSheet.getRange(curRow, 1, missRows.length, 7);
+    missRange.setValues(missRows);
+    reconSheet.getRange(curRow, 4, missRows.length, 1).setNumberFormat("#,##0.00");
+    reconSheet.getRange(curRow, 5, missRows.length, 1).setDataValidation(payerValidation);
+    reconSheet.getRange(curRow, 7, missRows.length, 1).insertCheckboxes();
+    curRow += missRows.length + 1;
   }
 
-  // Unmatched in Transactions Section
-  reconSheet.getRange(curRow, 1, 1, 5).merge()
-    .setValue("🕒 Logged Transactions NOT found on Statement (" + unmatchedInSheet.length + " items)")
+  // TABLE 3: 🕒 Unmatched Sheet Transactions
+  reconSheet.getRange(curRow, 1, 1, 6).merge()
+    .setValue("🕒 Logged Transactions NOT on Statement (" + unmatchedInSheet.length + " items)")
     .setFontWeight("bold")
-    .setBackground(CONFIG.COLORS.DUE_SOON);
+    .setBackground(CONFIG.COLORS.HEADER);
   curRow++;
 
-  const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Payer"];
-  reconSheet.getRange(curRow, 1, 1, 5).setValues([unHeaders])
+  const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Payer", "Status"];
+  reconSheet.getRange(curRow, 1, 1, 6).setValues([unHeaders])
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.HEADER);
   curRow++;
 
   if (unmatchedInSheet.length === 0) {
-    reconSheet.getRange(curRow, 1, 1, 5).merge()
+    reconSheet.getRange(curRow, 1, 1, 6).merge()
       .setValue("✅ All sheet transactions match statement records!");
   } else {
-    const unRows = unmatchedInSheet.map((u, i) => [
-      i + 1,
-      Utilities.formatDate(u.date, tz, "yyyy-MM-dd"),
-      u.desc,
-      u.amount,
-      u.person
-    ]);
-    reconSheet.getRange(curRow, 1, unRows.length, 5).setValues(unRows);
+    let stmtCutoffDate = null;
+    if (stmtSheet && stmtSheet.getLastRow() >= 2) {
+      const sVal = stmtSheet.getRange("B2").getValue();
+      if (sVal) stmtCutoffDate = new Date(sVal);
+    }
+
+    const unRows = unmatchedInSheet.map((u, idx) => {
+      let status = "🕒 Pending (Next Statement)";
+      if (stmtCutoffDate && u.date <= stmtCutoffDate) {
+        status = "⚠️ Unbilled Discrepancy (before cutoff)";
+      }
+      return [
+        idx + 1,
+        Utilities.formatDate(u.date, tz, "yyyy-MM-dd"),
+        u.desc,
+        u.amount,
+        u.person,
+        status
+      ];
+    });
+
+    reconSheet.getRange(curRow, 1, unRows.length, 6).setValues(unRows);
     reconSheet.getRange(curRow, 4, unRows.length, 1).setNumberFormat("#,##0.00");
   }
 
-  reconSheet.autoResizeColumns(1, 5);
+  reconSheet.autoResizeColumns(1, 7);
+}
+
+function addAssignedChargesToTransactions() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const reconSheet = ss.getSheetByName(CONFIG.SHEETS.RECONCILIATION);
+  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+
+  if (!reconSheet || !txSheet) return;
+
+  const lastRow = reconSheet.getLastRow();
+  if (lastRow < 5) return;
+
+  const data = reconSheet.getRange(1, 1, lastRow, 7).getValues();
+  const toAdd = [];
+
+  data.forEach(row => {
+    const amt = parseFloat(row[3]);
+    const payer = String(row[4] || "").trim();
+    const note = String(row[5] || "").trim();
+    const isChecked = row[6] === true;
+
+    if (!isNaN(amt) && amt > 0 && payer !== "" && isChecked) {
+      const rawDate = row[1];
+      const dateObj = new Date(rawDate);
+      toAdd.push({
+        date: isNaN(dateObj.getTime()) ? new Date() : dateObj,
+        desc: note || String(row[2]),
+        payer: payer,
+        amount: amt
+      });
+    }
+  });
+
+  if (toAdd.length === 0) {
+    SpreadsheetApp.getUi().alert(
+      "No Charges Selected",
+      "Please assign a Payer (Column E) and check the 'Add to Sheet?' box (Column G) for any charges you want to add.",
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    return;
+  }
+
+  let txLastRow = txSheet.getLastRow();
+  let nextId = 1;
+  if (txLastRow >= 2) {
+    const lastIdVal = txSheet.getRange(txLastRow, 1).getValue();
+    if (!isNaN(parseInt(lastIdVal, 10))) {
+      nextId = parseInt(lastIdVal, 10) + 1;
+    }
+  }
+
+  const newRows = toAdd.map(item => [
+    nextId++,
+    item.date,
+    item.desc,
+    item.payer,
+    item.amount
+  ]);
+
+  txSheet.getRange(txLastRow + 1, 1, newRows.length, 5).setValues(newRows);
+  txSheet.getRange(txLastRow + 1, 2, newRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
+  txSheet.getRange(txLastRow + 1, 5, newRows.length, 1).setNumberFormat("#,##0.00");
+
+  updateLiveDashboard();
+
+  SpreadsheetApp.getUi().alert(
+    "Charges Added Successfully",
+    `Successfully added ${toAdd.length} charge(s) to the Transactions sheet!\n` +
+    `The Reconciliation and Monthly Debts have been updated.`,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
 // ==========================================
