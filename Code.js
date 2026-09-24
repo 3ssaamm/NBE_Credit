@@ -16,11 +16,11 @@ const CONFIG = {
   SHEETS: {
     TRANSACTIONS: "Transactions",
     INSTALLMENTS: "Installments",
-    MONTHLY_DEBTS: "Monthly Debts",
     DEBT_BREAKDOWN: "Debt Breakdown",
     PAYMENT_HISTORY: "Payment History",
     BANK_STATEMENT: "Bank Statement",
-    RECONCILIATION: "Reconciliation"
+    RECONCILIATION: "Reconciliation",
+    AUDIT_DIFFERENCES: "Audit & Differences"
   },
   COLORS: {
     PAID: "#d9ead3",       // Soft green
@@ -91,6 +91,7 @@ function onOpen() {
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
     .addSeparator()
     .addItem("📊 Go to Debt Breakdown Sheet", "menuGoToDebtBreakdown")
+    .addItem("🔍 Go to Audit & Differences Sheet", "menuGoToAuditDifferences")
     .addSeparator()
     .addItem("⏰ Setup Daily Auto-Check", "setupDailyTrigger")
     .addToUi();
@@ -102,6 +103,18 @@ function menuGoToDebtBreakdown() {
   if (!sheet) {
     updateLiveDashboard();
     sheet = ss.getSheetByName(CONFIG.SHEETS.DEBT_BREAKDOWN);
+  }
+  if (sheet) {
+    ss.setActiveSheet(sheet);
+  }
+}
+
+function menuGoToAuditDifferences() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(CONFIG.SHEETS.AUDIT_DIFFERENCES);
+  if (!sheet) {
+    updateLiveDashboard();
+    sheet = ss.getSheetByName(CONFIG.SHEETS.AUDIT_DIFFERENCES);
   }
   if (sheet) {
     ss.setActiveSheet(sheet);
@@ -337,7 +350,7 @@ function menuProcessStatement() {
         `• Due Date: ${result.lastMeta.dueDate || "N/A"}\n` +
         `• Closing Balance: ${result.lastMeta.closingBalance ? result.lastMeta.closingBalance.toFixed(2) + " EGP" : "N/A"}\n` +
         `• Transactions Found: ${result.totalTxCount}\n\n` +
-        `The Bank Statement, Reconciliation, and Monthly Debts tabs have all been updated!`,
+        `The Bank Statement, Reconciliation, Debt Breakdown, and Audit & Differences tabs have all been updated!`,
         ui.ButtonSet.OK
       );
     } else {
@@ -885,6 +898,25 @@ function hasMerchantKeywordOverlap(desc1, desc2) {
          words2.some(w => words1.includes(w) || c1.includes(w));
 }
 
+function normalizePersonName(name) {
+  if (!name) return "";
+  const cleaned = String(name).trim().replace(/\s+/g, " ");
+  if (!cleaned) return "";
+  return cleaned
+    .toLowerCase()
+    .split(" ")
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+function splitPayerNames(payerStr) {
+  if (!payerStr) return [];
+  return String(payerStr)
+    .split(/[\+\,\/]/)
+    .map(p => normalizePersonName(p))
+    .filter(p => p && p.toLowerCase() !== "shared");
+}
+
 function getAllUniquePayers(ss) {
   const peopleSet = new Set();
 
@@ -893,15 +925,7 @@ function getAllUniquePayers(ss) {
     const numRows = txSheet.getLastRow() - 1;
     const vals = txSheet.getRange(2, 4, numRows, 1).getValues();
     vals.forEach(r => {
-      const pStr = String(r[0] || "").trim();
-      if (!pStr) return;
-      pStr.split(/[\+\,\/]/).forEach(p => {
-        const name = p.trim();
-        if (name && name.toLowerCase() !== "shared") {
-          const cap = name.charAt(0).toUpperCase() + name.slice(1);
-          peopleSet.add(cap);
-        }
-      });
+      splitPayerNames(r[0]).forEach(name => peopleSet.add(name));
     });
   }
 
@@ -910,20 +934,50 @@ function getAllUniquePayers(ss) {
     const numRows = instSheet.getLastRow() - 1;
     const vals = instSheet.getRange(2, 9, numRows, 1).getValues();
     vals.forEach(r => {
-      const pStr = String(r[0] || "").trim();
-      if (!pStr) return;
-      pStr.split(/[\+\,\/]/).forEach(p => {
-        const name = p.trim();
-        if (name && name.toLowerCase() !== "shared") {
-          const cap = name.charAt(0).toUpperCase() + name.slice(1);
-          peopleSet.add(cap);
-        }
-      });
+      splitPayerNames(r[0]).forEach(name => peopleSet.add(name));
     });
   }
 
+  // Also include payers from stored statement assignments
+  try {
+    const scriptProps = PropertiesService.getScriptProperties();
+    const assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
+    Object.keys(assignedMap).forEach(k => {
+      const item = assignedMap[k];
+      if (item && item.payer) {
+        splitPayerNames(item.payer).forEach(name => peopleSet.add(name));
+      }
+    });
+  } catch (e) {}
+
+  // Also include payers from visible Reconciliation sheet Table 2
+  try {
+    const reconSheet = ss.getSheetByName(CONFIG.SHEETS.RECONCILIATION);
+    if (reconSheet && reconSheet.getLastRow() >= 5) {
+      const lastR = reconSheet.getLastRow();
+      const colA = reconSheet.getRange(1, 1, lastR, 1).getValues();
+      let t2 = -1;
+      let t3 = -1;
+      for (let i = 0; i < colA.length; i++) {
+        const txt = String(colA[i][0] || "");
+        if (txt.includes("MISSING from Sheet")) t2 = i + 1;
+        if (txt.includes("NOT Found on Bank Statement") || txt.includes("Transactions in Sheet NOT")) t3 = i + 1;
+      }
+      if (t2 > 0) {
+        const endRow = (t3 > t2) ? t3 - 1 : lastR;
+        const numRows = endRow - (t2 + 1);
+        if (numRows > 0) {
+          const pVals = reconSheet.getRange(t2 + 2, 5, numRows, 1).getValues();
+          pVals.forEach(r => {
+            splitPayerNames(r[0]).forEach(name => peopleSet.add(name));
+          });
+        }
+      }
+    }
+  } catch (e) {}
+
   const result = Array.from(peopleSet).sort((a, b) => a.localeCompare(b));
-  return result.length > 0 ? result : ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza"];
+  return result.length > 0 ? result : ["Abdo", "Dad", "Hager", "Mai", "Mido", "Muhanad", "Mum", "Nourween", "Zoza"];
 }
 
 function getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate) {
@@ -1664,8 +1718,13 @@ function updateLiveDashboard(options) {
 
   const transactionsSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
   const installmentsSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
-  const debtsSheet = getOrCreateSheet(ss, CONFIG.SHEETS.MONTHLY_DEBTS);
   const historySheet = ss.getSheetByName(CONFIG.SHEETS.PAYMENT_HISTORY);
+
+  // Permanently delete legacy 'Monthly Debts' sheet if it exists
+  const oldDebtsSheet = ss.getSheetByName("Monthly Debts");
+  if (oldDebtsSheet) {
+    try { ss.deleteSheet(oldDebtsSheet); } catch (e) {}
+  }
 
   if (!transactionsSheet || !installmentsSheet || !historySheet) {
     SpreadsheetApp.getUi().alert(
@@ -1709,10 +1768,12 @@ function updateLiveDashboard(options) {
   const debtLineItems = [];
 
   function addDebtItem({ dueDate, person, category, desc, installmentInfo, purchaseDate, originalAmount, amount, isMissingFromSheet, note }) {
+    if (!dueDate || !person) return;
+    const normalizedPerson = normalizePersonName(person);
+    if (!normalizedPerson || normalizedPerson.toLowerCase() === "shared") return;
+
     const sortKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
     const label = Utilities.formatDate(dueDate, tz, "MMMM yyyy");
-    const rawP = String(person || "").trim();
-    const normalizedPerson = rawP.charAt(0).toUpperCase() + rawP.slice(1);
 
     if (!allDebts[sortKey]) {
       allDebts[sortKey] = {
@@ -1798,16 +1859,18 @@ function updateLiveDashboard(options) {
 
       existingTransactionsForDedupe.push({
         date: purchaseDate,
-        desc: desc.toLowerCase(),
-        amount: amount
+        rawDate: rawDate,
+        desc: desc,
+        amount: amount,
+        rawPerson: rawPerson
       });
 
       const dueDate = getDueDateForPurchase(purchaseDate, tz);
       if (!dueDate) return;
 
-      const rawPayerStr = String(rawPerson).trim();
-      const people = rawPayerStr.split(/[\+\,\/]/).map(p => p.trim()).filter(p => p);
-      const splitAmount = amount / Math.max(1, people.length);
+      const people = splitPayerNames(rawPerson);
+      if (people.length === 0) return;
+      const splitAmount = amount / people.length;
 
       people.forEach(p => {
         addDebtItem({
@@ -1843,9 +1906,9 @@ function updateLiveDashboard(options) {
       const purchaseDate = parseDateValue(rawDate, tz);
       if (!purchaseDate) return;
 
-      const rawPayerStr = String(rawPayer).trim();
-      const people = rawPayerStr.split(/[\+\,\/]/).map(p => p.trim()).filter(p => p);
-      const splitEmi = emi / Math.max(1, people.length);
+      const people = splitPayerNames(rawPayer);
+      if (people.length === 0) return;
+      const splitEmi = emi / people.length;
 
       // First installment is due in the statement cycle of the purchase date
       const firstDueDate = getDueDateForPurchase(purchaseDate, tz);
@@ -1871,42 +1934,85 @@ function updateLiveDashboard(options) {
     });
   }
 
-  // 3. Process Assigned Statement Charges (Charges on Bank Statement MISSING from Transactions sheet)
+  // 3. Process Assigned Statement Charges (From Reconciliation Table 2 & ScriptProperties)
+  // Read both ScriptProperties AND visible Reconciliation sheet Table 2 directly
+  const assignedFromRecon = [];
+  const reconSheet = ss.getSheetByName(CONFIG.SHEETS.RECONCILIATION);
+  if (reconSheet && reconSheet.getLastRow() >= 5) {
+    const lastRow = reconSheet.getLastRow();
+    const colA = reconSheet.getRange(1, 1, lastRow, 1).getValues();
+    let table2Start = -1;
+    let table3Start = -1;
+    for (let i = 0; i < colA.length; i++) {
+      const txt = String(colA[i][0] || "");
+      if (txt.includes("MISSING from Sheet")) table2Start = i + 1;
+      if (txt.includes("NOT Found on Bank Statement") || txt.includes("Transactions in Sheet NOT")) table3Start = i + 1;
+    }
+    if (table2Start > 0) {
+      const endRow = (table3Start > table2Start) ? table3Start - 1 : lastRow;
+      const numRows = endRow - (table2Start + 1);
+      if (numRows > 0) {
+        const rows = reconSheet.getRange(table2Start + 2, 1, numRows, 6).getValues();
+        rows.forEach(r => {
+          const rawDate = r[1];
+          const desc = String(r[2] || "").trim();
+          const amt = parseFloat(r[3]);
+          const payer = String(r[4] || "").trim();
+          const note = String(r[5] || "").trim();
+          if (!isNaN(amt) && amt > 0 && desc && payer) {
+            assignedFromRecon.push({
+              rawDate: rawDate,
+              desc: desc,
+              amount: amt,
+              payer: payer,
+              note: note
+            });
+          }
+        });
+      }
+    }
+  }
+
   let assignedMap = {};
   try {
     assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
   } catch (err) {}
 
+  const mergedAssigned = new Map();
+  // ScriptProperties baseline
+  Object.keys(assignedMap).forEach(k => {
+    const item = assignedMap[k];
+    if (item && item.amount > 0 && item.desc && item.payer) {
+      const mKey = `${item.amount.toFixed(2)}_${String(item.desc).substring(0, 30).toLowerCase()}`;
+      mergedAssigned.set(mKey, item);
+    }
+  });
+  // Visible sheet values take active precedence
+  assignedFromRecon.forEach(item => {
+    const mKey = `${item.amount.toFixed(2)}_${item.desc.substring(0, 30).toLowerCase()}`;
+    mergedAssigned.set(mKey, item);
+  });
+
   let assignedMissingCount = 0;
   let assignedMissingTotal = 0;
+  const reconAssignedList = [];
 
-  Object.keys(assignedMap).forEach(key => {
-    const item = assignedMap[key];
-    if (!item || !item.payer || !item.amount || item.amount <= 0) return;
-
-    // Skip neglected / ignored statement charges
-    if (item.payer === "NEGLECT" || item.payer === "🚫 Neglect / Ignore" || String(item.payer).toUpperCase().includes("NEGLECT")) {
+  mergedAssigned.forEach(item => {
+    const payerStr = String(item.payer || "").trim();
+    if (!payerStr || payerStr === "🚫 Neglect / Ignore" || payerStr.toUpperCase().includes("NEGLECT")) {
       return;
     }
 
-    // Check if user manually typed this into Transactions sheet already
-    const cleanDesc = cleanMerchantName(item.desc);
-    const alreadyInTx = existingTransactionsForDedupe.some(tx => {
-      return Math.abs(tx.amount - item.amount) < 0.05 && 
-             (tx.desc.includes(cleanDesc) || cleanDesc.includes(tx.desc));
-    });
-
-    if (alreadyInTx) return;
+    const people = splitPayerNames(payerStr);
+    if (people.length === 0) return;
 
     assignedMissingCount++;
     assignedMissingTotal += item.amount;
+    reconAssignedList.push(item);
 
     const chargeDueDate = activeStatementDueDate;
-    const chargeDate = parseDateValue(item.dateStr, tz) || cardBal.statementDate || chargeDueDate;
-
-    const rawPayerStr = String(item.payer).trim();
-    const people = rawPayerStr.split(/[\+\,\/]/).map(p => p.trim()).filter(p => p);
-    const splitAmount = item.amount / Math.max(1, people.length);
+    const chargeDate = parseDateValue(item.rawDate || item.dateStr, tz) || cardBal.statementDate || chargeDueDate;
+    const splitAmount = item.amount / people.length;
 
     people.forEach(p => {
       addDebtItem({
@@ -1924,40 +2030,6 @@ function updateLiveDashboard(options) {
     });
   });
 
-  // 4. Render Dashboard in 'Monthly Debts'
-  debtsSheet.clear();
-
-  // Overview Card
-  debtsSheet.getRange("A1:B1").merge()
-    .setValue("💳 NBE Credit Card Overview (Limit: 100,000 EGP)")
-    .setFontWeight("bold")
-    .setFontSize(13)
-    .setBackground(CONFIG.COLORS.PRIMARY)
-    .setFontColor("#ffffff");
-
-  const overviewRows = [
-    ["Total Credit Limit:", cardBal.creditLimit],
-    ["Available Balance Right Now:", cardBal.availableBalanceNow],
-    ["Available After Month Settled:", cardBal.availableAfterSettlement],
-    ["Blocked Remaining Installments:", cardBal.totalBlockedInstallments],
-    ["Billed Statement Balance:", cardBal.billedBalance],
-    ["Unbilled New Purchases:", cardBal.unbilledNewPurchases]
-  ];
-
-  debtsSheet.getRange(2, 1, overviewRows.length, 2).setValues(overviewRows);
-  debtsSheet.getRange(2, 1, overviewRows.length, 1).setFontWeight("bold").setFontSize(10);
-  debtsSheet.getRange(2, 2, overviewRows.length, 1).setFontWeight("bold").setFontSize(10).setNumberFormat("#,##0.00");
-  debtsSheet.getRange("A2:B7").setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
-  debtsSheet.getRange("A3:B3").setBackground(CONFIG.COLORS.DUE_SOON);
-
-  let currentRow = 9;
-
-  const sortedKeys = Object.keys(allDebts).sort();
-  if (sortedKeys.length === 0) {
-    debtsSheet.getRange(currentRow, 1).setValue("No transaction or installment data found.");
-    return;
-  }
-
   // Collect and sort unique people: combine all known sheet payers + any in debtLineItems
   const allKnownPeople = getAllUniquePayers(ss);
   const allPeopleSet = new Set(allKnownPeople);
@@ -1968,233 +2040,11 @@ function updateLiveDashboard(options) {
   });
   const sortedPeople = Array.from(allPeopleSet).sort((a, b) => a.localeCompare(b));
 
-  const today = new Date();
-  const currentMonthSortKey = Utilities.formatDate(today, tz, "yyyy-MM");
-  const todayDay = parseInt(Utilities.formatDate(today, tz, "d"), 10);
-
-  // ==========================================
-  // MASTER MATRIX TABLE (DIVIDED BY PERSON IN ONE TABLE)
-  // ==========================================
-  const totalCols = 5 + sortedPeople.length;
-
-  debtsSheet.getRange(currentRow, 1, 1, totalCols).merge()
-    .setValue("📊 Master Monthly Debt Matrix (All Persons Divided in One Table)")
-    .setFontWeight("bold")
-    .setFontSize(13)
-    .setBackground(CONFIG.COLORS.PRIMARY)
-    .setFontColor("#ffffff");
-  currentRow++;
-
-  debtsSheet.getRange(currentRow, 1, 1, totalCols).merge()
-    .setValue("Complete overview of all months, due dates, bank statement bills, and individual family shares side-by-side.")
-    .setFontStyle("italic")
-    .setFontSize(9)
-    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
-  currentRow++;
-
-  const matrixHeaders = ["Due Month", "Status", "Family Total Due", "Bank Bill (EGP)", "Audit Diff (EGP)", ...sortedPeople];
-  debtsSheet.getRange(currentRow, 1, 1, matrixHeaders.length)
-    .setValues([matrixHeaders])
-    .setFontWeight("bold")
-    .setBackground(CONFIG.COLORS.HEADER)
-    .setBorder(true, true, true, true, true, true);
-  currentRow++;
-
-  const matrixRows = [];
-  const matrixRowColors = [];
-
-  let grandTotalDebt = 0;
-  let grandBankBill = 0;
-  const personTotals = {};
-  sortedPeople.forEach(p => { personTotals[p] = 0; });
-
-  sortedKeys.forEach(key => {
-    const data = allDebts[key];
-    const monthLabel = data.label;
-    const isPaid = paidMonthsSet.has(monthLabel.toLowerCase());
-    let statusLabel = "🕒 Upcoming";
-    let statusColor = CONFIG.COLORS.UPCOMING;
-
-    if (isPaid) {
-      statusLabel = "✅ Paid";
-      statusColor = CONFIG.COLORS.PAID;
-    } else if (key < currentMonthSortKey || (key === currentMonthSortKey && todayDay > 25)) {
-      statusLabel = "🚨 Overdue";
-      statusColor = CONFIG.COLORS.OVERDUE;
-    } else if (key === currentMonthSortKey && todayDay <= 25) {
-      statusLabel = "⚠️ Due Soon (25th)";
-      statusColor = CONFIG.COLORS.DUE_SOON;
-    }
-
-    const isStatementMonth = (key === activeStatementSortKey);
-    const bankBillVal = (cardBal.billedBalance > 0 && isStatementMonth) ? cardBal.billedBalance : "";
-    const diffVal = (typeof bankBillVal === "number") ? (data.total - bankBillVal) : "";
-
-    grandTotalDebt += data.total;
-    if (typeof bankBillVal === "number") grandBankBill += bankBillVal;
-
-    const row = [
-      monthLabel,
-      statusLabel,
-      data.total,
-      bankBillVal,
-      diffVal
-    ];
-
-    sortedPeople.forEach(p => {
-      const pAmt = data.people[p] || 0;
-      row.push(pAmt);
-      personTotals[p] += pAmt;
-    });
-
-    matrixRows.push(row);
-    matrixRowColors.push(statusColor);
-  });
-
-  // Render Matrix Data Rows
-  const matrixRange = debtsSheet.getRange(currentRow, 1, matrixRows.length, totalCols);
-  matrixRange.setValues(matrixRows);
-
-  for (let r = 0; r < matrixRows.length; r++) {
-    debtsSheet.getRange(currentRow + r, 2).setBackground(matrixRowColors[r]).setFontWeight("bold");
-    if (matrixRows[r][1].includes("Paid")) {
-      debtsSheet.getRange(currentRow + r, 1).setFontLine("line-through");
-    }
-  }
-
-  // Format currency columns
-  debtsSheet.getRange(currentRow, 3, matrixRows.length, totalCols - 2).setNumberFormat("#,##0.00");
-  debtsSheet.getRange(currentRow, 1, matrixRows.length, 1).setFontWeight("bold");
-  currentRow += matrixRows.length;
-
-  // Grand Total Summary Row
-  const totalSummaryRow = ["TOTAL ALL MONTHS", "", grandTotalDebt, (grandBankBill > 0 ? grandBankBill : ""), ""];
-  sortedPeople.forEach(p => totalSummaryRow.push(personTotals[p]));
-
-  debtsSheet.getRange(currentRow, 1, 1, totalCols)
-    .setValues([totalSummaryRow])
-    .setFontWeight("bold")
-    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
-    .setBorder(true, true, true, true, true, true);
-  debtsSheet.getRange(currentRow, 3, 1, totalCols - 2).setNumberFormat("#,##0.00");
-  currentRow += 3;
-
-  // ==========================================
-  // DETAILED MONTHLY DUES CARDS (WITH SPLIT BREAKDOWN)
-  // ==========================================
-  debtsSheet.getRange(currentRow, 1, 1, 3).merge()
-    .setValue("📑 Detailed Monthly Dues (Cards & Category Breakdown)")
-    .setFontWeight("bold")
-    .setFontSize(12)
-    .setBackground(CONFIG.COLORS.HEADER);
-  currentRow += 2;
-
-  sortedKeys.forEach(key => {
-    const data = allDebts[key];
-    const monthLabel = data.label;
-    const isPaid = paidMonthsSet.has(monthLabel.toLowerCase());
-
-    let blockColor = null;
-    let isOverdue = false;
-    let isDueSoon = false;
-
-    if (isPaid) {
-      blockColor = CONFIG.COLORS.PAID;
-    } else if (key < currentMonthSortKey || (key === currentMonthSortKey && todayDay > 25)) {
-      isOverdue = true;
-      blockColor = CONFIG.COLORS.OVERDUE;
-    } else if (key === currentMonthSortKey && todayDay <= 25) {
-      isDueSoon = true;
-      blockColor = CONFIG.COLORS.DUE_SOON;
-    }
-
-    // Title Row
-    const titleRange = debtsSheet.getRange(currentRow, 1, 1, 3);
-    titleRange.merge();
-    let headerText = monthLabel;
-    if (isOverdue) headerText += " (OVERDUE)";
-    else if (isDueSoon) headerText += " (DUE BY 25th)";
-    else if (isPaid) headerText += " (PAID)";
-
-    titleRange.setValue(headerText)
-      .setFontWeight("bold")
-      .setFontSize(12)
-      .setBackground(blockColor || CONFIG.COLORS.HEADER);
-    if (isPaid) titleRange.setFontLine("line-through");
-    currentRow++;
-
-    // Data Rows
-    const rows = [];
-    const isStatementMonth = (key === activeStatementSortKey);
-    let bankDueOffset = -1;
-
-    if (cardBal.billedBalance > 0 && isStatementMonth) {
-      bankDueOffset = rows.length;
-      rows.push(["🏦 BANK STATEMENT DUE (Must Pay):", cardBal.billedBalance, "Exact statement closing balance from NBE"]);
-      rows.push(["👥 Sum of Individual Family Shares:", data.total, "Total purchases, EMIs & assigned items in this cycle"]);
-
-      const diff = data.total - cardBal.billedBalance;
-      if (Math.abs(diff) < 1.00) {
-        rows.push(["⚖️ Audit & Reconciliation Status:", "✅ Matched (0.00 EGP difference)", "All family shares perfectly match bank bill"]);
-      } else if (diff > 1.00) {
-        rows.push(["⚖️ Audit Difference:", "+" + diff.toFixed(2) + " EGP", "Family debts exceed bank bill (prior overpayment applied)"]);
-        rows.push(["👉 What to Pay:", cardBal.billedBalance, "Transfer billed amount to NBE to settle card"]);
-      } else {
-        rows.push(["⚠️ Audit Difference:", "-" + Math.abs(diff).toFixed(2) + " EGP", "Bank bill is higher! Check Reconciliation for unassigned items"]);
-      }
-    } else {
-      rows.push(["Total Bill (Purchases & EMIs):", data.total, `Purchases: ${data.purchasesTotal.toFixed(2)} | EMIs: ${data.installmentsTotal.toFixed(2)}`]);
-    }
-
-    const personHeaderIdx = rows.length;
-    rows.push(["Person", "Owes (EGP)", "Category Breakdown"]);
-
-    const activePeople = Object.keys(data.people).sort();
-    activePeople.forEach(p => {
-      const pTotal = data.people[p];
-      const bk = data.peopleBreakdown[p] || { purchases: 0, installments: 0, missingFromSheet: 0 };
-      const bkParts = [];
-      if (bk.purchases > 0) bkParts.push(`Purchases: ${bk.purchases.toFixed(2)}`);
-      if (bk.installments > 0) bkParts.push(`EMIs: ${bk.installments.toFixed(2)}`);
-      if (bk.missingFromSheet > 0) bkParts.push(`⚠️ Missing from Sheet: ${bk.missingFromSheet.toFixed(2)}`);
-      const bkStr = bkParts.join(" | ") || `Total: ${pTotal.toFixed(2)}`;
-      rows.push([p, pTotal, bkStr]);
-    });
-
-    const dataRange = debtsSheet.getRange(currentRow, 1, rows.length, 3);
-    dataRange.setValues(rows);
-
-    // Number formatting
-    for (let r = 0; r < rows.length; r++) {
-      if (typeof rows[r][1] === "number") {
-        debtsSheet.getRange(currentRow + r, 2).setNumberFormat("#,##0.00");
-      } else {
-        debtsSheet.getRange(currentRow + r, 2).setNumberFormat("@");
-      }
-    }
-
-    // Typography & Styling
-    debtsSheet.getRange(currentRow, 1, personHeaderIdx, 3).setFontWeight("bold");
-    debtsSheet.getRange(currentRow + personHeaderIdx, 1, 1, 3).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
-
-    if (blockColor) dataRange.setBackground(blockColor);
-
-    if (bankDueOffset >= 0) {
-      debtsSheet.getRange(currentRow + bankDueOffset, 1, 1, 3)
-        .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
-        .setFontWeight("bold")
-        .setFontColor(CONFIG.COLORS.PRIMARY);
-    }
-
-    if (isPaid) dataRange.setFontLine("line-through");
-
-    currentRow += rows.length + 1;
-  });
-
-  debtsSheet.autoResizeColumns(1, totalCols);
-
-  // 5. Render Dedicated 'Debt Breakdown' Sheet
+  // 4. Render Dedicated 'Debt Breakdown' Sheet
   renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeStatementDueDate, assignedMissingCount, assignedMissingTotal);
+
+  // 5. Render Dedicated 'Audit & Differences' Sheet
+  renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, activeStatementDueDate, reconAssignedList, neglectedTxKeys, existingTransactionsForDedupe);
 }
 
 function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeStatementDueDate, assignedMissingCount, assignedMissingTotal) {
@@ -2559,4 +2409,498 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   }
 
   sheet.autoResizeColumns(1, 9);
+}
+
+function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, activeStatementDueDate, reconAssignedList, neglectedTxKeys, existingTxList) {
+  const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.AUDIT_DIFFERENCES);
+  sheet.clear();
+  sheet.setHiddenGridlines(false);
+
+  const activeSortKey = Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
+  const activeMonthLabel = Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
+  const activeData = allDebts[activeSortKey] || {
+    label: activeMonthLabel,
+    total: 0,
+    purchasesTotal: 0,
+    installmentsTotal: 0,
+    missingFromSheetTotal: 0,
+    people: {},
+    peopleBreakdown: {}
+  };
+
+  const bankBill = cardBal.billedBalance || 0;
+  const familyTotal = activeData.total || 0;
+  const netDiff = familyTotal - bankBill;
+
+  // Title Banner
+  sheet.getRange("A1:H1").merge()
+    .setValue("🔍 NBE Credit Card — Cross-Sheet Audit & Discrepancy Detective (" + activeMonthLabel + ")")
+    .setFontWeight("bold")
+    .setFontSize(14)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff");
+
+  sheet.getRange("A2:H2").merge()
+    .setValue("Automated reconciliation & audit engine comparing Bank Statement, Transactions, Installments, Reconciliation, and Debt Breakdown.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+
+  let curRow = 4;
+
+  // ==========================================
+  // 1. EXECUTIVE SUMMARY & BALANCE EQUATION
+  // ==========================================
+  sheet.getRange(curRow, 1, 1, 8).merge()
+    .setValue("📊 Executive Reconciliation Balance Equation")
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setBackground(CONFIG.COLORS.HEADER);
+  curRow++;
+
+  let statusBadge = "✅ Perfect Match (0.00 EGP difference)";
+  let statusColor = CONFIG.COLORS.PAID;
+  if (Math.abs(netDiff) >= 0.05) {
+    if (netDiff > 0) {
+      statusBadge = "⚠️ Family Shares Exceed Bank Bill by +" + netDiff.toFixed(2) + " EGP";
+      statusColor = CONFIG.COLORS.DUE_SOON;
+    } else {
+      statusBadge = "🚨 Bank Bill Exceeds Shares by -" + Math.abs(netDiff).toFixed(2) + " EGP (Missing Items!)";
+      statusColor = CONFIG.COLORS.OVERDUE;
+    }
+  }
+
+  const kpiData = [
+    ["🏦 Bank Closing Balance (Must Pay):", bankBill, "👥 Total Family Shares in Debt Breakdown:", familyTotal, "⚖️ Net Discrepancy:", netDiff, "Status:", statusBadge],
+    ["🛒 Purchases Total (Sheet):", activeData.purchasesTotal, "📦 Installments Total (Sheet):", activeData.installmentsTotal, "⚠️ Missing Assigned (Table 2):", activeData.missingFromSheetTotal, "Total Card Limit:", cardBal.creditLimit],
+    ["💳 Statement Total Debits:", cardBal.totalDebit || 0, "💰 Statement Credits / Payments:", cardBal.totalCredit || 0, "Available Balance Now:", cardBal.availableBalanceNow, "Available Post-Settlement:", cardBal.availableAfterSettlement]
+  ];
+
+  sheet.getRange(curRow, 1, kpiData.length, 8).setValues(kpiData);
+  sheet.getRange(curRow, 1, kpiData.length, 8).setFontSize(9).setBackground(CONFIG.COLORS.PRIMARY_LIGHT).setBorder(true, true, true, true, true, true);
+  for (let c of [1, 3, 5, 7]) {
+    sheet.getRange(curRow, c, kpiData.length, 1).setFontWeight("bold");
+  }
+  for (let c of [2, 4, 6]) {
+    sheet.getRange(curRow, c, kpiData.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+  }
+  sheet.getRange(curRow + 1, 8).setNumberFormat("#,##0.00");
+  sheet.getRange(curRow + 2, 6).setNumberFormat("#,##0.00");
+  sheet.getRange(curRow + 2, 8).setNumberFormat("#,##0.00");
+  sheet.getRange(curRow, 8).setBackground(statusColor).setFontWeight("bold");
+  curRow += kpiData.length + 2;
+
+  // GATHER STATEMENT ITEMS
+  const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
+  const stmtDebits = [];
+  const stmtInstallments = [];
+  const stmtCredits = [];
+
+  if (stmtSheet && stmtSheet.getLastRow() >= 7) {
+    const lastR = stmtSheet.getLastRow();
+    const rows = stmtSheet.getRange(7, 1, lastR - 6, 8).getValues();
+    rows.forEach((r, idx) => {
+      const rowNum = 7 + idx;
+      const rawDate = r[1];
+      const pDate = parseDateValue(rawDate, tz);
+      const desc = String(r[3] || "").trim();
+      const type = String(r[4] || "").trim().toUpperCase();
+      const amt = parseFloat(r[5]);
+      const auth = String(r[6] || "").trim();
+      const status = String(r[7] || "").trim();
+
+      if (isNaN(amt) || amt <= 0) return;
+
+      const itemObj = {
+        rowNum: rowNum,
+        date: pDate || rawDate,
+        dateStr: String(rawDate),
+        desc: desc,
+        type: type,
+        amount: amt,
+        auth: auth,
+        status: status
+      };
+
+      if (type === "DEBIT") stmtDebits.push(itemObj);
+      else if (type === "INSTALLMENT") stmtInstallments.push(itemObj);
+      else if (type === "CREDIT") stmtCredits.push(itemObj);
+    });
+  }
+
+  // 1. Unassigned / Missing Statement Charges
+  const unassignedStatementCharges = [];
+  stmtDebits.forEach(st => {
+    const assignedItem = reconAssignedList.find(a => {
+      return Math.abs(a.amount - st.amount) < 0.05 && 
+             (a.desc.toLowerCase().includes(cleanMerchantName(st.desc).toLowerCase()) || 
+              cleanMerchantName(st.desc).toLowerCase().includes(cleanMerchantName(a.desc).toLowerCase()));
+    });
+    if (assignedItem) return;
+
+    const matchedPurchase = debtLineItems.find(it => {
+      if (it.category !== "Purchase" || it.sortKey !== activeSortKey) return false;
+      const amtDiff = Math.abs(it.originalAmount - st.amount);
+      if (amtDiff > 0.05) return false;
+      return hasMerchantKeywordOverlap(st.desc, it.desc);
+    });
+    if (matchedPurchase) return;
+
+    unassignedStatementCharges.push({
+      date: st.date,
+      type: "DEBIT",
+      desc: st.desc,
+      amount: st.amount,
+      status: st.status.includes("Neglect") ? "🚫 Neglected / Ignored" : "⚠️ Unassigned in Reconciliation Table 2",
+      action: st.status.includes("Neglect") ? "Neglected in Reconciliation" : "Assign a payer in Reconciliation Table 2 -> will immediately add to Debt Breakdown"
+    });
+  });
+
+  const unassignedStatementInstallments = [];
+  stmtInstallments.forEach(si => {
+    const matchedInst = debtLineItems.find(it => {
+      if (it.category !== "Installment" || it.sortKey !== activeSortKey) return false;
+      const emiDiff = Math.abs(it.originalAmount - si.amount);
+      if (emiDiff > 0.50) return false;
+      return hasMerchantKeywordOverlap(si.desc, it.desc) || si.desc.toLowerCase().includes(it.desc.toLowerCase()) || it.desc.toLowerCase().includes(cleanMerchantName(si.desc).toLowerCase());
+    });
+    if (!matchedInst) {
+      unassignedStatementInstallments.push({
+        date: si.date,
+        type: "INSTALLMENT",
+        desc: si.desc,
+        amount: si.amount,
+        status: "⚠️ Unrecorded Statement Installment",
+        action: "Add this installment to 'Installments' sheet so it divides into family shares!"
+      });
+    }
+  });
+
+  const chargesOnStatementNotInDebt = [...unassignedStatementCharges, ...unassignedStatementInstallments];
+
+  // 2. Unbilled Sheet Purchases
+  const unbilledSheetPurchases = [];
+  existingTxList.forEach(tx => {
+    const dueDate = getDueDateForPurchase(tx.date, tz);
+    if (!dueDate) return;
+    const sKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
+    if (sKey !== activeSortKey) return;
+
+    const matchedStmt = stmtDebits.find(st => {
+      const amtDiff = Math.abs(tx.amount - st.amount);
+      if (amtDiff > 0.05) return false;
+      return hasMerchantKeywordOverlap(st.desc, tx.desc);
+    });
+
+    if (!matchedStmt) {
+      const dStr = Utilities.formatDate(tx.date, tz, "yyyy-MM-dd");
+      const txKeyNorm = `${dStr}_${tx.amount.toFixed(2)}_${tx.desc.substring(0, 30)}_${tx.rawPerson}`;
+      const isNeglected = neglectedTxKeys.has(txKeyNorm);
+
+      unbilledSheetPurchases.push({
+        date: tx.date,
+        person: normalizePersonName(tx.rawPerson),
+        desc: tx.desc,
+        amount: tx.amount,
+        status: isNeglected ? "🚫 Neglected (Excluded from Bill)" : "Active in Bill (Unbilled by NBE)",
+        action: isNeglected ? "Already excluded from bill" : "If bank has not billed this yet, check Neglect box in Reconciliation Table 3"
+      });
+    }
+  });
+
+  // ==========================================
+  // 2. MATHEMATICAL DIFFERENCE BRIDGE
+  // ==========================================
+  sheet.getRange(curRow, 1, 1, 5).merge()
+    .setValue("🌉 Difference Bridge (Why Family Shares Differ from Bank Bill)")
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setBackground(CONFIG.COLORS.HEADER);
+  curRow++;
+
+  const unassignedDebitsTotal = unassignedStatementCharges.filter(c => !c.status.includes("Neglect")).reduce((s, c) => s + c.amount, 0);
+  const unassignedInstTotal = unassignedStatementInstallments.reduce((s, c) => s + c.amount, 0);
+  const unbilledPurchasesActiveTotal = unbilledSheetPurchases.filter(p => !p.status.includes("Neglect")).reduce((s, p) => s + p.amount, 0);
+
+  const bridgeHeaders = ["Step / Component", "Amount (EGP)", "Sign", "Impact on Discrepancy", "Status"];
+  sheet.getRange(curRow, 1, 1, bridgeHeaders.length).setValues([bridgeHeaders]).setFontWeight("bold").setBackground(CONFIG.COLORS.HEADER);
+  curRow++;
+
+  const bridgeRows = [
+    ["1. Bank Statement Closing Balance (NBE Bill)", bankBill, "Base", "Exact amount billed by NBE on PDF statement", "Bank Official"],
+    ["2. Plus: Unassigned Statement Debits", unassignedDebitsTotal, "+ (Bank > Sheet)", "Billed by bank but not yet assigned to family", unassignedDebitsTotal > 0 ? "⚠️ Needs Assignment" : "✅ 0.00 EGP"],
+    ["3. Plus: Unrecorded Statement Installments", unassignedInstTotal, "+ (Bank > Sheet)", "Installments billed by bank missing from Installments sheet", unassignedInstTotal > 0 ? "⚠️ Missing EMI" : "✅ 0.00 EGP"],
+    ["4. Minus: Unbilled Transactions in Sheet", -unbilledPurchasesActiveTotal, "- (Sheet > Bank)", "Recorded in Transactions but not billed by NBE in this cycle", unbilledPurchasesActiveTotal > 0 ? "ℹ️ Unbilled by NBE" : "✅ 0.00 EGP"],
+    ["5. Plus: Assigned Statement Charges (Table 2)", activeData.missingFromSheetTotal, "+ (Table 2)", "Statement debits assigned to family members", activeData.missingFromSheetTotal > 0 ? "✅ Included in Bill" : "0.00 EGP"],
+    ["6. Computed Total Family Shares in Debt Breakdown", familyTotal, "=", "Sum of all individual shares due in Debt Breakdown", statusBadge]
+  ];
+
+  sheet.getRange(curRow, 1, bridgeRows.length, bridgeHeaders.length).setValues(bridgeRows);
+  sheet.getRange(curRow, 2, bridgeRows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+  sheet.getRange(curRow, 1, bridgeRows.length, 1).setFontWeight("bold");
+  sheet.getRange(curRow + bridgeRows.length - 1, 1, 1, bridgeHeaders.length).setBackground(CONFIG.COLORS.PRIMARY_LIGHT).setFontWeight("bold");
+  curRow += bridgeRows.length + 2;
+
+  // ==========================================
+  // TABLE 1: ⚠️ CHARGES ON BANK STATEMENT NOT IN DEBT BREAKDOWN
+  // ==========================================
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("⚠️ Table 1: Charges on Bank Statement NOT in Debt Breakdown (" + chargesOnStatementNotInDebt.length + " items)")
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setBackground(chargesOnStatementNotInDebt.length > 0 ? CONFIG.COLORS.OVERDUE : CONFIG.COLORS.PAID);
+  curRow++;
+
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("Debits or installments billed by NBE on the official statement that are currently NOT included in any family member's share.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  curRow++;
+
+  const t1Headers = ["#", "Date", "Type", "Description / Merchant", "Amount (EGP)", "Status", "Action Required"];
+  sheet.getRange(curRow, 1, 1, t1Headers.length).setValues([t1Headers]).setFontWeight("bold").setBackground(CONFIG.COLORS.HEADER).setBorder(true, true, true, true, true, true);
+  curRow++;
+
+  if (chargesOnStatementNotInDebt.length === 0) {
+    sheet.getRange(curRow, 1, 1, 7).merge()
+      .setValue("✅ All bank statement debits and installments are 100% accounted for in Debt Breakdown!")
+      .setFontColor(CONFIG.COLORS.PRIMARY)
+      .setFontWeight("bold");
+    curRow += 2;
+  } else {
+    const t1Rows = chargesOnStatementNotInDebt.map((c, idx) => [
+      idx + 1,
+      c.date,
+      c.type,
+      c.desc,
+      c.amount,
+      c.status,
+      c.action
+    ]);
+    sheet.getRange(curRow, 1, t1Rows.length, t1Headers.length).setValues(t1Rows);
+    sheet.getRange(curRow, 2, t1Rows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(curRow, 5, t1Rows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+    for (let r = 0; r < t1Rows.length; r++) {
+      if (t1Rows[r][5].includes("Unassigned") || t1Rows[r][5].includes("Unrecorded")) {
+        sheet.getRange(curRow + r, 1, 1, t1Headers.length).setBackground(CONFIG.COLORS.OVERDUE);
+      } else {
+        sheet.getRange(curRow + r, 1, 1, t1Headers.length).setBackground("#eeeeee");
+      }
+    }
+    curRow += t1Rows.length + 2;
+  }
+
+  // ==========================================
+  // TABLE 2: 📋 TRANSACTIONS IN SHEET NOT FOUND ON BANK STATEMENT
+  // ==========================================
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("📋 Table 2: Purchases in Transactions Sheet NOT Found on Bank Statement (" + unbilledSheetPurchases.length + " items)")
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setBackground("#e3f2fd");
+  curRow++;
+
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("Purchases recorded in your Transactions sheet that were NOT billed on this statement. If unbilled by bank, you can Neglect them in Reconciliation Table 3.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  curRow++;
+
+  const t2Headers = ["#", "Purchase Date", "Person", "Description / Merchant", "Amount (EGP)", "Current Status", "Recommendation"];
+  sheet.getRange(curRow, 1, 1, t2Headers.length).setValues([t2Headers]).setFontWeight("bold").setBackground(CONFIG.COLORS.HEADER).setBorder(true, true, true, true, true, true);
+  curRow++;
+
+  if (unbilledSheetPurchases.length === 0) {
+    sheet.getRange(curRow, 1, 1, 7).merge()
+      .setValue("✅ All sheet transactions in this cycle were billed on the bank statement!")
+      .setFontColor(CONFIG.COLORS.PRIMARY)
+      .setFontWeight("bold");
+    curRow += 2;
+  } else {
+    const t2Rows = unbilledSheetPurchases.map((p, idx) => [
+      idx + 1,
+      p.date,
+      p.person,
+      p.desc,
+      p.amount,
+      p.status,
+      p.action
+    ]);
+    sheet.getRange(curRow, 1, t2Rows.length, t2Headers.length).setValues(t2Rows);
+    sheet.getRange(curRow, 2, t2Rows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(curRow, 5, t2Rows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+    for (let r = 0; r < t2Rows.length; r++) {
+      if (t2Rows[r][5].includes("Neglected")) {
+        sheet.getRange(curRow + r, 1, 1, t2Headers.length).setBackground("#eeeeee");
+      }
+    }
+    curRow += t2Rows.length + 2;
+  }
+
+  // ==========================================
+  // TABLE 3: 🔍 POTENTIAL DUPLICATES & DOUBLE-COUNT WARNINGS
+  // ==========================================
+  const duplicateWarnings = [];
+  reconAssignedList.forEach(a => {
+    const cleanA = cleanMerchantName(a.desc).toLowerCase();
+    const suspectTx = existingTxList.find(tx => {
+      const amtDiff = Math.abs(tx.amount - a.amount);
+      if (amtDiff > 0.05) return false;
+      const cleanT = cleanMerchantName(tx.desc).toLowerCase();
+      return cleanA.includes(cleanT) || cleanT.includes(cleanA) || hasMerchantKeywordOverlap(a.desc, tx.desc);
+    });
+
+    if (suspectTx) {
+      duplicateWarnings.push({
+        type: "⚠️ Assigned Charge vs Sheet Duplicate",
+        date: a.rawDate || a.dateStr,
+        person: normalizePersonName(a.payer),
+        desc: `Assigned: "${a.desc}" ↔ Sheet: "${suspectTx.desc}"`,
+        amount: a.amount,
+        recommendation: `Possible double-count! If this is the same transaction, unassign in Reconciliation Table 2 or remove from Transactions.`
+      });
+    }
+  });
+
+  const seenTx = new Map();
+  existingTxList.forEach(tx => {
+    const dStr = Utilities.formatDate(tx.date, tz, "yyyy-MM-dd");
+    const key = `${dStr}_${tx.amount.toFixed(2)}_${normalizePersonName(tx.rawPerson)}`;
+    if (seenTx.has(key)) {
+      duplicateWarnings.push({
+        type: "⚠️ Duplicate Entry in Transactions Sheet",
+        date: tx.date,
+        person: normalizePersonName(tx.rawPerson),
+        desc: tx.desc,
+        amount: tx.amount,
+        recommendation: `Multiple transactions with exact same date (${dStr}), person (${normalizePersonName(tx.rawPerson)}), and amount (${tx.amount.toFixed(2)} EGP). Check if entered twice.`
+      });
+    } else {
+      seenTx.set(key, tx);
+    }
+  });
+
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("🔍 Table 3: Potential Duplicates & Double-Count Warnings (" + duplicateWarnings.length + " warnings)")
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setBackground(duplicateWarnings.length > 0 ? CONFIG.COLORS.DUE_SOON : CONFIG.COLORS.PAID);
+  curRow++;
+
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("Detection of transactions that may be counted twice (e.g. assigned from statement AND recorded in Transactions, or duplicated entries).")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  curRow++;
+
+  const t3Headers = ["#", "Warning Type", "Date", "Person", "Description / Details", "Amount (EGP)", "Action Recommendation"];
+  sheet.getRange(curRow, 1, 1, t3Headers.length).setValues([t3Headers]).setFontWeight("bold").setBackground(CONFIG.COLORS.HEADER).setBorder(true, true, true, true, true, true);
+  curRow++;
+
+  if (duplicateWarnings.length === 0) {
+    sheet.getRange(curRow, 1, 1, 7).merge()
+      .setValue("✅ No duplicate transactions or double-counted assignments detected!")
+      .setFontColor(CONFIG.COLORS.PRIMARY)
+      .setFontWeight("bold");
+    curRow += 2;
+  } else {
+    const t3Rows = duplicateWarnings.map((w, idx) => [
+      idx + 1,
+      w.type,
+      w.date,
+      w.person,
+      w.desc,
+      w.amount,
+      w.recommendation
+    ]);
+    sheet.getRange(curRow, 1, t3Rows.length, t3Headers.length).setValues(t3Rows);
+    sheet.getRange(curRow, 3, t3Rows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(curRow, 6, t3Rows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+    sheet.getRange(curRow, 1, t3Rows.length, t3Headers.length).setBackground(CONFIG.COLORS.DUE_SOON);
+    curRow += t3Rows.length + 2;
+  }
+
+  // ==========================================
+  // TABLE 4: 👥 PAYER NAMES INTEGRITY CHECK (Whitespace & Casing Audit)
+  // ==========================================
+  const rawVariantsMap = new Map();
+  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+  if (txSheet && txSheet.getLastRow() >= 2) {
+    const rawTxPayers = txSheet.getRange(2, 4, txSheet.getLastRow() - 1, 1).getValues();
+    rawTxPayers.forEach(r => {
+      const raw = String(r[0] || "");
+      if (!raw.trim()) return;
+      splitPayerNames(raw).forEach(norm => {
+        if (!rawVariantsMap.has(norm)) rawVariantsMap.set(norm, new Set());
+        rawVariantsMap.get(norm).add(raw.trim());
+      });
+    });
+  }
+
+  const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  if (instSheet && instSheet.getLastRow() >= 2) {
+    const rawInstPayers = instSheet.getRange(2, 9, instSheet.getLastRow() - 1, 1).getValues();
+    rawInstPayers.forEach(r => {
+      const raw = String(r[0] || "");
+      if (!raw.trim()) return;
+      splitPayerNames(raw).forEach(norm => {
+        if (!rawVariantsMap.has(norm)) rawVariantsMap.set(norm, new Set());
+        rawVariantsMap.get(norm).add(raw.trim());
+      });
+    });
+  }
+
+  reconAssignedList.forEach(a => {
+    if (a.payer) {
+      splitPayerNames(a.payer).forEach(norm => {
+        if (!rawVariantsMap.has(norm)) rawVariantsMap.set(norm, new Set());
+        rawVariantsMap.get(norm).add(String(a.payer).trim());
+      });
+    }
+  });
+
+  sheet.getRange(curRow, 1, 1, 5).merge()
+    .setValue("👥 Table 4: Payer Names Integrity Check (Automatic Case & Whitespace Normalization)")
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setBackground(CONFIG.COLORS.HEADER);
+  curRow++;
+
+  sheet.getRange(curRow, 1, 1, 5).merge()
+    .setValue("All payer names are automatically trimmed, title-cased, and unified across sheets. Different casing (e.g. 'mido' vs 'MIDO') or trailing spaces are merged automatically.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  curRow++;
+
+  const t4Headers = ["#", "Normalized Name", "Active Share in Bill (EGP)", "Raw Variations Detected in Sheets", "Status"];
+  sheet.getRange(curRow, 1, 1, t4Headers.length).setValues([t4Headers]).setFontWeight("bold").setBackground(CONFIG.COLORS.HEADER).setBorder(true, true, true, true, true, true);
+  curRow++;
+
+  const sortedNormNames = Array.from(rawVariantsMap.keys()).sort((a, b) => a.localeCompare(b));
+  const t4Rows = sortedNormNames.map((name, idx) => {
+    const pShare = (activeData.peopleBreakdown && activeData.peopleBreakdown[name]) ? activeData.peopleBreakdown[name].total : 0;
+    const variants = Array.from(rawVariantsMap.get(name) || []).join(", ");
+    return [
+      idx + 1,
+      name,
+      pShare,
+      variants || name,
+      "✅ Cleanly Unified"
+    ];
+  });
+
+  if (t4Rows.length > 0) {
+    sheet.getRange(curRow, 1, t4Rows.length, t4Headers.length).setValues(t4Rows);
+    sheet.getRange(curRow, 1, t4Rows.length, 1).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
+    sheet.getRange(curRow, 2, t4Rows.length, 1).setFontWeight("bold");
+    sheet.getRange(curRow, 3, t4Rows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+    sheet.getRange(curRow, 5, t4Rows.length, 1).setBackground(CONFIG.COLORS.PAID);
+    curRow += t4Rows.length + 2;
+  }
+
+  sheet.autoResizeColumns(1, 8);
 }
