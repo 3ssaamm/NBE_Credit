@@ -43,10 +43,69 @@ function onOpen() {
     .addItem("📥 Process Latest Statement (Drive)", "menuProcessStatement")
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
     .addSeparator()
-    .addItem("➕ Add Checked Charges to Transactions", "addAssignedChargesToTransactions")
+    .addItem("➕ Add Assigned Charges to Transactions", "addAssignedChargesToTransactions")
     .addSeparator()
     .addItem("⏰ Setup Daily Auto-Check", "setupDailyTrigger")
     .addToUi();
+}
+
+function onEdit(e) {
+  if (!e || !e.range) return;
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== CONFIG.SHEETS.RECONCILIATION) return;
+
+  const col = e.range.getColumn();
+  const row = e.range.getRow();
+  if (row < 5) return;
+
+  const validPayers = ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza", "Shared"];
+
+  // Table 2: User assigns a Payer in Column E (col 5)
+  if (col === 5) {
+    const val = String(e.value || e.range.getValue() || "").trim();
+    if (!validPayers.includes(val)) return;
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+    if (!txSheet) return;
+
+    // Read row values: Col 1 (#), Col 2 (Date), Col 3 (Desc), Col 4 (Amount), Col 5 (Payer), Col 6 (Custom Note)
+    const rowValues = sheet.getRange(row, 1, 1, 6).getValues()[0];
+    const rawDate = rowValues[1];
+    const origDesc = String(rowValues[2] || "").trim();
+    const amt = parseFloat(rowValues[3]);
+    const payer = val;
+    const note = String(rowValues[5] || "").trim();
+
+    if (isNaN(amt) || amt <= 0) return;
+
+    const dateObj = new Date(rawDate);
+    const finalDate = isNaN(dateObj.getTime()) ? new Date() : dateObj;
+    const finalDesc = note || origDesc;
+
+    // Determine next ID in Transactions
+    let txLastRow = txSheet.getLastRow();
+    let nextId = 1;
+    if (txLastRow >= 2) {
+      const lastIdVal = txSheet.getRange(txLastRow, 1).getValue();
+      if (!isNaN(parseInt(lastIdVal, 10))) {
+        nextId = parseInt(lastIdVal, 10) + 1;
+      }
+    }
+
+    // Append to Transactions
+    const newTxRow = [nextId, finalDate, finalDesc, payer, amt];
+    txSheet.getRange(txLastRow + 1, 1, 1, 5).setValues([newTxRow]);
+    txSheet.getRange(txLastRow + 1, 2, 1, 1).setNumberFormat("dddd, MMMM d, yyyy");
+    txSheet.getRange(txLastRow + 1, 5, 1, 1).setNumberFormat("#,##0.00");
+
+    // Mark row as Added in Reconciliation sheet
+    sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
+    sheet.getRange(row, 5).clearDataValidations().setValue("✅ Added (" + payer + ")");
+
+    // Toast notification
+    ss.toast(`Added "${finalDesc}" (${amt.toFixed(2)} EGP) for ${payer} to Transactions!`, "💳 Transaction Added", 4);
+  }
 }
 
 function setupDailyTrigger() {
@@ -793,20 +852,20 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
   }
 
   // TABLE 2: ⚠️ Missing Charges from Sheet
-  reconSheet.getRange(curRow, 1, 1, 7).merge()
+  reconSheet.getRange(curRow, 1, 1, 6).merge()
     .setValue("⚠️ Charges on Statement MISSING from Sheet (" + missingInSheet.length + " items)")
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.OVERDUE);
   curRow++;
 
-  const missHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Assign Payer", "Custom Note", "Add to Sheet?"];
-  reconSheet.getRange(curRow, 1, 1, 7).setValues([missHeaders])
+  const missHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Assign Payer", "Custom Note"];
+  reconSheet.getRange(curRow, 1, 1, 6).setValues([missHeaders])
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.HEADER);
   curRow++;
 
   if (missingInSheet.length === 0) {
-    reconSheet.getRange(curRow, 1, 1, 7).merge()
+    reconSheet.getRange(curRow, 1, 1, 6).merge()
       .setValue("✅ All statement debits are successfully recorded in Transactions!")
       .setFontColor(CONFIG.COLORS.PRIMARY);
     curRow += 2;
@@ -823,16 +882,14 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
       m.desc,
       m.amount,
       "",
-      cleanMerchantName(m.desc),
-      false
+      cleanMerchantName(m.desc)
     ]);
 
-    const missRange = reconSheet.getRange(curRow, 1, missRows.length, 7);
+    const missRange = reconSheet.getRange(curRow, 1, missRows.length, 6);
     missRange.setValues(missRows);
     reconSheet.getRange(curRow, 2, missRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
     reconSheet.getRange(curRow, 4, missRows.length, 1).setNumberFormat("#,##0.00");
     reconSheet.getRange(curRow, 5, missRows.length, 1).setDataValidation(payerValidation);
-    reconSheet.getRange(curRow, 7, missRows.length, 1).insertCheckboxes();
     curRow += missRows.length + 1;
   }
 
@@ -910,7 +967,7 @@ function addAssignedChargesToTransactions() {
   const lastRow = reconSheet.getLastRow();
   if (lastRow < 5) return;
 
-  const data = reconSheet.getRange(1, 1, lastRow, 7).getValues();
+  const data = reconSheet.getRange(1, 1, lastRow, 6).getValues();
   const toAdd = [];
   const validPayers = ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza", "Shared"];
 
@@ -918,9 +975,8 @@ function addAssignedChargesToTransactions() {
     const amt = parseFloat(row[3]);
     const payer = String(row[4] || "").trim();
     const note = String(row[5] || "").trim();
-    const isChecked = row[6] === true;
 
-    if (!isNaN(amt) && amt > 0 && validPayers.includes(payer) && isChecked) {
+    if (!isNaN(amt) && amt > 0 && validPayers.includes(payer)) {
       const rawDate = row[1];
       const dateObj = new Date(rawDate);
       toAdd.push({
@@ -935,7 +991,7 @@ function addAssignedChargesToTransactions() {
   if (toAdd.length === 0) {
     SpreadsheetApp.getUi().alert(
       "No Charges Selected",
-      "Please assign a Payer (Column E) and check the 'Add to Sheet?' box (Column G) for any charges you want to add.",
+      "Please select a name in 'Assign Payer' (Column E) for any missing charges you want to add to Transactions.",
       SpreadsheetApp.getUi().ButtonSet.OK
     );
     return;
