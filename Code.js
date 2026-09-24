@@ -587,7 +587,42 @@ function runReconciliation(ss, tz) {
     }
   });
 
-  // Pass 2: Split Matches (2 or 3 sheet items sum to 1 statement charge)
+function findSubsetCombination(items, targetAmt, maxK, tolerance) {
+  const tol = tolerance || 0.10;
+  const n = items.length;
+  if (n < 2) return null;
+
+  const sorted = items.slice().sort((a, b) => b.amount - a.amount);
+
+  function search(startIdx, currentCombo, currentSum, k) {
+    if (currentCombo.length >= 2 && Math.abs(currentSum - targetAmt) <= tol) {
+      return currentCombo.slice();
+    }
+    if (currentCombo.length >= k || startIdx >= n) {
+      return null;
+    }
+
+    for (let i = startIdx; i < n; i++) {
+      const nextSum = currentSum + sorted[i].amount;
+      if (nextSum > targetAmt + tol) continue;
+
+      currentCombo.push(sorted[i]);
+      const res = search(i + 1, currentCombo, nextSum, k);
+      if (res) return res;
+      currentCombo.pop();
+    }
+    return null;
+  }
+
+  const limit = Math.min(n, maxK || 6);
+  for (let k = 2; k <= limit; k++) {
+    const res = search(0, [], 0, k);
+    if (res) return res;
+  }
+  return null;
+}
+
+  // Pass 2: N-Way Split Matches (2, 3, 4, 5, or 6 people split 1 statement charge)
   stmtDebits.forEach(st => {
     if (st.matched) return;
 
@@ -600,55 +635,19 @@ function runReconciliation(ss, tz) {
       return true;
     });
 
-    // Check pairs (2-way split)
-    let foundPair = false;
-    for (let i = 0; i < candidates.length; i++) {
-      for (let j = i + 1; j < candidates.length; j++) {
-        const sum = candidates[i].amount + candidates[j].amount;
-        if (Math.abs(sum - st.amount) < 0.10) {
-          const keywordMatch = hasMerchantKeywordOverlap(st.desc, candidates[i].desc) ||
-                               hasMerchantKeywordOverlap(st.desc, candidates[j].desc);
-          if (keywordMatch) {
-            st.matched = true;
-            st.matchType = "SPLIT";
-            candidates[i].matched = true;
-            candidates[j].matched = true;
-            st.matchedItems.push(candidates[i], candidates[j]);
-            foundPair = true;
-            break;
-          }
-        }
-      }
-      if (foundPair) break;
-    }
+    if (candidates.length < 2) return;
 
-    if (foundPair) return;
-
-    // Check triplets (3-way split)
-    let foundTriplet = false;
-    for (let i = 0; i < candidates.length; i++) {
-      for (let j = i + 1; j < candidates.length; j++) {
-        for (let k = j + 1; k < candidates.length; k++) {
-          const sum = candidates[i].amount + candidates[j].amount + candidates[k].amount;
-          if (Math.abs(sum - st.amount) < 0.10) {
-            const keywordMatch = hasMerchantKeywordOverlap(st.desc, candidates[i].desc) ||
-                                 hasMerchantKeywordOverlap(st.desc, candidates[j].desc) ||
-                                 hasMerchantKeywordOverlap(st.desc, candidates[k].desc);
-            if (keywordMatch) {
-              st.matched = true;
-              st.matchType = "SPLIT";
-              candidates[i].matched = true;
-              candidates[j].matched = true;
-              candidates[k].matched = true;
-              st.matchedItems.push(candidates[i], candidates[j], candidates[k]);
-              foundTriplet = true;
-              break;
-            }
-          }
-        }
-        if (foundTriplet) break;
+    const combo = findSubsetCombination(candidates, st.amount, 6, 0.10);
+    if (combo) {
+      const keywordMatch = combo.some(item => hasMerchantKeywordOverlap(st.desc, item.desc));
+      if (keywordMatch) {
+        st.matched = true;
+        st.matchType = "SPLIT";
+        combo.forEach(item => {
+          item.matched = true;
+          st.matchedItems.push(item);
+        });
       }
-      if (foundTriplet) break;
     }
   });
 
@@ -662,33 +661,34 @@ function runReconciliation(ss, tz) {
       if (tx.matched) return false;
       if (st.date) {
         const daysDiff = Math.abs((tx.date.getTime() - st.date.getTime()) / (1000 * 60 * 60 * 24));
-        return daysDiff <= 3;
+        return daysDiff <= 4;
       }
       return true;
     });
 
+    if (nearby.length === 0) return;
+
+    // Case A: Exact 1-to-1 amount match, but different description or typo
     const singleAmtMatch = nearby.find(tx => Math.abs(tx.amount - st.amount) < 0.05);
     if (singleAmtMatch) {
       suggestedMatches.push({
         stmt: st,
         sheetItems: [singleAmtMatch],
-        reason: `Exact amount (${st.amount.toFixed(2)}), dates within 3 days — check shop name`
+        reason: `Exact amount (${st.amount.toFixed(2)}), dates within 4 days — check shop name`
       });
       return;
     }
 
-    for (let i = 0; i < nearby.length; i++) {
-      for (let j = i + 1; j < nearby.length; j++) {
-        const sum = nearby[i].amount + nearby[j].amount;
-        if (Math.abs(sum - st.amount) < 0.10) {
-          suggestedMatches.push({
-            stmt: st,
-            sheetItems: [nearby[i], nearby[j]],
-            reason: `Split sum matches ${st.amount.toFixed(2)} (${nearby[i].person} + ${nearby[j].person})`
-          });
-          return;
-        }
-      }
+    // Case B: N-way split sum matches (2 to 6 items) without keyword overlap
+    const combo = findSubsetCombination(nearby, st.amount, 6, 0.10);
+    if (combo) {
+      const peopleList = combo.map(it => it.person).join(" + ");
+      suggestedMatches.push({
+        stmt: st,
+        sheetItems: combo,
+        reason: `${combo.length}-way split sum matches ${st.amount.toFixed(2)} (${peopleList})`
+      });
+      return;
     }
   });
 
