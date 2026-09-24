@@ -1852,7 +1852,7 @@ function updateLiveDashboard() {
 function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeStatementDueDate, assignedMissingCount, assignedMissingTotal) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.DEBT_BREAKDOWN);
   sheet.clear();
-  sheet.setHideGridlines(false);
+  sheet.setHiddenGridlines(false);
 
   const activeSortKey = Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
   const activeMonthLabel = Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
