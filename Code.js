@@ -177,12 +177,14 @@ function onEdit(e) {
         );
       }
 
-      updateLiveDashboard();
+      updateBankStatementStatusRow(origDesc, amt, isNeglected ? "🚫 Neglected / Ignored" : `⚠️ Unrecorded (Assigned to ${payer})`, isNeglected ? "#eeeeee" : CONFIG.COLORS.DUE_SOON);
+      updateLiveDashboard({ skipRecon: true });
     } else {
       delete assignedMap[chargeKey];
       scriptProps.setProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
       sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.OVERDUE);
-      updateLiveDashboard();
+      updateBankStatementStatusRow(origDesc, amt, "⚠️ Unassigned (Not in Sheet)", CONFIG.COLORS.OVERDUE);
+      updateLiveDashboard({ skipRecon: true });
     }
     return;
   }
@@ -213,7 +215,8 @@ function onEdit(e) {
 
         const ss = SpreadsheetApp.getActiveSpreadsheet();
         ss.toast(`Match confirmed for ${stmtDesc}!`, "💳 Match Confirmed", 3);
-        updateLiveDashboard();
+        updateBankStatementStatusRow(stmtDesc, amt, "✅ Confirmed Match", CONFIG.COLORS.PAID);
+        updateLiveDashboard({ skipRecon: true });
       }
     }
     return;
@@ -248,7 +251,7 @@ function onEdit(e) {
       scriptProps.setProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
       sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
       sheet.getRange(row, 8).setValue("🚫 Neglected (Excluded)");
-      updateLiveDashboard();
+      updateLiveDashboard({ skipRecon: true });
       SpreadsheetApp.getActiveSpreadsheet().toast(
         `Neglected "${origDesc}" (${amt.toFixed(2)} EGP) from active calculations!`,
         "🚫 Transaction Neglected",
@@ -259,7 +262,7 @@ function onEdit(e) {
       scriptProps.setProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
       sheet.getRange(row, 1, 1, 8).setBackground(null);
       sheet.getRange(row, 8).setValue("Active in Bill");
-      updateLiveDashboard();
+      updateLiveDashboard({ skipRecon: true });
       SpreadsheetApp.getActiveSpreadsheet().toast(
         `Restored "${origDesc}" (${amt.toFixed(2)} EGP) to active calculations!`,
         "✅ Transaction Restored",
@@ -267,6 +270,27 @@ function onEdit(e) {
       );
     }
   }
+}
+
+function updateBankStatementStatusRow(desc, amt, statusText, color) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
+    if (!stmtSheet || stmtSheet.getLastRow() < 7) return;
+
+    const lastRow = stmtSheet.getLastRow();
+    const rows = stmtSheet.getRange(7, 4, lastRow - 6, 3).getValues(); // Col 4: desc, Col 5: type, Col 6: amt
+    for (let i = 0; i < rows.length; i++) {
+      const rDesc = String(rows[i][0] || "").trim();
+      const rAmt = parseFloat(rows[i][2]);
+      if (Math.abs(rAmt - amt) < 0.05 && (rDesc === desc || rDesc.includes(desc.substring(0, 15)) || desc.includes(rDesc.substring(0, 15)))) {
+        const targetCell = stmtSheet.getRange(7 + i, 8);
+        targetCell.setValue(statusText);
+        if (color) targetCell.setBackground(color);
+        break;
+      }
+    }
+  } catch (err) {}
 }
 
 function setupDailyTrigger() {
@@ -1618,7 +1642,8 @@ function calculateCardBalance(ss, tz) {
   };
 }
 
-function updateLiveDashboard() {
+function updateLiveDashboard(options) {
+  const opts = (options && typeof options === "object") ? options : {};
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
 
@@ -1639,8 +1664,10 @@ function updateLiveDashboard() {
   // NOTE: 'Transactions' and 'Installments' sheets are user-managed inputs.
   // The script NEVER modifies, writes to, or cleans them.
 
-  // Run reconciliation
-  runReconciliation(ss, tz);
+  // Run reconciliation ONLY when not skipped (e.g. avoid erasing/rewriting Reconciliation sheet during onEdit)
+  if (!opts.skipRecon) {
+    runReconciliation(ss, tz);
+  }
 
   // Read Card Balance & Active Statement info
   const cardBal = calculateCardBalance(ss, tz);
