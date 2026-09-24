@@ -377,18 +377,23 @@ function writeStatementToSheet(ss, meta, transactions) {
     .setBorder(true, true, true, true, false, false);
 
   if (transactions.length > 0) {
-    const rows = transactions.map((t, idx) => [
-      idx + 1,
-      t.txDate,
-      t.postDate,
-      t.desc,
-      t.type,
-      t.amount,
-      t.authCode
-    ]);
+    const rows = transactions.map((t, idx) => {
+      const txD = new Date(t.txDate);
+      const postD = new Date(t.postDate);
+      return [
+        idx + 1,
+        isNaN(txD.getTime()) ? t.txDate : txD,
+        isNaN(postD.getTime()) ? t.postDate : postD,
+        t.desc,
+        t.type,
+        t.amount,
+        t.authCode
+      ];
+    });
 
     const dataRange = sheet.getRange(startRow + 1, 1, rows.length, headers.length);
     dataRange.setValues(rows);
+    sheet.getRange(startRow + 1, 2, rows.length, 2).setNumberFormat("dddd, MMMM d, yyyy");
     sheet.getRange(startRow + 1, 6, rows.length, 1).setNumberFormat("#,##0.00");
 
     // Color rows by type
@@ -738,7 +743,7 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
       const itemsDesc = s.sheetItems.map(it => `${it.desc} (${it.person}: ${it.amount.toFixed(2)})`).join(" + ");
       return [
         idx + 1,
-        s.stmt.dateStr,
+        s.stmt.date || s.stmt.dateStr,
         s.stmt.desc,
         s.stmt.amount,
         itemsDesc,
@@ -749,6 +754,7 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
 
     const sugRange = reconSheet.getRange(curRow, 1, sugRows.length, 7);
     sugRange.setValues(sugRows);
+    reconSheet.getRange(curRow, 2, sugRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
     reconSheet.getRange(curRow, 4, sugRows.length, 1).setNumberFormat("#,##0.00");
     reconSheet.getRange(curRow, 7, sugRows.length, 1).insertCheckboxes();
     curRow += sugRows.length + 1;
@@ -781,7 +787,7 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
 
     const missRows = missingInSheet.map((m, idx) => [
       idx + 1,
-      m.dateStr,
+      m.date || m.dateStr,
       m.desc,
       m.amount,
       "",
@@ -791,6 +797,7 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
 
     const missRange = reconSheet.getRange(curRow, 1, missRows.length, 7);
     missRange.setValues(missRows);
+    reconSheet.getRange(curRow, 2, missRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
     reconSheet.getRange(curRow, 4, missRows.length, 1).setNumberFormat("#,##0.00");
     reconSheet.getRange(curRow, 5, missRows.length, 1).setDataValidation(payerValidation);
     reconSheet.getRange(curRow, 7, missRows.length, 1).insertCheckboxes();
@@ -827,7 +834,7 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
       }
       return [
         idx + 1,
-        Utilities.formatDate(u.date, tz, "yyyy-MM-dd"),
+        u.date,
         u.desc,
         u.amount,
         u.person,
@@ -836,6 +843,7 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
     });
 
     reconSheet.getRange(curRow, 1, unRows.length, 6).setValues(unRows);
+    reconSheet.getRange(curRow, 2, unRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
     reconSheet.getRange(curRow, 4, unRows.length, 1).setNumberFormat("#,##0.00");
   }
 
