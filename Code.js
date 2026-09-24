@@ -90,6 +90,19 @@ function getDueDateForPurchase(purchaseDate, tz, statementDate, statementDueDate
   return new Date(year, month + 1, 1);
 }
 
+function getDueDateForInstallment(purchaseDate, tz) {
+  if (!purchaseDate || isNaN(purchaseDate.getTime())) return null;
+  const targetTz = tz || "Africa/Cairo";
+
+  // NBE 55-Day Installment Policy:
+  // Purchases made on installment in month M have a full billing cycle grace period (~55 days).
+  // The first EMI is billed on month M+1 statement, due on the 25th of month M+2.
+  // Example: Fan purchased Aug 28 -> First EMI billed on Sep 30 statement, due Oct 25 (month + 2).
+  const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
+  const year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
+  return new Date(year, month + 2, 1);
+}
+
 // ==========================================
 // 1. MENU & TRIGGER SETUP
 // ==========================================
@@ -2011,8 +2024,8 @@ function updateLiveDashboard(options) {
       if (people.length === 0) return;
       const splitEmi = emi / people.length;
 
-      // First installment is due in the statement cycle of the purchase date
-      const firstDueDate = getDueDateForPurchase(purchaseDate, tz, cardBal.statementDate, activeStatementDueDate);
+      // First installment is due under NBE 55-day installment policy (month + 2)
+      const firstDueDate = getDueDateForInstallment(purchaseDate, tz);
 
       for (let i = 0; i < durationMonths; i++) {
         const dueMonthDate = new Date(firstDueDate.getFullYear(), firstDueDate.getMonth() + i, 1);
@@ -2813,59 +2826,192 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
   const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
   let stmtInstallmentsBilledTotal = 0;
   let stmtInstallmentCount = 0;
+  const stmtInstallments = [];
 
   if (stmtSheet && stmtSheet.getLastRow() >= 7) {
     const lastR = stmtSheet.getLastRow();
     const rows = stmtSheet.getRange(7, 1, lastR - 6, 8).getValues();
-    rows.forEach(r => {
+    rows.forEach((r, idx) => {
       const type = String(r[4] || "").trim().toUpperCase();
       const amt = parseFloat(r[5]);
+      const desc = String(r[3] || "").trim();
       if (type === "INSTALLMENT" && !isNaN(amt) && amt > 0) {
         stmtInstallmentsBilledTotal += amt;
         stmtInstallmentCount++;
+
+        let instCurrent = null;
+        let instTotal = null;
+        const mInst = desc.match(/(\d+)\s+OF\s+(\d+)/i);
+        if (mInst) {
+          instCurrent = parseInt(mInst[1], 10);
+          instTotal = parseInt(mInst[2], 10);
+        }
+        stmtInstallments.push({
+          stmtRowIdx: idx,
+          desc: desc,
+          amount: amt,
+          instCurrent: instCurrent,
+          instTotal: instTotal
+        });
       }
     });
   }
 
-  const instDiff = stmtInstallmentsBilledTotal - activeData.installmentsTotal;
-  const instStatusBadge = Math.abs(instDiff) < 0.50 ? "✅ 100% Matched (Bank Statement and Sheet Installments are in perfect sync)" : `⚠️ Discrepancy: ${instDiff.toFixed(2)} EGP`;
+  // Read all installment records from user's Installments sheet
+  const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  const sheetInstallmentRows = [];
+  if (instSheet && instSheet.getLastRow() >= 2) {
+    const instData = instSheet.getRange(2, 1, instSheet.getLastRow() - 1, 11).getValues();
+    instData.forEach((iRow, idx) => {
+      const rawDate = iRow[1];
+      const desc = String(iRow[2] || "").trim();
+      const duration = parseInt(iRow[4], 10);
+      const emi = parseFloat(iRow[7]);
+      const payer = String(iRow[8] || "").trim();
+      const paymentsMade = parseInt(iRow[9], 10) || 0;
+      const status = String(iRow[10] || "").toLowerCase();
+      const pDate = parseDateValue(rawDate, tz);
 
-  sheet.getRange(curRow, 1, 1, 6).merge()
+      if (!isNaN(emi) && emi > 0 && desc && payer) {
+        sheetInstallmentRows.push({
+          index: idx,
+          rowIdx: idx + 2,
+          date: pDate,
+          rawDate: rawDate,
+          desc: desc,
+          duration: duration,
+          emi: emi,
+          payer: payer,
+          paymentsMade: paymentsMade,
+          status: status
+        });
+      }
+    });
+  }
+
+  // Run matching engine
+  const instMatches = matchStatementInstallments(stmtInstallments, sheetInstallmentRows);
+  const matchedStmtIdxs = new Set(instMatches.map(m => m.stmtIdx));
+  const matchedSheetIdxs = new Set();
+  instMatches.forEach(m => {
+    (m.sheetRows || []).forEach(r => matchedSheetIdxs.add(r.index));
+  });
+
+  // Identify unbilled sheet installments (e.g. Fan bought Aug 28 subject to 55-day policy)
+  const unbilledSheetInstallments = sheetInstallmentRows.filter(sh => {
+    return !matchedSheetIdxs.has(sh.index) && sh.status !== "completed";
+  });
+
+  // Identify statement installments not found in sheet
+  const unrecordedStmtInstallments = stmtInstallments.filter((st, sIdx) => !matchedStmtIdxs.has(sIdx));
+
+  const instDiff = stmtInstallmentsBilledTotal - activeData.installmentsTotal;
+  const instStatusBadge = Math.abs(instDiff) < 0.50 ? "✅ 100% Matched (Bank Statement and Active Bill in Sync)" : `⚠️ Discrepancy: ${instDiff.toFixed(2)} EGP`;
+
+  sheet.getRange(curRow, 1, 1, 7).merge()
     .setValue("📦 Table 3: Installments Verification (Installments Sheet vs Bank Statement)")
     .setFontWeight("bold")
     .setFontSize(11)
     .setBackground(CONFIG.COLORS.HEADER);
   curRow++;
 
-  sheet.getRange(curRow, 1, 1, 6).merge()
-    .setValue(`Bank Statement Billed EMIs: ${stmtInstallmentsBilledTotal.toFixed(2)} EGP (${stmtInstallmentCount} items) | Installments Sheet Due: ${activeData.installmentsTotal.toFixed(2)} EGP | Status: ${instStatusBadge}`)
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue(`Bank Statement Billed EMIs: ${stmtInstallmentsBilledTotal.toFixed(2)} EGP (${stmtInstallmentCount} items) | ` +
+              `Active Sheet Due: ${activeData.installmentsTotal.toFixed(2)} EGP | ` +
+              `Unbilled Sheet Installments (55-Day Policy / Pending): ${unbilledSheetInstallments.length} item(s) | Status: ${instStatusBadge}`)
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(Math.abs(instDiff) < 0.50 ? CONFIG.COLORS.PRIMARY : "#b71c1c");
   curRow++;
 
-  const t3Headers = ["#", "Installment Description", "Payer", "Progress", "EMI (Sheet EGP)", "Status on Bank Statement"];
+  const t3Headers = ["#", "Installment Description", "Payer", "Progress", "EMI (EGP)", "Status on Bank Statement", "Audit & Policy Verification Note"];
   sheet.getRange(curRow, 1, 1, t3Headers.length).setValues([t3Headers]).setFontWeight("bold").setBackground(CONFIG.COLORS.HEADER).setBorder(true, true, true, true, true, true);
   curRow++;
 
-  // List active installments for this cycle from debtLineItems
-  const activeInstItems = debtLineItems.filter(it => it.category === "Installment" && it.sortKey === activeSortKey);
-  if (activeInstItems.length === 0) {
-    sheet.getRange(curRow, 1, 1, 6).merge().setValue("No installments due for this cycle.");
+  const t3Rows = [];
+  const t3RowColors = [];
+
+  // 1. Matched installments (Billed by Bank and in Sheet)
+  instMatches.forEach((m, idx) => {
+    const sheetDesc = m.sheetRows.map(r => r.desc).join(" + ");
+    const payer = m.payerLabel;
+    const progress = (m.stmt.instCurrent && m.stmt.instTotal)
+      ? `${m.stmt.instCurrent} of ${m.stmt.instTotal}`
+      : (m.sheetRows[0].duration ? `Active (${m.sheetRows[0].duration} mos)` : "-");
+
+    t3Rows.push([
+      idx + 1,
+      sheetDesc || m.stmt.desc,
+      payer,
+      progress,
+      m.stmt.amount,
+      "✅ Billed by Bank (Verified)",
+      `Matched statement debit: "${m.stmt.desc}"`
+    ]);
+    t3RowColors.push(CONFIG.COLORS.PAID);
+  });
+
+  // 2. Unbilled Sheet Installments (In Sheet but NOT on Statement, e.g. Fan bought Aug 28)
+  unbilledSheetInstallments.forEach(sh => {
+    const pDate = sh.date;
+    const firstDueDate = pDate ? getDueDateForInstallment(pDate, tz) : null;
+    const isFutureGrace = firstDueDate && firstDueDate > activeStatementDueDate;
+
+    let statusText = "";
+    let noteText = "";
+    let rowColor = "#fffde7"; // Soft yellow
+
+    if (isFutureGrace) {
+      const dueLabel = Utilities.formatDate(firstDueDate, tz, "MMMM yyyy");
+      statusText = "⏳ NOT Billed (55-Day Grace Policy)";
+      noteText = `Bought ${pDate ? Utilities.formatDate(pDate, tz, "MMM d, yyyy") : ""}. Under NBE 55-day policy, 1st EMI starts in ${dueLabel}. Excluded from this bill.`;
+    } else {
+      statusText = "⚠️ Missing from Bank Statement";
+      noteText = "Recorded in Installments sheet, but NBE did NOT bill this EMI on this statement.";
+      rowColor = CONFIG.COLORS.OVERDUE;
+    }
+
+    t3Rows.push([
+      t3Rows.length + 1,
+      sh.desc,
+      sh.payer,
+      sh.duration ? `Pending 1st of ${sh.duration}` : "Pending",
+      sh.emi,
+      statusText,
+      noteText
+    ]);
+    t3RowColors.push(rowColor);
+  });
+
+  // 3. Statement installments not found in Sheet
+  unrecordedStmtInstallments.forEach(st => {
+    t3Rows.push([
+      t3Rows.length + 1,
+      st.desc,
+      "⚠️ Unknown (Unrecorded)",
+      (st.instCurrent && st.instTotal) ? `${st.instCurrent} of ${st.instTotal}` : "-",
+      st.amount,
+      "🚨 Unrecorded on Sheet",
+      `Bank billed this EMI (${st.amount.toFixed(2)} EGP), but it is missing from Installments sheet!`
+    ]);
+    t3RowColors.push(CONFIG.COLORS.OVERDUE);
+  });
+
+  if (t3Rows.length === 0) {
+    sheet.getRange(curRow, 1, 1, t3Headers.length).merge().setValue("No installments found.");
     curRow += 2;
   } else {
-    const t3Rows = activeInstItems.map((it, idx) => [
-      idx + 1,
-      it.desc,
-      it.person,
-      it.installmentInfo,
-      it.amount,
-      "✅ Billed by Bank"
-    ]);
-
     sheet.getRange(curRow, 1, t3Rows.length, t3Headers.length).setValues(t3Rows);
     sheet.getRange(curRow, 5, t3Rows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
-    sheet.getRange(curRow, 6, t3Rows.length, 1).setBackground(CONFIG.COLORS.PAID);
+
+    for (let r = 0; r < t3Rows.length; r++) {
+      sheet.getRange(curRow + r, 6).setBackground(t3RowColors[r]).setFontWeight("bold");
+      if (t3Rows[r][5].includes("55-Day")) {
+        sheet.getRange(curRow + r, 1, 1, t3Headers.length).setBackground("#fffde7");
+      } else if (t3Rows[r][5].includes("Missing") || t3Rows[r][5].includes("Unrecorded")) {
+        sheet.getRange(curRow + r, 1, 1, t3Headers.length).setBackground("#ffebee");
+      }
+    }
     curRow += t3Rows.length + 3;
   }
 
