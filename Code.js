@@ -1545,6 +1545,9 @@ function calculateCardBalance(ss, tz) {
   let billedBalance = 0;
   let statementDate = null;
   let statementDueDate = null;
+  let openingBalance = 0;
+  let totalDebit = 0;
+  let totalCredit = 0;
 
   // Read latest statement closing balance if available
   const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
@@ -1553,6 +1556,15 @@ function calculateCardBalance(ss, tz) {
     if (!isNaN(parseFloat(closeVal))) {
       billedBalance = parseFloat(closeVal);
     }
+    const openVal = stmtSheet.getRange("B3").getValue();
+    if (!isNaN(parseFloat(openVal))) openingBalance = parseFloat(openVal);
+
+    const totDebVal = stmtSheet.getRange("F3").getValue();
+    if (!isNaN(parseFloat(totDebVal))) totalDebit = parseFloat(totDebVal);
+
+    const totCredVal = stmtSheet.getRange("B4").getValue();
+    if (!isNaN(parseFloat(totCredVal))) totalCredit = parseFloat(totCredVal);
+
     const stmtDateVal = stmtSheet.getRange("B2").getValue();
     statementDate = parseDateValue(stmtDateVal, tz);
     const dueDateVal = stmtSheet.getRange("D2").getValue();
@@ -1631,6 +1643,9 @@ function calculateCardBalance(ss, tz) {
   return {
     creditLimit: creditLimit,
     billedBalance: billedBalance,
+    openingBalance: openingBalance,
+    totalDebit: totalDebit,
+    totalCredit: totalCredit,
     statementDate: statementDate,
     statementDueDate: statementDueDate,
     isCurrentBillPaid: isCurrentBillPaid,
@@ -2266,6 +2281,27 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
       .setFontWeight("bold")
       .setFontColor("#b71c1c")
       .setBackground(CONFIG.COLORS.DUE_SOON);
+    curRow += 2;
+  }
+
+  if (Math.abs(diff) >= 1.00) {
+    let diffNote = "";
+    if (diff > 0) {
+      diffNote = `🔍 Difference Detective (+${diff.toFixed(2)} EGP Exceeding): ` +
+        `Family shares total (${activeData.total.toFixed(2)} EGP) exceeds the bank bill (${bankBill.toFixed(2)} EGP). ` +
+        `Check: (1) Reconciliation Table 3 for unbilled sheet purchases that can be neglected, ` +
+        `(2) Reconciliation Table 2 if any of the ${assignedMissingCount} assigned missing charges was already recorded in Transactions under another merchant name, ` +
+        `or (3) Bank Statement credits/refunds (Total Credit: ${cardBal.totalCredit ? cardBal.totalCredit.toFixed(2) + " EGP" : "0.00 EGP"}).`;
+    } else {
+      diffNote = `🔍 Difference Detective (-${Math.abs(diff).toFixed(2)} EGP Shortfall): Bank bill is higher by ${Math.abs(diff).toFixed(2)} EGP. Check Reconciliation Table 2 for unassigned statement charges.`;
+    }
+    sheet.getRange(curRow, 1, 1, 7).merge()
+      .setValue(diffNote)
+      .setFontWeight("bold")
+      .setFontSize(9)
+      .setFontColor("#b06000")
+      .setBackground("#fffde7")
+      .setWrap(true);
     curRow += 2;
   }
 
