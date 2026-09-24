@@ -699,7 +699,39 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
 
   const suggestedStmtIds = new Set(suggestedMatches.map(s => s.stmt.id));
   const missingInSheet = stmtDebits.filter(st => !st.matched && !suggestedStmtIds.has(st.id));
-  const unmatchedInSheet = txDebits.filter(tx => !tx.matched);
+
+  // Determine statement cycle start date from earliest transaction across ALL statement rows
+  let minStmtDate = null;
+  stmtData.forEach(row => {
+    const rawD = row[1];
+    if (rawD) {
+      const d = new Date(rawD);
+      if (!isNaN(d.getTime())) {
+        if (!minStmtDate || d < minStmtDate) minStmtDate = d;
+      }
+    }
+  });
+
+  const stmtStartDay = minStmtDate
+    ? new Date(minStmtDate.getFullYear(), minStmtDate.getMonth(), minStmtDate.getDate(), 0, 0, 0, 0)
+    : null;
+
+  // Track sheet transactions already included in Suggested Matches (Table 1)
+  const suggestedTxRowNums = new Set();
+  suggestedMatches.forEach(s => {
+    s.sheetItems.forEach(it => suggestedTxRowNums.add(it.rowNum));
+  });
+
+  // Only include unmatched transactions that belong to this cycle or future (exclude settled past history)
+  const unmatchedInSheet = txDebits.filter(tx => {
+    if (tx.matched) return false;
+    if (suggestedTxRowNums.has(tx.rowNum)) return false; // Already in Suggested Matches
+    if (stmtStartDay) {
+      const txDay = new Date(tx.date.getFullYear(), tx.date.getMonth(), tx.date.getDate(), 0, 0, 0, 0);
+      if (txDay < stmtStartDay) return false; // Settled in previous statement cycles
+    }
+    return true;
+  });
 
   // 4. Render Reconciliation Sheet
   reconSheet.getRange("A1:G1").merge()
@@ -811,6 +843,16 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
     .setBackground(CONFIG.COLORS.HEADER);
   curRow++;
 
+  const dateLabel = stmtStartDay ? Utilities.formatDate(stmtStartDay, tz, "MMMM d, yyyy") : "";
+  if (dateLabel) {
+    reconSheet.getRange(curRow, 1, 1, 6).merge()
+      .setValue("ℹ️ Showing active cycle & pending items only. All transactions prior to " + dateLabel + " are already settled.")
+      .setFontStyle("italic")
+      .setFontSize(9)
+      .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+    curRow++;
+  }
+
   const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Payer", "Status"];
   reconSheet.getRange(curRow, 1, 1, 6).setValues([unHeaders])
     .setFontWeight("bold")
@@ -819,18 +861,26 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
 
   if (unmatchedInSheet.length === 0) {
     reconSheet.getRange(curRow, 1, 1, 6).merge()
-      .setValue("✅ All sheet transactions match statement records!");
+      .setValue("✅ All current cycle transactions match statement records! (Prior history is settled)")
+      .setFontColor(CONFIG.COLORS.PRIMARY)
+      .setFontWeight("bold");
+    curRow += 2;
   } else {
     let stmtCutoffDate = null;
     if (stmtSheet && stmtSheet.getLastRow() >= 2) {
       const sVal = stmtSheet.getRange("B2").getValue();
-      if (sVal) stmtCutoffDate = new Date(sVal);
+      if (sVal) {
+        const d = new Date(sVal);
+        if (!isNaN(d.getTime())) {
+          stmtCutoffDate = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+        }
+      }
     }
 
     const unRows = unmatchedInSheet.map((u, idx) => {
       let status = "🕒 Pending (Next Statement)";
       if (stmtCutoffDate && u.date <= stmtCutoffDate) {
-        status = "⚠️ Unbilled Discrepancy (before cutoff)";
+        status = "⚠️ Unbilled Discrepancy (in cycle)";
       }
       return [
         idx + 1,
@@ -862,6 +912,7 @@ function addAssignedChargesToTransactions() {
 
   const data = reconSheet.getRange(1, 1, lastRow, 7).getValues();
   const toAdd = [];
+  const validPayers = ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza", "Shared"];
 
   data.forEach(row => {
     const amt = parseFloat(row[3]);
@@ -869,7 +920,7 @@ function addAssignedChargesToTransactions() {
     const note = String(row[5] || "").trim();
     const isChecked = row[6] === true;
 
-    if (!isNaN(amt) && amt > 0 && payer !== "" && isChecked) {
+    if (!isNaN(amt) && amt > 0 && validPayers.includes(payer) && isChecked) {
       const rawDate = row[1];
       const dateObj = new Date(rawDate);
       toAdd.push({
