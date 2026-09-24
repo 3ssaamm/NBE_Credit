@@ -37,12 +37,111 @@ const CONFIG = {
 // 1. MENU & TRIGGER SETUP
 // ==========================================
 
+function cleanTransactionsSheet(ss) {
+  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+  if (!txSheet || txSheet.getLastRow() < 2) return 0;
+
+  const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+  const lastRow = txSheet.getLastRow();
+  const data = txSheet.getRange(2, 1, lastRow - 1, 5).getValues();
+
+  const seenExact = new Set();
+  const historicalContent = new Set();
+  const cleanRows = [];
+  let duplicatesRemoved = 0;
+
+  // Pass 1: Identify all legitimate historical transactions (prior to September 2026)
+  data.forEach(r => {
+    const rawDate = r[1];
+    let dStr = "";
+    if (rawDate instanceof Date && !isNaN(rawDate.getTime())) {
+      dStr = Utilities.formatDate(rawDate, tz, "yyyy-MM-dd");
+    } else {
+      const d = new Date(rawDate);
+      dStr = !isNaN(d.getTime()) ? Utilities.formatDate(d, tz, "yyyy-MM-dd") : String(rawDate).trim();
+    }
+    const desc = String(r[2] || "").trim().toLowerCase();
+    const payer = String(r[3] || "").trim().toLowerCase();
+    const amt = parseFloat(r[4]);
+
+    if (desc && payer && !isNaN(amt) && amt > 0) {
+      if (!dStr.startsWith("2026-09")) {
+        historicalContent.add(`${desc}_${payer}_${amt.toFixed(2)}`);
+      }
+    }
+  });
+
+  // Pass 2: Filter duplicates
+  data.forEach(r => {
+    const rawDate = r[1];
+    let dStr = "";
+    if (rawDate instanceof Date && !isNaN(rawDate.getTime())) {
+      dStr = Utilities.formatDate(rawDate, tz, "yyyy-MM-dd");
+    } else {
+      const d = new Date(rawDate);
+      dStr = !isNaN(d.getTime()) ? Utilities.formatDate(d, tz, "yyyy-MM-dd") : String(rawDate).trim();
+    }
+    const desc = String(r[2] || "").trim().toLowerCase();
+    const payer = String(r[3] || "").trim().toLowerCase();
+    const amt = parseFloat(r[4]);
+
+    if (!desc || !payer || isNaN(amt) || amt <= 0) return;
+
+    const exactKey = `${dStr}_${desc}_${payer}_${amt.toFixed(2)}`;
+    const contentKey = `${desc}_${payer}_${amt.toFixed(2)}`;
+
+    // Exact duplicate seen earlier in the sheet
+    if (seenExact.has(exactKey)) {
+      duplicatesRemoved++;
+      return;
+    }
+
+    // Accidental batch duplicate added with September 2026 date that copies older transaction
+    if (dStr.startsWith("2026-09") && historicalContent.has(contentKey)) {
+      duplicatesRemoved++;
+      return;
+    }
+
+    seenExact.add(exactKey);
+    cleanRows.push(r);
+  });
+
+  if (duplicatesRemoved > 0) {
+    // Renumber IDs sequentially
+    cleanRows.forEach((r, idx) => {
+      r[0] = idx + 1;
+    });
+
+    txSheet.getRange(2, 1, lastRow - 1, 5).clearContent();
+    if (cleanRows.length > 0) {
+      txSheet.getRange(2, 1, cleanRows.length, 5).setValues(cleanRows);
+      txSheet.getRange(2, 2, cleanRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
+      txSheet.getRange(2, 5, cleanRows.length, 1).setNumberFormat("#,##0.00");
+    }
+  }
+
+  return duplicatesRemoved;
+}
+
+function menuCleanDuplicates() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const removed = cleanTransactionsSheet(ss);
+  updateLiveDashboard();
+  SpreadsheetApp.getUi().alert(
+    "Cleanup Complete",
+    `Removed ${removed} duplicate transaction(s)!\n\n` +
+    `Monthly Debts and Reconciliation have been restored to their authentic numbers.`,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("💳 NBE Tracker")
     .addItem("📥 Process Latest Statement (Drive)", "menuProcessStatement")
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
     .addSeparator()
+    .addItem("🧹 Clean Duplicates & Restore Debts", "menuCleanDuplicates")
     .addItem("➕ Add Assigned Charges to Transactions", "addAssignedChargesToTransactions")
     .addSeparator()
     .addItem("⏰ Setup Daily Auto-Check", "setupDailyTrigger")
@@ -65,6 +164,18 @@ function onEdit(e) {
     const val = String(e.value || e.range.getValue() || "").trim();
     if (!validPayers.includes(val)) return;
 
+    // Check that row is strictly in Table 2 (under "MISSING from Sheet")
+    const lastRow = sheet.getLastRow();
+    const colA = sheet.getRange(1, 1, lastRow, 1).getValues();
+    let table2Start = -1;
+    for (let i = 0; i < colA.length; i++) {
+      if (String(colA[i][0]).includes("MISSING from Sheet")) {
+        table2Start = i + 1;
+        break;
+      }
+    }
+    if (table2Start === -1 || row <= table2Start + 1) return;
+
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
     if (!txSheet) return;
@@ -83,8 +194,24 @@ function onEdit(e) {
     const finalDate = isNaN(dateObj.getTime()) ? new Date() : dateObj;
     const finalDesc = note || origDesc;
 
+    // Check if duplicate already exists in Transactions
+    const txLastRow = txSheet.getLastRow();
+    if (txLastRow >= 2) {
+      const existingTx = txSheet.getRange(2, 1, txLastRow - 1, 5).getValues();
+      const alreadyExists = existingTx.some(r => {
+        const rAmt = parseFloat(r[4]);
+        const rDesc = String(r[2] || "").trim().toLowerCase();
+        return Math.abs(rAmt - amt) < 0.05 && rDesc === finalDesc.toLowerCase();
+      });
+      if (alreadyExists) {
+        sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
+        sheet.getRange(row, 5).clearDataValidations().setValue("✅ Already in Sheet (" + payer + ")");
+        ss.toast(`Charge "${finalDesc}" is already in Transactions!`, "ℹ️ Already Recorded", 3);
+        return;
+      }
+    }
+
     // Determine next ID in Transactions
-    let txLastRow = txSheet.getLastRow();
     let nextId = 1;
     if (txLastRow >= 2) {
       const lastIdVal = txSheet.getRange(txLastRow, 1).getValue();
@@ -430,7 +557,7 @@ function writeStatementToSheet(ss, meta, transactions) {
   sheet.clear();
 
   // Summary Banner
-  sheet.getRange("A1:G1").merge()
+  sheet.getRange("A1:H1").merge()
     .setValue("NBE Credit Card Statement — " + (meta.statementDate || "Latest"))
     .setFontWeight("bold")
     .setFontSize(14)
@@ -458,7 +585,7 @@ function writeStatementToSheet(ss, meta, transactions) {
 
   // Table Headers
   const startRow = 6;
-  const headers = ["#", "Tx Date", "Posting Date", "Description", "Type", "Amount (EGP)", "Auth Code"];
+  const headers = ["#", "Tx Date", "Posting Date", "Description", "Type", "Amount (EGP)", "Auth Code", "Assigned Payer / Status"];
   const headerRange = sheet.getRange(startRow, 1, 1, headers.length);
   headerRange.setValues([headers])
     .setFontWeight("bold")
@@ -469,6 +596,8 @@ function writeStatementToSheet(ss, meta, transactions) {
     const rows = transactions.map((t, idx) => {
       const txD = new Date(t.txDate);
       const postD = new Date(t.postDate);
+      let initStatus = "⏳ Checking...";
+      if (t.type === "CREDIT") initStatus = "💳 Bank Payment Settled";
       return [
         idx + 1,
         isNaN(txD.getTime()) ? t.txDate : txD,
@@ -476,7 +605,8 @@ function writeStatementToSheet(ss, meta, transactions) {
         t.desc,
         t.type,
         t.amount,
-        t.authCode
+        t.authCode,
+        initStatus
       ];
     });
 
@@ -501,8 +631,141 @@ function writeStatementToSheet(ss, meta, transactions) {
 }
 
 // ==========================================
-// 4. INSTALLMENTS AUTO-SYNC FROM STATEMENT
+// 4. INSTALLMENTS SPLIT MATCHING & AUTO-SYNC
 // ==========================================
+
+function findSubsetCombination(items, targetAmt, maxK, tolerance) {
+  const tol = tolerance || 0.10;
+  const n = items.length;
+  if (n < 2) return null;
+
+  const sorted = items.slice().sort((a, b) => b.amount - a.amount);
+
+  function search(startIdx, currentCombo, currentSum, k) {
+    if (currentCombo.length >= 2 && Math.abs(currentSum - targetAmt) <= tol) {
+      return currentCombo.slice();
+    }
+    if (currentCombo.length >= k || startIdx >= n) {
+      return null;
+    }
+
+    for (let i = startIdx; i < n; i++) {
+      const nextSum = currentSum + sorted[i].amount;
+      if (nextSum > targetAmt + tol) continue;
+
+      currentCombo.push(sorted[i]);
+      const res = search(i + 1, currentCombo, nextSum, k);
+      if (res) return res;
+      currentCombo.pop();
+    }
+    return null;
+  }
+
+  const limit = Math.min(n, maxK || 6);
+  for (let k = 2; k <= limit; k++) {
+    const res = search(0, [], 0, k);
+    if (res) return res;
+  }
+  return null;
+}
+
+function matchStatementInstallments(statementInstallments, sheetInstallmentRows) {
+  const matchedStmt = new Set();
+  const matchedSheet = new Set();
+  const results = [];
+
+  // Pass 1: 1-to-1 exact match by EMI
+  statementInstallments.forEach((st, sIdx) => {
+    const cand = sheetInstallmentRows.find((sh, shIdx) => {
+      if (matchedSheet.has(shIdx)) return false;
+      if (Math.abs(st.amount - sh.emi) > 0.50) return false;
+      if (st.instTotal && sh.duration && Math.abs(st.instTotal - sh.duration) > 1) return false;
+      return true;
+    });
+
+    if (cand) {
+      matchedStmt.add(sIdx);
+      matchedSheet.add(cand.index);
+      results.push({
+        stmtIdx: sIdx,
+        stmt: st,
+        sheetRows: [cand],
+        payerLabel: cand.payer,
+        type: "1-to-1"
+      });
+    }
+  });
+
+  // Pass 2: Split match on same description & duration (e.g. Deepfreezer, Kettle, Earphones, Hand blender)
+  const descGroups = {};
+  sheetInstallmentRows.forEach((sh, shIdx) => {
+    if (matchedSheet.has(shIdx)) return;
+    const key = (sh.desc || "").toLowerCase().trim() + "_" + (sh.duration || 0);
+    if (!descGroups[key]) descGroups[key] = [];
+    descGroups[key].push(sh);
+  });
+
+  statementInstallments.forEach((st, sIdx) => {
+    if (matchedStmt.has(sIdx)) return;
+
+    for (const key in descGroups) {
+      const group = descGroups[key];
+      if (!group || group.length < 2) continue;
+      if (st.instTotal && group[0].duration && Math.abs(group[0].duration - st.instTotal) > 1) continue;
+
+      const groupSum = group.reduce((sum, it) => sum + it.emi, 0);
+      if (Math.abs(groupSum - st.amount) <= 0.60) {
+        matchedStmt.add(sIdx);
+        group.forEach(it => matchedSheet.add(it.index));
+        const uniquePayers = [...new Set(group.map(it => it.payer))];
+        results.push({
+          stmtIdx: sIdx,
+          stmt: st,
+          sheetRows: group,
+          payerLabel: uniquePayers.join(" + ") + " (Split)",
+          type: "SPLIT_SAME_DESC"
+        });
+        delete descGroups[key];
+        break;
+      }
+    }
+  });
+
+  // Pass 3: General subset matching for remaining items (e.g. multi-item cart)
+  statementInstallments.forEach((st, sIdx) => {
+    if (matchedStmt.has(sIdx)) return;
+
+    const available = sheetInstallmentRows.filter((sh, shIdx) => {
+      if (matchedSheet.has(shIdx)) return false;
+      if (st.instTotal && sh.duration && Math.abs(sh.duration - st.instTotal) > 1) return false;
+      return true;
+    });
+
+    if (available.length < 2) return;
+
+    const combo = findSubsetCombination(
+      available.map(a => ({ ...a, amount: a.emi })),
+      st.amount,
+      6,
+      0.60
+    );
+
+    if (combo) {
+      matchedStmt.add(sIdx);
+      combo.forEach(c => matchedSheet.add(c.index));
+      const uniquePayers = [...new Set(combo.map(c => c.payer))];
+      results.push({
+        stmtIdx: sIdx,
+        stmt: st,
+        sheetRows: combo,
+        payerLabel: uniquePayers.join(" + ") + " (Split)",
+        type: "SPLIT_CART"
+      });
+    }
+  });
+
+  return results;
+}
 
 function syncInstallmentsFromStatement(ss, transactions) {
   const installmentsSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
@@ -515,27 +778,32 @@ function syncInstallmentsFromStatement(ss, transactions) {
   const range = installmentsSheet.getRange(2, 1, numRows, 11);
   const values = range.getValues();
 
-  values.forEach(row => {
-    const desc = String(row[2] || "").toLowerCase().trim();
-    const emi = parseFloat(row[7]);
+  const sheetInstallmentRows = [];
+  values.forEach((row, idx) => {
+    const desc = String(row[2] || "").trim();
     const duration = parseInt(row[4], 10);
+    const emi = parseFloat(row[7]);
+    const payer = String(row[8] || "").trim();
+    if (!isNaN(emi) && emi > 0) {
+      sheetInstallmentRows.push({
+        index: idx,
+        desc: desc,
+        duration: duration,
+        emi: emi,
+        payer: payer
+      });
+    }
+  });
 
-    if (isNaN(emi) || emi <= 0) return;
+  const matches = matchStatementInstallments(statementInstallments, sheetInstallmentRows);
 
-    // Search statement installments by matching EMI (within 0.50 EGP margin)
-    const match = statementInstallments.find(st => {
-      const emiMatch = Math.abs(st.amount - emi) < 0.50;
-      if (!emiMatch) return false;
-      // If duration is specified on statement, match total
-      if (st.instTotal && duration && Math.abs(st.instTotal - duration) > 1) {
-        return false;
-      }
-      return true;
-    });
-
-    if (match && match.instCurrent != null) {
-      row[9] = match.instCurrent; // Payments Made (Column J)
-      row[10] = (match.instCurrent >= duration) ? "Completed" : "Ongoing"; // Status (Column K)
+  matches.forEach(m => {
+    const instCurrent = m.stmt.instCurrent;
+    if (instCurrent != null) {
+      m.sheetRows.forEach(sh => {
+        values[sh.index][9] = instCurrent; // Payments Made (Column J)
+        values[sh.index][10] = (instCurrent >= sh.duration) ? "Completed" : "Ongoing"; // Status (Column K)
+      });
     }
   });
 
@@ -620,6 +888,7 @@ function runReconciliation(ss, tz) {
       const pDate = new Date(row[1]);
       stmtDebits.push({
         id: idx + 1,
+        stmtRowIndex: idx,
         dateStr: String(row[1]),
         date: isNaN(pDate.getTime()) ? null : pDate,
         desc: String(row[3]),
@@ -629,6 +898,57 @@ function runReconciliation(ss, tz) {
         matchedItems: []
       });
     }
+  });
+
+  // Read Installments for payer lookup on Bank Statement
+  const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  const sheetInstallmentRows = [];
+  if (instSheet && instSheet.getLastRow() >= 2) {
+    const instData = instSheet.getRange(2, 1, instSheet.getLastRow() - 1, 11).getValues();
+    instData.forEach((iRow, idx) => {
+      const emi = parseFloat(iRow[7]);
+      const payer = String(iRow[8] || "").trim();
+      const desc = String(iRow[2] || "").trim();
+      const duration = parseInt(iRow[4], 10);
+      if (!isNaN(emi) && emi > 0 && payer) {
+        sheetInstallmentRows.push({
+          index: idx,
+          emi: emi,
+          payer: payer,
+          desc: desc,
+          duration: duration
+        });
+      }
+    });
+  }
+
+  // Extract statement installment rows for split matching
+  const stmtInstallments = [];
+  stmtData.forEach((row, idx) => {
+    const type = String(row[4]).trim().toUpperCase();
+    if (type === "INSTALLMENT") {
+      const desc = String(row[3] || "");
+      let instCurrent = null;
+      let instTotal = null;
+      const mInst = desc.match(/(\d+)\s+OF\s+(\d+)/i);
+      if (mInst) {
+        instCurrent = parseInt(mInst[1], 10);
+        instTotal = parseInt(mInst[2], 10);
+      }
+      stmtInstallments.push({
+        stmtRowIdx: idx,
+        desc: desc,
+        amount: parseFloat(row[5]),
+        instCurrent: instCurrent,
+        instTotal: instTotal
+      });
+    }
+  });
+
+  const instMatches = matchStatementInstallments(stmtInstallments, sheetInstallmentRows);
+  const instMatchMap = {};
+  instMatches.forEach(m => {
+    instMatchMap[m.stmt.stmtRowIdx] = m.payerLabel;
   });
 
   // 2. Read Sheet Transactions
@@ -697,40 +1017,7 @@ function runReconciliation(ss, tz) {
     }
   });
 
-function findSubsetCombination(items, targetAmt, maxK, tolerance) {
-  const tol = tolerance || 0.10;
-  const n = items.length;
-  if (n < 2) return null;
-
-  const sorted = items.slice().sort((a, b) => b.amount - a.amount);
-
-  function search(startIdx, currentCombo, currentSum, k) {
-    if (currentCombo.length >= 2 && Math.abs(currentSum - targetAmt) <= tol) {
-      return currentCombo.slice();
-    }
-    if (currentCombo.length >= k || startIdx >= n) {
-      return null;
-    }
-
-    for (let i = startIdx; i < n; i++) {
-      const nextSum = currentSum + sorted[i].amount;
-      if (nextSum > targetAmt + tol) continue;
-
-      currentCombo.push(sorted[i]);
-      const res = search(i + 1, currentCombo, nextSum, k);
-      if (res) return res;
-      currentCombo.pop();
-    }
-    return null;
-  }
-
-  const limit = Math.min(n, maxK || 6);
-  for (let k = 2; k <= limit; k++) {
-    const res = search(0, [], 0, k);
-    if (res) return res;
-  }
-  return null;
-}
+// (findSubsetCombination moved to top-level Section 4 for shared use across debits & installments)
 
   // Pass 2: N-Way Split Matches (2, 3, 4, 5, or 6 people split 1 statement charge)
   stmtDebits.forEach(st => {
@@ -906,6 +1193,62 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
     curRow += missRows.length + 1;
   }
 
+  // 5. Update Column H ('Assigned Payer / Status') in Bank Statement Sheet
+  const stmtRowStatus = new Array(stmtData.length);
+  for (let i = 0; i < stmtData.length; i++) {
+    const rType = String(stmtData[i][4]).trim().toUpperCase();
+    const rAmt = parseFloat(stmtData[i][5]);
+
+    if (rType === "CREDIT") {
+      stmtRowStatus[i] = { text: "💳 Bank Payment Settled", color: "#e1f5fe" };
+    } else if (rType === "INSTALLMENT") {
+      const payerLabel = instMatchMap[i];
+      if (payerLabel) {
+        stmtRowStatus[i] = { text: "✅ " + payerLabel + " (Installment)", color: CONFIG.COLORS.PAID };
+      } else {
+        stmtRowStatus[i] = { text: "⚠️ Unassigned Installment", color: CONFIG.COLORS.OVERDUE };
+      }
+    } else {
+      stmtRowStatus[i] = { text: "⚠️ Unassigned (Not in Sheet)", color: CONFIG.COLORS.OVERDUE };
+    }
+  }
+
+  // Overlay matched debits and suggested matches
+  stmtDebits.forEach(st => {
+    const idx = st.stmtRowIndex;
+    if (idx != null && idx >= 0 && idx < stmtData.length) {
+      if (st.matched) {
+        let payerStr = "";
+        if (st.matchType === "EXACT" && st.matchedItems.length > 0) {
+          payerStr = st.matchedItems[0].person;
+        } else if (st.matchType === "SPLIT") {
+          payerStr = st.matchedItems.map(it => it.person).join(" + ") + " (Split)";
+        } else if (st.matchType === "CONFIRMED") {
+          payerStr = "Confirmed Match";
+        }
+        stmtRowStatus[idx] = { text: "✅ " + (payerStr || "Assigned"), color: CONFIG.COLORS.PAID };
+      } else if (suggestedStmtIds.has(st.id)) {
+        stmtRowStatus[idx] = { text: "❓ Needs Confirmation", color: CONFIG.COLORS.DUE_SOON };
+      } else {
+        stmtRowStatus[idx] = { text: "⚠️ Unassigned (Not in Sheet)", color: CONFIG.COLORS.OVERDUE };
+      }
+    }
+  });
+
+  stmtSheet.getRange(6, 8).setValue("Assigned Payer / Status")
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.HEADER)
+    .setBorder(true, true, true, true, false, false);
+
+  const statusValues = stmtRowStatus.map(s => [s.text]);
+  const statusColors = stmtRowStatus.map(s => [s.color]);
+  const hRange = stmtSheet.getRange(7, 8, stmtData.length, 1);
+  hRange.setValues(statusValues);
+  hRange.setBackgrounds(statusColors);
+  hRange.setFontWeight("bold");
+  hRange.setFontSize(9);
+  stmtSheet.autoResizeColumns(1, 8);
+
   reconSheet.autoResizeColumns(1, 7);
 }
 
@@ -919,30 +1262,65 @@ function addAssignedChargesToTransactions() {
   const lastRow = reconSheet.getLastRow();
   if (lastRow < 5) return;
 
-  const data = reconSheet.getRange(1, 1, lastRow, 6).getValues();
+  // Locate Table 2: "MISSING from Sheet"
+  const colA = reconSheet.getRange(1, 1, lastRow, 1).getValues();
+  let table2Start = -1;
+  for (let i = 0; i < colA.length; i++) {
+    if (String(colA[i][0]).includes("MISSING from Sheet")) {
+      table2Start = i + 1;
+      break;
+    }
+  }
+
+  if (table2Start === -1 || table2Start + 2 > lastRow) {
+    SpreadsheetApp.getUi().alert(
+      "No Missing Charges Found",
+      "No unassigned charges found in the Reconciliation sheet.",
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    return;
+  }
+
+  const startRow = table2Start + 2;
+  const numRows = lastRow - startRow + 1;
+  const data = reconSheet.getRange(startRow, 1, numRows, 6).getValues();
   const toAdd = [];
   const validPayers = ["Mido", "Mai", "Abdo", "Dad", "Mum", "Zoza", "Shared"];
 
-  data.forEach(row => {
+  // Read existing transactions to prevent duplicates
+  const existingTx = txSheet.getLastRow() >= 2 ? txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues() : [];
+
+  data.forEach((row, idx) => {
     const amt = parseFloat(row[3]);
     const payer = String(row[4] || "").trim();
     const note = String(row[5] || "").trim();
 
     if (!isNaN(amt) && amt > 0 && validPayers.includes(payer)) {
       const rawDate = row[1];
+      const desc = note || String(row[2]);
       const dateObj = new Date(rawDate);
-      toAdd.push({
-        date: isNaN(dateObj.getTime()) ? new Date() : dateObj,
-        desc: note || String(row[2]),
-        payer: payer,
-        amount: amt
+      const finalDate = isNaN(dateObj.getTime()) ? new Date() : dateObj;
+
+      const alreadyExists = existingTx.some(r => {
+        const rAmt = parseFloat(r[4]);
+        const rDesc = String(r[2] || "").trim().toLowerCase();
+        return Math.abs(rAmt - amt) < 0.05 && rDesc === desc.toLowerCase();
       });
+
+      if (!alreadyExists) {
+        toAdd.push({
+          date: finalDate,
+          desc: desc,
+          payer: payer,
+          amount: amt
+        });
+      }
     }
   });
 
   if (toAdd.length === 0) {
     SpreadsheetApp.getUi().alert(
-      "No Charges Selected",
+      "No New Charges Selected",
       "Please select a name in 'Assign Payer' (Column E) for any missing charges you want to add to Transactions.",
       SpreadsheetApp.getUi().ButtonSet.OK
     );
@@ -1085,6 +1463,9 @@ function updateLiveDashboard() {
     return;
   }
 
+  // Clean duplicate transactions if any were added
+  cleanTransactionsSheet(ss);
+
   // Run reconciliation
   runReconciliation(ss, tz);
 
@@ -1164,7 +1545,9 @@ function updateLiveDashboard() {
         return;
       }
 
-      const person = String(rawPayer).trim().toLowerCase();
+      const rawPayerStr = String(rawPayer).trim();
+      const people = rawPayerStr.split(/[\+\,\/]/).map(p => p.trim().toLowerCase()).filter(p => p);
+      const splitEmi = emi / Math.max(1, people.length);
 
       // NBE 55-day cutoff rule
       let firstPayDate = new Date(purchaseDate);
@@ -1182,7 +1565,9 @@ function updateLiveDashboard() {
 
         if (paidMonthsSet.has(monthKey)) paymentsMade++;
 
-        addDebt(dueMonthDate, person, emi);
+        people.forEach(person => {
+          addDebt(dueMonthDate, person, splitEmi);
+        });
       }
 
       newInstallmentStatuses.push([paymentsMade, (paymentsMade >= durationMonths ? "Completed" : "Ongoing")]);
@@ -1269,16 +1654,27 @@ function updateLiveDashboard() {
 
     // Data Rows
     const rows = [];
-    rows.push(["Total Bill (Purchases & EMIs):", data.total]);
-
-    // Show bank statement comparison if available for active due month
     const isStatementMonth = (isDueSoon || key === currentMonthSortKey);
+    let bankDueOffset = -1;
+
     if (cardBal.billedBalance > 0 && isStatementMonth) {
-      rows.push(["Bank Statement Balance Due:", cardBal.billedBalance]);
+      bankDueOffset = rows.length;
+      rows.push(["🏦 BANK STATEMENT DUE (Must Pay):", cardBal.billedBalance]);
+      rows.push(["👥 Sum of Individual Family Shares:", data.total]);
+
       const diff = data.total - cardBal.billedBalance;
-      if (Math.abs(diff) > 1) {
-        rows.push(["Prior Overpayment Applied by Bank:", -diff]);
+      if (Math.abs(diff) < 1.00) {
+        rows.push(["⚖️ Audit & Reconciliation Status:", "✅ Matched (0.00 EGP difference)"]);
+      } else if (diff > 1.00) {
+        rows.push(["⚖️ Audit Difference:", "+" + diff.toFixed(2) + " EGP (Debts exceed bank bill)"]);
+        rows.push(["ℹ️ Explanation:", "Bank applied prior month overpayment (-" + diff.toFixed(2) + " EGP)"]);
+        rows.push(["👉 What to Pay:", "Transfer " + cardBal.billedBalance.toFixed(2) + " EGP to NBE to fully settle card"]);
+      } else {
+        rows.push(["⚠️ Audit Difference:", "-" + Math.abs(diff).toFixed(2) + " EGP (Missing charges!)"]);
+        rows.push(["ℹ️ Action Needed:", "Bank bill is higher! Check 'Bank Statement' Col H for ⚠️ Unassigned charges"]);
       }
+    } else {
+      rows.push(["Total Bill (Purchases & EMIs):", data.total]);
     }
 
     const personHeaderIdx = rows.length;
@@ -1293,14 +1689,29 @@ function updateLiveDashboard() {
     const dataRange = debtsSheet.getRange(currentRow, 1, rows.length, 2);
     dataRange.setValues(rows);
 
-    // Number formatting for amounts (Column B)
-    debtsSheet.getRange(currentRow, 2, rows.length, 1).setNumberFormat("#,##0.00");
+    // Number formatting: numbers as currency #,##0.00, text as @
+    for (let r = 0; r < rows.length; r++) {
+      if (typeof rows[r][1] === "number") {
+        debtsSheet.getRange(currentRow + r, 2).setNumberFormat("#,##0.00");
+      } else {
+        debtsSheet.getRange(currentRow + r, 2).setNumberFormat("@");
+      }
+    }
 
     // Typography & Styling
     debtsSheet.getRange(currentRow, 1, personHeaderIdx, 2).setFontWeight("bold");
     debtsSheet.getRange(currentRow + personHeaderIdx, 1, 1, 2).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
 
     if (blockColor) dataRange.setBackground(blockColor);
+
+    // Prominently highlight Bank Statement Due row
+    if (bankDueOffset >= 0) {
+      debtsSheet.getRange(currentRow + bankDueOffset, 1, 1, 2)
+        .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
+        .setFontWeight("bold")
+        .setFontColor(CONFIG.COLORS.PRIMARY);
+    }
+
     if (isPaid) dataRange.setFontLine("line-through");
 
     currentRow += rows.length + 1;
