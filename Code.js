@@ -106,6 +106,34 @@ function onEdit(e) {
     // Toast notification
     ss.toast(`Added "${finalDesc}" (${amt.toFixed(2)} EGP) for ${payer} to Transactions!`, "💳 Transaction Added", 4);
   }
+
+  // Table 1: User confirms a Suggested Match in Column G (col 7)
+  if (col === 7 && (e.value === "TRUE" || e.range.getValue() === true)) {
+    const rowValues = sheet.getRange(row, 1, 1, 7).getValues()[0];
+    const rawDate = rowValues[1];
+    const stmtDesc = String(rowValues[2] || "").trim();
+    const amt = parseFloat(rowValues[3]);
+
+    if (!isNaN(amt) && amt > 0) {
+      const dateStr = String(rawDate);
+      const stKey = `${dateStr}_${amt.toFixed(2)}_${stmtDesc.substring(0, 20)}`;
+
+      const scriptProps = PropertiesService.getScriptProperties();
+      const rawJson = scriptProps.getProperty("CONFIRMED_MATCHES") || "[]";
+      let setKeys = [];
+      try { setKeys = JSON.parse(rawJson); } catch (err) {}
+      if (!setKeys.includes(stKey)) {
+        setKeys.push(stKey);
+        scriptProps.setProperty("CONFIRMED_MATCHES", JSON.stringify(setKeys));
+      }
+
+      sheet.getRange(row, 1, 1, 7).setBackground(CONFIG.COLORS.PAID);
+      sheet.getRange(row, 7).clearDataValidations().setValue("✅ Confirmed");
+
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      ss.toast(`Match confirmed for ${stmtDesc}!`, "💳 Match Confirmed", 3);
+    }
+  }
 }
 
 function setupDailyTrigger() {
@@ -421,8 +449,10 @@ function writeStatementToSheet(ss, meta, transactions) {
   sheet.getRange("A2:A4").setFontWeight("bold");
   sheet.getRange("C2:C4").setFontWeight("bold");
   sheet.getRange("E2:E4").setFontWeight("bold");
-  sheet.getRange("B2:B4").setNumberFormat("#,##0.00");
-  sheet.getRange("D2:D4").setNumberFormat("#,##0.00");
+  sheet.getRange("B2").setNumberFormat("@");
+  sheet.getRange("D2").setNumberFormat("@");
+  sheet.getRange("B3:B4").setNumberFormat("#,##0.00");
+  sheet.getRange("D3:D4").setNumberFormat("#,##0.00");
   sheet.getRange("F2:F4").setNumberFormat("#,##0.00");
   sheet.getRange("2:4").setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
 
@@ -627,6 +657,22 @@ function runReconciliation(ss, tz) {
   }
 
   // 3. Multi-Pass Matching
+  // Pass 0: Pre-confirmed Matches from ScriptProperties
+  const scriptProps = PropertiesService.getScriptProperties();
+  const confirmedMatchesJson = scriptProps.getProperty("CONFIRMED_MATCHES") || "[]";
+  let confirmedMatchKeys = new Set();
+  try {
+    confirmedMatchKeys = new Set(JSON.parse(confirmedMatchesJson));
+  } catch (e) {}
+
+  stmtDebits.forEach(st => {
+    const stKey = `${st.dateStr}_${st.amount.toFixed(2)}_${st.desc.substring(0, 20)}`;
+    if (confirmedMatchKeys.has(stKey)) {
+      st.matched = true;
+      st.matchType = "CONFIRMED";
+    }
+  });
+
   // Pass 1: 1-to-1 Exact Match (Amount exact, Date within 5 days, Keyword Overlap)
   stmtDebits.forEach(st => {
     if (st.matched) return;
@@ -759,39 +805,6 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
   const suggestedStmtIds = new Set(suggestedMatches.map(s => s.stmt.id));
   const missingInSheet = stmtDebits.filter(st => !st.matched && !suggestedStmtIds.has(st.id));
 
-  // Determine statement cycle start date from earliest transaction across ALL statement rows
-  let minStmtDate = null;
-  stmtData.forEach(row => {
-    const rawD = row[1];
-    if (rawD) {
-      const d = new Date(rawD);
-      if (!isNaN(d.getTime())) {
-        if (!minStmtDate || d < minStmtDate) minStmtDate = d;
-      }
-    }
-  });
-
-  const stmtStartDay = minStmtDate
-    ? new Date(minStmtDate.getFullYear(), minStmtDate.getMonth(), minStmtDate.getDate(), 0, 0, 0, 0)
-    : null;
-
-  // Track sheet transactions already included in Suggested Matches (Table 1)
-  const suggestedTxRowNums = new Set();
-  suggestedMatches.forEach(s => {
-    s.sheetItems.forEach(it => suggestedTxRowNums.add(it.rowNum));
-  });
-
-  // Only include unmatched transactions that belong to this cycle or future (exclude settled past history)
-  const unmatchedInSheet = txDebits.filter(tx => {
-    if (tx.matched) return false;
-    if (suggestedTxRowNums.has(tx.rowNum)) return false; // Already in Suggested Matches
-    if (stmtStartDay) {
-      const txDay = new Date(tx.date.getFullYear(), tx.date.getMonth(), tx.date.getDate(), 0, 0, 0, 0);
-      if (txDay < stmtStartDay) return false; // Settled in previous statement cycles
-    }
-    return true;
-  });
-
   // 4. Render Reconciliation Sheet
   reconSheet.getRange("A1:G1").merge()
     .setValue("Statement Reconciliation — Smart Audit & Discrepancies")
@@ -893,67 +906,6 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
     curRow += missRows.length + 1;
   }
 
-  // TABLE 3: 🕒 Unmatched Sheet Transactions
-  reconSheet.getRange(curRow, 1, 1, 6).merge()
-    .setValue("🕒 Logged Transactions NOT on Statement (" + unmatchedInSheet.length + " items)")
-    .setFontWeight("bold")
-    .setBackground(CONFIG.COLORS.HEADER);
-  curRow++;
-
-  const dateLabel = stmtStartDay ? Utilities.formatDate(stmtStartDay, tz, "MMMM d, yyyy") : "";
-  if (dateLabel) {
-    reconSheet.getRange(curRow, 1, 1, 6).merge()
-      .setValue("ℹ️ Showing active cycle & pending items only. All transactions prior to " + dateLabel + " are already settled.")
-      .setFontStyle("italic")
-      .setFontSize(9)
-      .setFontColor(CONFIG.COLORS.TEXT_MUTED);
-    curRow++;
-  }
-
-  const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Payer", "Status"];
-  reconSheet.getRange(curRow, 1, 1, 6).setValues([unHeaders])
-    .setFontWeight("bold")
-    .setBackground(CONFIG.COLORS.HEADER);
-  curRow++;
-
-  if (unmatchedInSheet.length === 0) {
-    reconSheet.getRange(curRow, 1, 1, 6).merge()
-      .setValue("✅ All current cycle transactions match statement records! (Prior history is settled)")
-      .setFontColor(CONFIG.COLORS.PRIMARY)
-      .setFontWeight("bold");
-    curRow += 2;
-  } else {
-    let stmtCutoffDate = null;
-    if (stmtSheet && stmtSheet.getLastRow() >= 2) {
-      const sVal = stmtSheet.getRange("B2").getValue();
-      if (sVal) {
-        const d = new Date(sVal);
-        if (!isNaN(d.getTime())) {
-          stmtCutoffDate = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
-        }
-      }
-    }
-
-    const unRows = unmatchedInSheet.map((u, idx) => {
-      let status = "🕒 Pending (Next Statement)";
-      if (stmtCutoffDate && u.date <= stmtCutoffDate) {
-        status = "⚠️ Unbilled Discrepancy (in cycle)";
-      }
-      return [
-        idx + 1,
-        u.date,
-        u.desc,
-        u.amount,
-        u.person,
-        status
-      ];
-    });
-
-    reconSheet.getRange(curRow, 1, unRows.length, 6).setValues(unRows);
-    reconSheet.getRange(curRow, 2, unRows.length, 1).setNumberFormat("dddd, MMMM d, yyyy");
-    reconSheet.getRange(curRow, 4, unRows.length, 1).setNumberFormat("#,##0.00");
-  }
-
   reconSheet.autoResizeColumns(1, 7);
 }
 
@@ -1045,8 +997,13 @@ function calculateCardBalance(ss, tz) {
       billedBalance = parseFloat(closeVal);
     }
     const stmtDateVal = stmtSheet.getRange("B2").getValue();
-    if (stmtDateVal) {
-      statementDate = new Date(stmtDateVal);
+    if (stmtDateVal instanceof Date && !isNaN(stmtDateVal.getTime())) {
+      statementDate = stmtDateVal;
+    } else if (typeof stmtDateVal === "number" && stmtDateVal > 40000) {
+      statementDate = new Date(Math.round((stmtDateVal - 25569) * 86400 * 1000));
+    } else if (stmtDateVal) {
+      const d = new Date(stmtDateVal);
+      if (!isNaN(d.getTime())) statementDate = d;
     }
   }
 
@@ -1077,7 +1034,7 @@ function calculateCardBalance(ss, tz) {
       const pDate = new Date(row[1]);
       const amt = parseFloat(row[4]);
       if (!isNaN(pDate.getTime()) && !isNaN(amt) && amt > 0) {
-        if (!statementDate || pDate > statementDate) {
+        if (statementDate && pDate > statementDate) {
           unbilledNewPurchases += amt;
         }
       }
@@ -1185,9 +1142,11 @@ function updateLiveDashboard() {
     });
   }
 
-  // 2. Process Installments
+  // 2. Process Installments (Exact NBE 55-Day Cutoff Rule)
   if (installmentsSheet.getLastRow() >= 2) {
     const instData = installmentsSheet.getRange(2, 1, installmentsSheet.getLastRow() - 1, 11).getValues();
+    const newInstallmentStatuses = [];
+
     instData.forEach(row => {
       const rawDate = row[1];
       const durationMonths = parseInt(row[4], 10);
@@ -1195,20 +1154,43 @@ function updateLiveDashboard() {
       const rawPayer = row[8];
 
       if (!rawDate || isNaN(durationMonths) || durationMonths <= 0 || isNaN(emi) || emi <= 0 || !rawPayer) {
+        newInstallmentStatuses.push(["", ""]);
         return;
       }
 
       const purchaseDate = new Date(rawDate);
-      if (isNaN(purchaseDate.getTime())) return;
+      if (isNaN(purchaseDate.getTime())) {
+        newInstallmentStatuses.push(["", ""]);
+        return;
+      }
 
       const person = String(rawPayer).trim().toLowerCase();
-      const firstDueDate = getDueDateForPurchase(purchaseDate);
 
-      for (let i = 0; i < durationMonths; i++) {
-        const instDueDate = new Date(firstDueDate.getFullYear(), firstDueDate.getMonth() + i, 1);
-        addDebt(instDueDate, person, emi);
+      // NBE 55-day cutoff rule
+      let firstPayDate = new Date(purchaseDate);
+      firstPayDate.setDate(purchaseDate.getDate() + 55);
+
+      let startMonthOffset = 0;
+      if (firstPayDate.getDate() > 29) {
+        startMonthOffset = 1;
       }
+
+      let paymentsMade = 0;
+      for (let i = 0; i < durationMonths; i++) {
+        const dueMonthDate = new Date(firstPayDate.getFullYear(), firstPayDate.getMonth() + i + startMonthOffset, 1);
+        const monthKey = Utilities.formatDate(dueMonthDate, tz, "MMMM yyyy").toLowerCase();
+
+        if (paidMonthsSet.has(monthKey)) paymentsMade++;
+
+        addDebt(dueMonthDate, person, emi);
+      }
+
+      newInstallmentStatuses.push([paymentsMade, (paymentsMade >= durationMonths ? "Completed" : "Ongoing")]);
     });
+
+    if (newInstallmentStatuses.length > 0) {
+      installmentsSheet.getRange(2, 10, newInstallmentStatuses.length, 2).setValues(newInstallmentStatuses);
+    }
   }
 
   // 3. Render Dashboard in 'Monthly Debts'
@@ -1286,10 +1268,21 @@ function updateLiveDashboard() {
     currentRow++;
 
     // Data Rows
-    const rows = [
-      ["Total Bill:", data.total],
-      ["Person", "Owes"]
-    ];
+    const rows = [];
+    rows.push(["Total Bill (Purchases & EMIs):", data.total]);
+
+    // Show bank statement comparison if available for active due month
+    const isStatementMonth = (isDueSoon || key === currentMonthSortKey);
+    if (cardBal.billedBalance > 0 && isStatementMonth) {
+      rows.push(["Bank Statement Balance Due:", cardBal.billedBalance]);
+      const diff = data.total - cardBal.billedBalance;
+      if (Math.abs(diff) > 1) {
+        rows.push(["Prior Overpayment Applied by Bank:", -diff]);
+      }
+    }
+
+    const personHeaderIdx = rows.length;
+    rows.push(["Person", "Owes"]);
 
     const sortedPeople = Object.keys(data.people).sort();
     sortedPeople.forEach(p => {
@@ -1301,14 +1294,11 @@ function updateLiveDashboard() {
     dataRange.setValues(rows);
 
     // Number formatting for amounts (Column B)
-    debtsSheet.getRange(currentRow, 2, 1, 1).setNumberFormat("#,##0.00");
-    if (sortedPeople.length > 0) {
-      debtsSheet.getRange(currentRow + 2, 2, sortedPeople.length, 1).setNumberFormat("#,##0.00");
-    }
+    debtsSheet.getRange(currentRow, 2, rows.length, 1).setNumberFormat("#,##0.00");
 
     // Typography & Styling
-    debtsSheet.getRange(currentRow, 1, 1, 2).setFontWeight("bold");
-    debtsSheet.getRange(currentRow + 1, 1, 1, 2).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
+    debtsSheet.getRange(currentRow, 1, personHeaderIdx, 2).setFontWeight("bold");
+    debtsSheet.getRange(currentRow + personHeaderIdx, 1, 1, 2).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
 
     if (blockColor) dataRange.setBackground(blockColor);
     if (isPaid) dataRange.setFontLine("line-through");
