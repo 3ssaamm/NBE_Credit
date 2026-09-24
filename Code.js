@@ -67,17 +67,27 @@ function parseDateValue(rawDate, tz) {
   return null;
 }
 
-function getDueDateForPurchase(purchaseDate, tz) {
+function getDueDateForPurchase(purchaseDate, tz, statementDate, statementDueDate) {
   if (!purchaseDate || isNaN(purchaseDate.getTime())) return null;
   const targetTz = tz || "Africa/Cairo";
-  const day = parseInt(Utilities.formatDate(purchaseDate, targetTz, "d"), 10);
+
+  // If active statement info is available, anchor any in-period transaction directly to statementDueDate
+  if (statementDate && statementDueDate) {
+    const sEnd = new Date(statementDate.getFullYear(), statementDate.getMonth(), statementDate.getDate(), 23, 59, 59, 999);
+    // Billing cycle starts the day after previous cutoff (~35 days prior)
+    const sStart = new Date(statementDate.getFullYear(), statementDate.getMonth() - 1, statementDate.getDate() - 2, 0, 0, 0, 0);
+    if (purchaseDate >= sStart && purchaseDate <= sEnd) {
+      return statementDueDate;
+    }
+  }
+
+  // Standard NBE Consumer Credit Card Billing Cycle:
+  // Statements close on the last day of each calendar month (e.g. 31 Jan, 28 Feb, 31 Mar, ... 31 Aug).
+  // Payment is due on the 25th of the following month (month + 1).
+  // All purchases made during month M are billed on month M statement, due in month M + 1.
   const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
   const year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
-  // NBE Statement Cycle: Closes on the 29th of each month.
-  // Purchases made on or before the 29th are billed on this month's statement (due 25th of next month: month + 1).
-  // Purchases made on 30th or 31st roll over to next month's statement (due 25th of month + 2).
-  const monthOffset = (day <= 29) ? 1 : 2;
-  return new Date(year, month + monthOffset, 1);
+  return new Date(year, month + 1, 1);
 }
 
 // ==========================================
@@ -904,10 +914,27 @@ function hasMerchantKeywordOverlap(desc1, desc2) {
          words2.some(w => words1.includes(w) || c1.includes(w));
 }
 
+function isNeglectedPayer(name) {
+  if (!name) return false;
+  const s = String(name).toLowerCase().trim();
+  return s.includes("neglect") || s.includes("ignore") || s.startsWith("🚫") || s === "none" || s === "-";
+}
+
 function normalizePersonName(name) {
   if (!name) return "";
-  const cleaned = String(name).trim().replace(/\s+/g, " ");
+  let cleaned = String(name).trim().replace(/\s+/g, " ");
   if (!cleaned) return "";
+
+  if (isNeglectedPayer(cleaned)) return "";
+  const lower = cleaned.toLowerCase();
+  if (lower === "shared") return "";
+
+  // Common aliases & typo unification
+  if (lower === "me" || lower === "myself") return "Mido";
+  if (lower === "abd") return "Abdo";
+  if (lower === "zozza") return "Zoza";
+  if (lower === "mohanad") return "Muhanad";
+
   return cleaned
     .toLowerCase()
     .split(" ")
@@ -917,10 +944,15 @@ function normalizePersonName(name) {
 
 function splitPayerNames(payerStr) {
   if (!payerStr) return [];
-  return String(payerStr)
-    .split(/[\+\,\/]/)
+  const s = String(payerStr).trim();
+  if (isNeglectedPayer(s)) return [];
+
+  // Support splitting by +, &, /, and " and " (e.g. "Me and Abdo")
+  return s
+    .replace(/\s+and\s+/gi, " + ")
+    .split(/[\+\,\/\&]/)
     .map(p => normalizePersonName(p))
-    .filter(p => p && p.toLowerCase() !== "shared");
+    .filter(p => p && p.toLowerCase() !== "shared" && !isNeglectedPayer(p));
 }
 
 function getAllUniquePayers(ss) {
@@ -931,7 +963,9 @@ function getAllUniquePayers(ss) {
     const numRows = txSheet.getLastRow() - 1;
     const vals = txSheet.getRange(2, 4, numRows, 1).getValues();
     vals.forEach(r => {
-      splitPayerNames(r[0]).forEach(name => peopleSet.add(name));
+      splitPayerNames(r[0]).forEach(name => {
+        if (name && !isNeglectedPayer(name) && name.toLowerCase() !== "shared") peopleSet.add(name);
+      });
     });
   }
 
@@ -940,7 +974,9 @@ function getAllUniquePayers(ss) {
     const numRows = instSheet.getLastRow() - 1;
     const vals = instSheet.getRange(2, 9, numRows, 1).getValues();
     vals.forEach(r => {
-      splitPayerNames(r[0]).forEach(name => peopleSet.add(name));
+      splitPayerNames(r[0]).forEach(name => {
+        if (name && !isNeglectedPayer(name) && name.toLowerCase() !== "shared") peopleSet.add(name);
+      });
     });
   }
 
@@ -951,7 +987,9 @@ function getAllUniquePayers(ss) {
     Object.keys(assignedMap).forEach(k => {
       const item = assignedMap[k];
       if (item && item.payer) {
-        splitPayerNames(item.payer).forEach(name => peopleSet.add(name));
+        splitPayerNames(item.payer).forEach(name => {
+          if (name && !isNeglectedPayer(name) && name.toLowerCase() !== "shared") peopleSet.add(name);
+        });
       }
     });
   } catch (e) {}
@@ -975,15 +1013,20 @@ function getAllUniquePayers(ss) {
         if (numRows > 0) {
           const pVals = reconSheet.getRange(t2 + 2, 5, numRows, 1).getValues();
           pVals.forEach(r => {
-            splitPayerNames(r[0]).forEach(name => peopleSet.add(name));
+            splitPayerNames(r[0]).forEach(name => {
+              if (name && !isNeglectedPayer(name) && name.toLowerCase() !== "shared") peopleSet.add(name);
+            });
           });
         }
       }
     }
   } catch (e) {}
 
-  const result = Array.from(peopleSet).sort((a, b) => a.localeCompare(b));
-  return result.length > 0 ? result : ["Abdo", "Dad", "Hager", "Mai", "Mido", "Muhanad", "Mum", "Nourween", "Zoza"];
+  const result = Array.from(peopleSet)
+    .map(p => normalizePersonName(p))
+    .filter(p => p && !isNeglectedPayer(p) && p.toLowerCase() !== "shared");
+  const uniqueResult = Array.from(new Set(result)).sort((a, b) => a.localeCompare(b));
+  return uniqueResult.length > 0 ? uniqueResult : ["Abdo", "Dad", "Hager", "Mai", "Mido", "Muhanad", "Mum", "Nourween", "Zoza"];
 }
 
 function getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate) {
@@ -1923,7 +1966,7 @@ function updateLiveDashboard(options) {
         rawPerson: rawPerson
       });
 
-      const dueDate = getDueDateForPurchase(purchaseDate, tz);
+      const dueDate = getDueDateForPurchase(purchaseDate, tz, cardBal.statementDate, activeStatementDueDate);
       if (!dueDate) return;
 
       const people = splitPayerNames(rawPerson);
@@ -1969,7 +2012,7 @@ function updateLiveDashboard(options) {
       const splitEmi = emi / people.length;
 
       // First installment is due in the statement cycle of the purchase date
-      const firstDueDate = getDueDateForPurchase(purchaseDate, tz);
+      const firstDueDate = getDueDateForPurchase(purchaseDate, tz, cardBal.statementDate, activeStatementDueDate);
 
       for (let i = 0; i < durationMonths; i++) {
         const dueMonthDate = new Date(firstDueDate.getFullYear(), firstDueDate.getMonth() + i, 1);
@@ -2053,7 +2096,7 @@ function updateLiveDashboard(options) {
 
   assignedChargesList.forEach(item => {
     const payerStr = String(item.payer || "").trim();
-    if (!payerStr || payerStr === "🚫 Neglect / Ignore" || payerStr.toUpperCase().includes("NEGLECT")) {
+    if (!payerStr || isNeglectedPayer(payerStr)) {
       return;
     }
 
@@ -2088,11 +2131,13 @@ function updateLiveDashboard(options) {
   const allKnownPeople = getAllUniquePayers(ss);
   const allPeopleSet = new Set(allKnownPeople);
   debtLineItems.forEach(it => {
-    if (it.person && it.person.toLowerCase() !== "shared") {
+    if (it.person && it.person.toLowerCase() !== "shared" && !isNeglectedPayer(it.person)) {
       allPeopleSet.add(it.person);
     }
   });
-  const sortedPeople = Array.from(allPeopleSet).sort((a, b) => a.localeCompare(b));
+  const sortedPeople = Array.from(allPeopleSet)
+    .filter(p => p && !isNeglectedPayer(p) && p.toLowerCase() !== "shared")
+    .sort((a, b) => a.localeCompare(b));
 
   // 4. Render Dedicated 'Debt Breakdown' Sheet
   renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeStatementDueDate, assignedMissingCount, assignedMissingTotal);
@@ -2512,10 +2557,22 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
     .setBackground(CONFIG.COLORS.HEADER);
   curRow++;
 
+  let neglectedDebitsTotal = 0;
+  let neglectedDebitsCount = 0;
+  (assignedChargesList || []).forEach(item => {
+    if (isNeglectedPayer(item.payer)) {
+      neglectedDebitsTotal += item.amount;
+      neglectedDebitsCount++;
+    }
+  });
+
   let statusBadge = "✅ Perfect Match (0.00 EGP difference)";
   let statusColor = CONFIG.COLORS.PAID;
   if (Math.abs(netDiff) >= 0.05) {
-    if (netDiff > 0) {
+    if (Math.abs(netDiff + neglectedDebitsTotal) < 0.50) {
+      statusBadge = "✅ Balanced (Difference is " + neglectedDebitsTotal.toFixed(2) + " EGP Neglected Debits)";
+      statusColor = CONFIG.COLORS.PAID;
+    } else if (netDiff > 0) {
       statusBadge = "⚠️ Family Shares Exceed Bank Bill by +" + netDiff.toFixed(2) + " EGP";
       statusColor = CONFIG.COLORS.DUE_SOON;
     } else {
@@ -2526,7 +2583,7 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
 
   const kpiData = [
     ["🏦 Bank Closing Balance (Must Pay):", bankBill, "👥 Total Family Shares in Debt Breakdown:", familyTotal, "⚖️ Net Discrepancy:", netDiff, "Status:", statusBadge],
-    ["🛒 Purchases Total (Sheet):", activeData.purchasesTotal, "📦 Installments Total (Sheet):", activeData.installmentsTotal, "⚠️ Missing Assigned (Recon Table 2):", activeData.missingFromSheetTotal, "Total Card Limit:", cardBal.creditLimit],
+    ["🛒 Purchases Total (Sheet):", activeData.purchasesTotal, "📦 Installments Total (Sheet):", activeData.installmentsTotal, "⚠️ Missing Assigned (Recon Table 2):", activeData.missingFromSheetTotal, "🚫 Neglected Debits (Table 2):", neglectedDebitsTotal],
     ["💳 Statement Total Debits:", cardBal.totalDebit || 0, "💰 Statement Credits / Payments:", cardBal.totalCredit || 0, "Available Balance Now:", cardBal.availableBalanceNow, "Available Post-Settlement:", cardBal.availableAfterSettlement]
   ];
 
@@ -2535,12 +2592,9 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
   for (let c of [1, 3, 5, 7]) {
     sheet.getRange(curRow, c, kpiData.length, 1).setFontWeight("bold");
   }
-  for (let c of [2, 4, 6]) {
+  for (let c of [2, 4, 6, 8]) {
     sheet.getRange(curRow, c, kpiData.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
   }
-  sheet.getRange(curRow + 1, 8).setNumberFormat("#,##0.00");
-  sheet.getRange(curRow + 2, 6).setNumberFormat("#,##0.00");
-  sheet.getRange(curRow + 2, 8).setNumberFormat("#,##0.00");
   sheet.getRange(curRow, 8).setBackground(statusColor).setFontWeight("bold");
   curRow += kpiData.length + 2;
 
@@ -2585,7 +2639,22 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
   let grandReflectedTotal = 0;
   let grandPersonDiff = 0;
 
-  (sortedPeople || []).forEach(p => {
+  // Filter to real family members who have activity or expected debt (never include Neglect or Ignore!)
+  const auditPeople = (sortedPeople || []).filter(p => {
+    if (!p || isNeglectedPayer(p) || p.toLowerCase() === "shared") return false;
+    const bk = (activeData.peopleBreakdown && activeData.peopleBreakdown[p]) || { purchases: 0, installments: 0, missingFromSheet: 0, total: 0 };
+    let pReconAssigned = 0;
+    (assignedChargesList || []).forEach(item => {
+      if (isNeglectedPayer(item.payer)) return;
+      const payers = splitPayerNames(item.payer);
+      if (payers.includes(p)) {
+        pReconAssigned += (item.amount / payers.length);
+      }
+    });
+    return (bk.purchases > 0 || bk.installments > 0 || pReconAssigned > 0 || bk.total > 0);
+  });
+
+  auditPeople.forEach(p => {
     const bk = (activeData.peopleBreakdown && activeData.peopleBreakdown[p]) || { purchases: 0, installments: 0, missingFromSheet: 0, total: 0 };
     const pPurchases = bk.purchases || 0;
     const pInstallments = bk.installments || 0;
@@ -2593,6 +2662,7 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
     // Calculate this person's assigned debits directly from assignedChargesList (Table 2)
     let pReconAssigned = 0;
     (assignedChargesList || []).forEach(item => {
+      if (isNeglectedPayer(item.payer)) return;
       const payers = splitPayerNames(item.payer);
       if (payers.includes(p)) {
         pReconAssigned += (item.amount / payers.length);
@@ -2694,22 +2764,29 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
     curRow += 2;
   } else {
     const t2Rows = assignedChargesList.map((item, idx) => {
-      const payers = splitPayerNames(item.payer);
-      // Check if this item is represented in active Debt Breakdown missing items
-      const isReflected = debtLineItems.some(it => {
-        return it.isMissingFromSheet &&
-               Math.abs(it.originalAmount - item.amount) < 0.05 &&
-               payers.includes(it.person);
-      });
+      const isNeg = isNeglectedPayer(item.payer);
+      const payers = isNeg ? [] : splitPayerNames(item.payer);
+
+      let statusText = "";
+      if (isNeg) {
+        statusText = "🚫 Neglected / Excluded from Bill (Correct)";
+      } else {
+        const isReflected = debtLineItems.some(it => {
+          return it.isMissingFromSheet &&
+                 Math.abs(it.originalAmount - item.amount) < 0.05 &&
+                 payers.includes(it.person);
+        });
+        statusText = isReflected ? "✅ Reflected in Debt Breakdown" : "🚨 Missing from Debt Breakdown!";
+      }
 
       return [
         item.itemNum || (idx + 1),
         item.rawDate || item.dateStr,
         item.desc,
         item.amount,
-        item.payer,
+        isNeg ? "🚫 Neglect / Ignore" : item.payer,
         item.note || "-",
-        isReflected ? "✅ Reflected in Debt Breakdown" : "🚨 Missing from Debt Breakdown!"
+        statusText
       ];
     });
 
@@ -2718,7 +2795,10 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
     sheet.getRange(curRow, 4, t2Rows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
 
     for (let r = 0; r < t2Rows.length; r++) {
-      if (t2Rows[r][6].includes("Reflected")) {
+      if (t2Rows[r][6].includes("Neglected")) {
+        sheet.getRange(curRow + r, 1, 1, t2Headers.length).setBackground("#eeeeee");
+        sheet.getRange(curRow + r, 7).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
+      } else if (t2Rows[r][6].includes("Reflected")) {
         sheet.getRange(curRow + r, 7).setBackground(CONFIG.COLORS.PAID).setFontWeight("bold");
       } else {
         sheet.getRange(curRow + r, 7).setBackground(CONFIG.COLORS.OVERDUE).setFontWeight("bold");
@@ -2879,7 +2959,7 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
   // ==========================================
   const unbilledPurchases = [];
   (existingTxList || []).forEach(tx => {
-    const dueDate = getDueDateForPurchase(tx.date, tz);
+    const dueDate = getDueDateForPurchase(tx.date, tz, cardBal.statementDate, activeStatementDueDate);
     if (!dueDate) return;
     const sKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
     if (sKey !== activeSortKey) return;
