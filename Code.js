@@ -548,7 +548,7 @@ function parseNBEStatementText(text) {
 
   if (!text) return { meta: meta, transactions: [] };
 
-  // 1. Parse Metadata
+  // 1. Parse Statement Metadata
   const mCard = text.match(/Card (?:Number|No\.?)[:\s\t]+([0-9\*]+)/i);
   if (mCard) meta.card = mCard[1];
 
@@ -564,50 +564,63 @@ function parseNBEStatementText(text) {
     meta.totalDebit = parseFloat(mTot[2].replace(/,/g, ""));
   }
 
-  const mDueLimit = text.match(/Due Date[:\s\t]+([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})[\s\S]*?Credit Limit[:\s\t]+([\d,]+\.?\d*)/i);
+  const mDueLimit = text.match(/Due Date[:\s\t]+([0-9]{1,2}[\s\-\/\.][A-Za-z]+[\s\-\/\.][0-9]{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})[\s\S]*?Credit Limit[:\s\t]+([\d,]+\.?\d*)/i);
   if (mDueLimit) {
     meta.dueDate = mDueLimit[1].trim();
     meta.creditLimit = parseFloat(mDueLimit[2].replace(/,/g, ""));
   }
 
-  const mStmt = text.match(/Statement Date[:\s\t]+([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i);
+  const mStmt = text.match(/Statement Date[:\s\t]+([0-9]{1,2}[\s\-\/\.][A-Za-z]+[\s\-\/\.][0-9]{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i);
   if (mStmt) {
     meta.statementDate = mStmt[1].trim();
   }
 
-  // 2. Comprehensive Date Pattern:
-  // Supports:
+  // 2. Universal Date Pattern:
+  // Matches:
   // - Full English months: "31 August 2026", "05 July 2024"
   // - Abbreviated 3-letter months: "31 Aug 2026", "30 Jul 2024", "01 Sep 2026"
+  // - Hyphenated / Slash / Dotted month dates: "30-Jul-2024", "31-Aug-2026", "30/Aug/2024", "30.08.2024"
   // - Month names first: "Aug 31, 2026", "July 30, 2024"
   // - Numeric dates: "31/08/2026", "30-07-2024", "31.08.26"
-  const datePattern = /(?:\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{2,4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/gi;
+  // - Ordinal numbers: "1st August 2026", "31st August 2026"
+  const datePattern = /(?:\b\d{1,2}(?:st|nd|rd|th)?[\s\-\/\.](?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[\s\-\/\.]\d{2,4}\b|\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[\s\-\/\.]\d{1,2}(?:st|nd|rd|th)?,?[\s\-\/\.]\d{2,4}\b|\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b)/gi;
 
   const lines = text.split(/\r?\n/);
   const transactions = [];
-  const seenLineKeys = new Set();
 
-  function processTxCandidate(rawLine) {
-    const trimmed = rawLine.trim();
-    if (!trimmed) return;
+  for (let i = 0; i < lines.length; i++) {
+    let rawLine = lines[i].trim();
+    if (!rawLine) continue;
 
-    // Skip known page headers, disclaimers, and metadata lines
-    if (/^(?:Page\s+No|National\s+Bank|Statement\s+Date|Due\s+Date|Transaction\s+Date|Posting\s+Date|Card\s+Number|Opening\s+Balance|Total\s+of|Credit\s+Limit|Closing\s+Balance)/i.test(trimmed)) {
-      return;
+    // Skip pure page headers and metadata labels that have no transaction data
+    if (/^Page\s+No\.?\s+\d+/i.test(rawLine)) continue;
+    if (/^(?:Statement\s+Date|Due\s+Date|Opening\s+Balance|Closing\s+Balance|Total\s+(?:of\s+)?(?:Credit|Debit)|Credit\s+Limit)[:\s\t]/i.test(rawLine)) continue;
+    if (/^Transaction\s+Date\s+Posting\s+Date/i.test(rawLine)) continue;
+    if (/^National\s+Bank\s+of\s+Egypt\s*$/i.test(rawLine)) continue;
+
+    // Check if line contains a date
+    let dates = rawLine.match(datePattern);
+    if (!dates || dates.length === 0) continue;
+
+    // If line has a date but no numeric amount, check if amount wrapped to the next line in OCR
+    const hasDecimal = /[\d,]+\.\d{2}/.test(rawLine);
+    const hasTaggedAmount = /\b\d+(?:\.\d{2})?\s*(?:EGP|CR|-)\b/i.test(rawLine);
+    if (!hasDecimal && !hasTaggedAmount && i + 1 < lines.length) {
+      const nextLine = lines[i + 1].trim();
+      const nextHasDate = nextLine.match(datePattern);
+      const nextHasAmount = /[\d,]+\.\d{2}/.test(nextLine) || /\b\d+(?:\.\d{2})?\s*(?:EGP|CR|-)\b/i.test(nextLine);
+      if (!nextHasDate && nextHasAmount) {
+        rawLine = rawLine + " " + nextLine;
+        i++; // advance since next line was merged
+        dates = rawLine.match(datePattern);
+      }
     }
-
-    const dates = trimmed.match(datePattern);
-    if (!dates || dates.length === 0) return;
-
-    // Date must appear near the beginning of the transaction line
-    const firstDateIdx = trimmed.search(datePattern);
-    if (firstDateIdx > 15) return;
 
     const txDate = dates[0];
     const postDate = dates.length > 1 ? dates[1] : txDate;
 
-    // Strip the dates from the transaction line to parse body
-    let rest = trimmed;
+    // Remove dates from rawLine to parse transaction details
+    let rest = rawLine;
     dates.slice(0, 2).forEach(d => {
       rest = rest.replace(d, " ");
     });
@@ -628,49 +641,68 @@ function parseNBEStatementText(text) {
       txType = "CREDIT";
     }
 
-    // Extract auth code (5-8 digits at end or preceded by space/tab)
-    const mAuth = rest.match(/\b(\d{5,8})\b\s*$/);
-    if (mAuth) {
-      authCode = mAuth[1];
-      rest = rest.substring(0, mAuth.index).trim();
-    }
-
     // Amount extraction:
-    // Case 1: EGP explicitly tagged (e.g. "384.00 EGP" or "EGP 384.00" or "50.00 USD 2,457.58 EGP")
-    const mEgp = rest.match(/([\d,]+\.\d{2})\s*EGP/i) || rest.match(/EGP\s*([\d,]+\.\d{2})/i);
-    if (mEgp) {
-      amount = parseFloat(mEgp[1].replace(/,/g, ""));
+    // Case 1: Foreign currency converted to EGP (e.g. "50.00 USD 2,457.58 EGP")
+    const mFx = rest.match(/([\d,]+\.?\d*)\s*(?:USD|EUR|GBP|SAR|AED)\s+([\d,]+\.?\d*)\s*(?:EGP)?/i);
+    if (mFx) {
+      amount = parseFloat(mFx[2].replace(/,/g, ""));
     } else {
-      // Case 2: Scan for all decimal amounts, take the primary transaction amount
-      const allAmts = rest.match(/[\d,]+\.\d{2}/g);
-      if (allAmts && allAmts.length > 0) {
-        amount = parseFloat(allAmts[allAmts.length - 1].replace(/,/g, ""));
+      // Case 2: EGP explicitly tagged (e.g. "384.00 EGP" or "EGP 384.00")
+      const mEgp = rest.match(/([\d,]+\.?\d*)\s*EGP/i) || rest.match(/EGP\s*([\d,]+\.?\d*)/i);
+      if (mEgp) {
+        amount = parseFloat(mEgp[1].replace(/,/g, ""));
       } else {
-        // Case 3: Integer amount (e.g. "10000 CR" or "5000")
-        const intAmts = rest.match(/\b[\d,]+(?:\.00)?\b/g);
-        if (intAmts && intAmts.length > 0) {
-          const cand = parseFloat(intAmts[intAmts.length - 1].replace(/,/g, ""));
-          if (!isNaN(cand) && cand > 0) amount = cand;
+        // Case 3: Credit with CR or minus (e.g. "10000 CR" or "10,000.00 CR")
+        const mCr = rest.match(/([\d,]+\.?\d*)\s*CR\b/i) || rest.match(/([\d,]+\.?\d*)-/);
+        if (mCr) {
+          amount = parseFloat(mCr[1].replace(/,/g, ""));
+        } else {
+          // Case 4: Scan for all decimal numbers
+          const allAmts = rest.match(/[\d,]+\.\d{2}/g);
+          if (allAmts && allAmts.length > 0) {
+            // If multiple decimal numbers, take the last one (billed amount)
+            amount = parseFloat(allAmts[allAmts.length - 1].replace(/,/g, ""));
+          } else {
+            // Case 5: Integer amount at the end of line or before status
+            const intAmts = rest.match(/\b\d{1,7}\b/g);
+            if (intAmts && intAmts.length > 0) {
+              const cand = parseFloat(intAmts[intAmts.length - 1]);
+              if (!isNaN(cand) && cand > 0) amount = cand;
+            }
+          }
         }
       }
     }
 
-    if (isNaN(amount) || amount <= 0) return;
+    if (isNaN(amount) || amount <= 0) continue;
 
-    // Clean up description: remove numbers, currency codes, delimiters
+    // Auth Code extraction: only search for 5-8 digit integer that is NOT the amount itself
+    const authCandidates = rest.match(/\b\d{5,8}\b/g) || [];
+    for (const cand of authCandidates) {
+      const num = parseFloat(cand);
+      if (num !== amount && cand !== meta.card) {
+        authCode = cand;
+        break;
+      }
+    }
+
+    // Clean up description: strip amounts, currencies, delimiters, card tokens
     let desc = rest
+      .replace(new RegExp("\\b" + amount.toFixed(2) + "\\b", "g"), " ")
       .replace(/[\d,]+\.\d{2}/g, " ")
       .replace(/\b(?:EGP|USD|EUR|GBP|SAR|AED|CR)\b/gi, " ")
-      .replace(/[\t\|\*]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+      .replace(/[0-9\*]{12,19}/g, " ") // strip card numbers
+      .replace(/[\t\|\*]+/g, " ");
 
+    if (authCode) {
+      desc = desc.replace(new RegExp("\\b" + authCode + "\\b", "g"), " ");
+    }
+    desc = desc.replace(/\s+/g, " ").trim();
     if (!desc) desc = "Bank Statement Charge";
 
-    const dedupeKey = `${txDate}_${amount.toFixed(2)}_${desc.substring(0, 25)}`;
-    if (seenLineKeys.has(dedupeKey)) return;
-    seenLineKeys.add(dedupeKey);
-
+    // NO DEDUPLICATION OF DISTINCT DOCUMENT ROWS!
+    // Every separate row in the statement is an authentic transaction!
+    // (e.g. multiple recharges on the same day for the same amount are preserved!)
     transactions.push({
       txDate: txDate,
       postDate: postDate,
@@ -681,17 +713,6 @@ function parseNBEStatementText(text) {
       instCurrent: instCurrent,
       instTotal: instTotal
     });
-  }
-
-  // Pass A: Line-by-line / Table row scan
-  lines.forEach(l => processTxCandidate(l));
-
-  // Pass B: If line scan yielded very few items, run fallback block pattern
-  if (transactions.length === 0 || (meta.totalDebit > 0 && transactions.filter(t => t.type === "DEBIT" || t.type === "INSTALLMENT").reduce((s, t) => s + t.amount, 0) < meta.totalDebit * 0.5)) {
-    const singleDatePatternStr = "(?:\\d{1,2}\\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{2,4}|\\d{1,2}[\\/\\-\\.]\\d{1,2}[\\/\\-\\.]\\d{2,4})";
-    const blockRegex = new RegExp("(" + singleDatePatternStr + "[\\s\\S]*?)(?=" + singleDatePatternStr + "|Page\\s+No\\.|\\Z)", "gi");
-    const blocks = text.match(blockRegex) || [];
-    blocks.forEach(b => processTxCandidate(b.replace(/[\r\n]+/g, " ")));
   }
 
   // 3. Mathematical Reconciliation Check
