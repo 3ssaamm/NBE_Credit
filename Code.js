@@ -649,9 +649,9 @@ function parseNBEStatementText(text) {
 
     // Skip pure page headers, metadata labels, print timestamps, and column header titles
     if (/^Page\s+No\.?\s+\d+/i.test(rawLine)) continue;
-    if (/\bas of \d{1,2}:\d{2}(?::\d{2})?\b/i.test(rawLine)) continue;
-    if (/\b(?:printed|generated)\s+(?:on|at)\b/i.test(rawLine)) continue;
-    if (/\b(?:Minimum\s+Payment|Min\.?\s+Payment)\b/i.test(rawLine)) continue;
+    if (/\bas\s*of\b/i.test(rawLine)) continue;
+    if (/\b(?:printed|generated)\b/i.test(rawLine)) continue;
+    if (/\b(?:Minimum\s*Payment|Min\.?\s*Payment)\b/i.test(rawLine)) continue;
     if (/^(?:Statement\s+Date|Due\s+Date|Payment\s+Due\s+Date|Opening\s+Balance|Closing\s+Balance|Total\s+(?:of\s+)?(?:Credit|Debit)|Credit\s+Limit|Available\s+Credit)[:\s\t]/i.test(rawLine)) continue;
     if (/^Transaction\s+Date\s+Posting\s+Date/i.test(rawLine)) continue;
     if (/^National\s+Bank\s+of\s+Egypt\s*$/i.test(rawLine)) continue;
@@ -786,6 +786,11 @@ function parseNBEStatementText(text) {
       .replace(/^[\s,;:\-\|]+/, "")
       .trim();
     if (!desc) desc = "Bank Statement Charge";
+
+    // Double safeguard: Skip if the extracted description is a print timestamp or statement header
+    if (/\bas\s*of\b/i.test(desc) || /\b(?:Minimum\s*Payment|Min\.?\s*Payment)\b/i.test(desc) || /\b(?:printed|generated)\b/i.test(desc)) {
+      continue;
+    }
 
     // NO DEDUPLICATION OF DISTINCT DOCUMENT ROWS!
     // Every separate row in the statement is an authentic transaction!
