@@ -38,8 +38,38 @@ const CONFIG = {
 };
 
 // ==========================================
-// DATE & CUTOFF UTILITIES
+// UTILITIES & SAFE SCRIPT PROPERTIES
 // ==========================================
+
+function safeSetScriptProperty(key, val) {
+  try {
+    let strVal = typeof val === "string" ? val : JSON.stringify(val);
+    if (strVal.length > 8500 && key === "ASSIGNED_STATEMENT_CHARGES") {
+      try {
+        const parsed = JSON.parse(strVal);
+        const compacted = {};
+        const keys = Object.keys(parsed);
+        const recentKeys = keys.slice(-40);
+        recentKeys.forEach(k => {
+          const item = parsed[k];
+          if (item) {
+            compacted[k] = {
+              payer: item.payer,
+              note: (item.note || "").substring(0, 40),
+              amount: item.amount,
+              desc: (item.desc || "").substring(0, 30)
+            };
+          }
+        });
+        strVal = JSON.stringify(compacted);
+      } catch (compactErr) { }
+    }
+    PropertiesService.getScriptProperties().setProperty(key, strVal);
+  } catch (err) {
+    Logger.log(`[SafeProperties] Could not set '${key}': ` + (err ? (err.message || String(err)) : "Quota limit"));
+  }
+}
+
 
 function parseDateValue(rawDate, tz) {
   if (!rawDate) return null;
@@ -212,7 +242,7 @@ function onEdit(e) {
       };
       assignedMap[chargeKey] = record;
       assignedMap[legacyKey] = record;
-      scriptProps.setProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
+      safeSetScriptProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
 
       if (isNeglected) {
         sheet.getRange(row, 1, 1, 6).setBackground("#eeeeee");
@@ -235,7 +265,7 @@ function onEdit(e) {
     } else {
       delete assignedMap[chargeKey];
       delete assignedMap[legacyKey];
-      scriptProps.setProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
+      safeSetScriptProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
       sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.OVERDUE);
       updateBankStatementStatusRow(origDesc, amt, "⚠️ Unassigned (Not in Sheet)", CONFIG.COLORS.OVERDUE);
       updateLiveDashboard({ skipRecon: true });
@@ -261,7 +291,7 @@ function onEdit(e) {
         try { setKeys = JSON.parse(rawJson); } catch (err) { }
         if (!setKeys.includes(stKey)) {
           setKeys.push(stKey);
-          scriptProps.setProperty("CONFIRMED_MATCHES", JSON.stringify(setKeys));
+          safeSetScriptProperty("CONFIRMED_MATCHES", JSON.stringify(setKeys));
         }
 
         sheet.getRange(row, 1, 1, 7).setBackground(CONFIG.COLORS.PAID);
@@ -302,7 +332,7 @@ function onEdit(e) {
     if (isChecked) {
       if (!neglectedKeys.includes(txKeyNorm)) neglectedKeys.push(txKeyNorm);
       if (!neglectedKeys.includes(txKeyLegacy)) neglectedKeys.push(txKeyLegacy);
-      scriptProps.setProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
+      safeSetScriptProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
       sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
       sheet.getRange(row, 8).setValue("🚫 Neglected (Excluded)");
       updateLiveDashboard({ skipRecon: true });
@@ -313,7 +343,7 @@ function onEdit(e) {
       );
     } else {
       neglectedKeys = neglectedKeys.filter(k => k !== txKeyNorm && k !== txKeyLegacy);
-      scriptProps.setProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
+      safeSetScriptProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
       sheet.getRange(row, 1, 1, 8).setBackground(null);
       sheet.getRange(row, 8).setValue("Active in Bill");
       updateLiveDashboard({ skipRecon: true });
@@ -382,16 +412,23 @@ function menuProcessStatement() {
     const result = checkAndProcessNewStatements();
     updateLiveDashboard();
 
-    if (result.processedCount > 0) {
-      const debitSummary = result.lastMeta.sumDebits ? `\n• Total Debits: ${result.lastMeta.sumDebits.toFixed(2)} EGP (Statement: ${result.lastMeta.totalDebit.toFixed(2)} EGP)` : "";
-      const creditSummary = result.lastMeta.sumCredits ? `\n• Total Credits: ${result.lastMeta.sumCredits.toFixed(2)} EGP (Statement: ${result.lastMeta.totalCredit.toFixed(2)} EGP)` : "";
+    if (result && result.processedCount > 0) {
+      const meta = result.lastMeta || {};
+      const debVal = Number(meta.sumDebits || 0);
+      const credVal = Number(meta.sumCredits || 0);
+      const stmtDeb = Number(meta.totalDebit || 0);
+      const stmtCred = Number(meta.totalCredit || 0);
+
+      const debitSummary = debVal > 0 ? `\n• Total Debits: ${debVal.toFixed(2)} EGP` + (stmtDeb > 0 ? ` (Statement: ${stmtDeb.toFixed(2)} EGP)` : "") : "";
+      const creditSummary = credVal > 0 ? `\n• Total Credits: ${credVal.toFixed(2)} EGP` + (stmtCred > 0 ? ` (Statement: ${stmtCred.toFixed(2)} EGP)` : "") : "";
+
       ui.alert(
         "Statement Processed Successfully",
         `Processed ${result.processedCount} statement file(s):\n` +
-        `• File: ${result.processedFiles.join(", ")}\n` +
-        `• Statement Date: ${result.lastMeta.statementDate || "N/A"}\n` +
-        `• Due Date: ${result.lastMeta.dueDate || "N/A"}\n` +
-        `• Closing Balance: ${result.lastMeta.closingBalance ? result.lastMeta.closingBalance.toFixed(2) + " EGP" : "N/A"}\n` +
+        `• File: ${(result.processedFiles || []).join(", ")}\n` +
+        `• Statement Date: ${meta.statementDate || "N/A"}\n` +
+        `• Due Date: ${meta.dueDate || "N/A"}\n` +
+        `• Closing Balance: ${meta.closingBalance ? Number(meta.closingBalance).toFixed(2) + " EGP" : "N/A"}\n` +
         `• Transactions Found: ${result.totalTxCount}${debitSummary}${creditSummary}\n\n` +
         `The Bank Statement, Reconciliation, Debt Breakdown, and Audit & Differences tabs have all been updated!`,
         ui.ButtonSet.OK
@@ -406,7 +443,13 @@ function menuProcessStatement() {
       );
     }
   } catch (err) {
-    ui.alert("Error Processing Statement", err.message, ui.ButtonSet.OK);
+    const errText = (err && (err.message || err.toString())) ? (err.message || err.toString()) : "An error occurred during statement processing.";
+    Logger.log("Error in menuProcessStatement: " + errText + (err && err.stack ? "\n" + err.stack : ""));
+    try {
+      ui.alert("Error Processing Statement", errText, ui.ButtonSet.OK);
+    } catch (uiErr) {
+      Logger.log("Failed to show alert dialog: " + uiErr);
+    }
   }
 }
 
@@ -570,10 +613,14 @@ function parseNBEStatementText(text) {
     meta.closingBalance = parseFloat(mOpenClose[2].replace(/,/g, ""));
   }
 
-  const mTot = text.match(/Total (?:of )?Credit[:\s\t]+([\d,]+\.?\d*)[\s\S]*?Total (?:of )?Debit[:\s\t]+([\d,]+\.?\d*)/i);
-  if (mTot) {
-    meta.totalCredit = parseFloat(mTot[1].replace(/,/g, ""));
-    meta.totalDebit = parseFloat(mTot[2].replace(/,/g, ""));
+  const mTotCred = text.match(/Total (?:of )?Credit[:\s\t]+([\d,]+\.?\d*)/i);
+  if (mTotCred) {
+    meta.totalCredit = parseFloat(mTotCred[1].replace(/,/g, ""));
+  }
+
+  const mTotDeb = text.match(/Total (?:of )?Debit[:\s\t]+([\d,]+\.?\d*)/i);
+  if (mTotDeb) {
+    meta.totalDebit = parseFloat(mTotDeb[1].replace(/,/g, ""));
   }
 
   const mDueLimit = text.match(/Due Date[:\s\t]+([0-9]{1,2}[\s\-\/\.]+[A-Za-z]+[\s\-\/\.]+[0-9]{2,4}|\d{1,2}\s*[\/\-\.]\s*\d{1,2}\s*[\/\-\.]\s*\d{2,4})[\s\S]*?Credit Limit[:\s\t]+([\d,]+\.?\d*)/i);
@@ -659,45 +706,50 @@ function parseNBEStatementText(text) {
       if (!isNaN(parsedFx) && parsedFx > 0 && parsedFx <= maxAmountCap) {
         amount = parsedFx;
       }
-    } else {
-      // Case 2: Credit with CR or minus (e.g. "10000 CR", "10,000.00 CR", "10,000.00-", "-10,000.00")
-      const mCr = rest.match(/([\d,]+\.?\d*)\s*CR\b/i) || rest.match(/([\d,]+\.?\d*)-/) || rest.match(/-([\d,]+\.?\d*)/);
+    }
+
+    // Case 2: Credit with CR or minus (e.g. "10000 CR", "10,000.00 CR")
+    if (amount <= 0) {
+      const mCr = rest.match(/([\d,]+(?:\.\d+)?)\s*CR\b/i) || rest.match(/\b([\d,]+(?:\.\d+)?)-/) || rest.match(/(?:^|\s)-([\d,]+(?:\.\d+)?)/);
       if (mCr) {
         const parsedCr = parseFloat(mCr[1].replace(/,/g, ""));
         if (!isNaN(parsedCr) && parsedCr > 0 && parsedCr <= maxAmountCap) {
           amount = parsedCr;
         }
-      } else {
-        // Case 3: EGP or LE explicitly tagged (e.g. "384.00 EGP", "EGP 384.00", "12.5 EGP", "2.90 EGP")
-        const mEgp = rest.match(/([\d,]+\.?\d*)\s*(?:EGP|LE|L\.E\.)\b/i) || rest.match(/\b(?:EGP|LE|L\.E\.)\s*([\d,]+\.?\d*)/i);
-        if (mEgp) {
-          const parsedEgp = parseFloat(mEgp[1].replace(/,/g, ""));
-          if (!isNaN(parsedEgp) && parsedEgp > 0 && parsedEgp <= maxAmountCap) {
-            amount = parsedEgp;
-          }
+      }
+    }
+
+    // Case 3: EGP or LE explicitly tagged (e.g. "384.00 EGP", "EGP 384.00", "12.5 EGP", "2.90 EGP")
+    if (amount <= 0) {
+      const mEgp = rest.match(/([\d,]+(?:\.\d+)?)\s*(?:EGP|LE|L\.E\.)\b/i) || rest.match(/\b(?:EGP|LE|L\.E\.)\s*([\d,]+(?:\.\d+)?)/i);
+      if (mEgp) {
+        const parsedEgp = parseFloat(mEgp[1].replace(/,/g, ""));
+        if (!isNaN(parsedEgp) && parsedEgp > 0 && parsedEgp <= maxAmountCap) {
+          amount = parsedEgp;
+        }
+      }
+    }
+
+    // Case 4: Any numbers with decimal point (e.g. "833.25", "12.5")
+    if (amount <= 0) {
+      const allDecimals = (rest.match(/[\d,]+\.\d+/g) || [])
+        .map(s => parseFloat(s.replace(/,/g, "")))
+        .filter(n => !isNaN(n) && n > 0 && n <= maxAmountCap);
+      if (allDecimals.length > 0) {
+        amount = allDecimals[allDecimals.length - 1];
+      }
+    }
+
+    // Case 5: Integer amount (e.g. "10000", "100", "16200")
+    if (amount <= 0) {
+      const intCandidates = (rest.match(/\b\d{1,7}\b/g) || [])
+        .map(s => parseFloat(s))
+        .filter(n => !isNaN(n) && n > 0 && n <= maxAmountCap);
+      if (intCandidates.length > 0) {
+        if (intCandidates.length >= 2 && String(intCandidates[intCandidates.length - 1]).length === 6) {
+          amount = intCandidates[intCandidates.length - 2];
         } else {
-          // Case 4: Any numbers with decimal point (e.g. "833.25", "12.5")
-          const allDecimals = (rest.match(/[\d,]+\.\d+/g) || [])
-            .map(s => parseFloat(s.replace(/,/g, "")))
-            .filter(n => !isNaN(n) && n > 0 && n <= maxAmountCap);
-          if (allDecimals.length > 0) {
-            // Take the last decimal number (billing amount in table columns)
-            amount = allDecimals[allDecimals.length - 1];
-          } else {
-            // Case 5: Integer amount (e.g. "10000", "100", "16200")
-            // Make sure not to pick a 6-digit auth code if an integer amount precedes it
-            const intCandidates = (rest.match(/\b\d{1,7}\b/g) || [])
-              .map(s => parseFloat(s))
-              .filter(n => !isNaN(n) && n > 0 && n <= maxAmountCap);
-            if (intCandidates.length > 0) {
-              if (intCandidates.length >= 2 && String(intCandidates[intCandidates.length - 1]).length === 6) {
-                // Last is likely auth code, second to last is amount
-                amount = intCandidates[intCandidates.length - 2];
-              } else {
-                amount = intCandidates[intCandidates.length - 1];
-              }
-            }
-          }
+          amount = intCandidates[intCandidates.length - 1];
         }
       }
     }
@@ -756,7 +808,7 @@ function parseNBEStatementText(text) {
   meta.sumDebits = sumDebits;
   meta.sumCredits = sumCredits;
 
-  Logger.log(`[Statement Parser] Extracted ${transactions.length} items. Total Debits: ${sumDebits.toFixed(2)} (Stmt Meta: ${meta.totalDebit.toFixed(2)}), Total Credits: ${sumCredits.toFixed(2)} (Stmt Meta: ${meta.totalCredit.toFixed(2)})`);
+  Logger.log(`[Statement Parser] Extracted ${transactions.length} items. Total Debits: ${sumDebits.toFixed(2)} (Stmt Meta: ${Number(meta.totalDebit || 0).toFixed(2)}), Total Credits: ${sumCredits.toFixed(2)} (Stmt Meta: ${Number(meta.totalCredit || 0).toFixed(2)})`);
 
   return { meta: meta, transactions: transactions };
 }
@@ -1341,7 +1393,7 @@ function runReconciliation(ss, tz) {
             assignedMap[k2] = rec;
           }
         });
-        scriptProps.setProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
+        safeSetScriptProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
       }
     }
   }
