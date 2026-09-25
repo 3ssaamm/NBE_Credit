@@ -383,6 +383,8 @@ function menuProcessStatement() {
     updateLiveDashboard();
 
     if (result.processedCount > 0) {
+      const debitSummary = result.lastMeta.sumDebits ? `\n• Total Debits: ${result.lastMeta.sumDebits.toFixed(2)} EGP (Statement: ${result.lastMeta.totalDebit.toFixed(2)} EGP)` : "";
+      const creditSummary = result.lastMeta.sumCredits ? `\n• Total Credits: ${result.lastMeta.sumCredits.toFixed(2)} EGP (Statement: ${result.lastMeta.totalCredit.toFixed(2)} EGP)` : "";
       ui.alert(
         "Statement Processed Successfully",
         `Processed ${result.processedCount} statement file(s):\n` +
@@ -390,15 +392,15 @@ function menuProcessStatement() {
         `• Statement Date: ${result.lastMeta.statementDate || "N/A"}\n` +
         `• Due Date: ${result.lastMeta.dueDate || "N/A"}\n` +
         `• Closing Balance: ${result.lastMeta.closingBalance ? result.lastMeta.closingBalance.toFixed(2) + " EGP" : "N/A"}\n` +
-        `• Transactions Found: ${result.totalTxCount}\n\n` +
+        `• Transactions Found: ${result.totalTxCount}${debitSummary}${creditSummary}\n\n` +
         `The Bank Statement, Reconciliation, Debt Breakdown, and Audit & Differences tabs have all been updated!`,
         ui.ButtonSet.OK
       );
     } else {
       ui.alert(
         "No New Statements Found",
-        `No new PDF files were found in the '${CONFIG.FOLDER_NAME}' folder.\n\n` +
-        `If you uploaded a file, please make sure it is in '${CONFIG.FOLDER_NAME}' (and not inside 'Processed').\n` +
+        `No PDF files were found in '${CONFIG.FOLDER_NAME}' or '${CONFIG.PROCESSED_SUBFOLDER}'.\n\n` +
+        `Please upload your NBE Credit Card statement PDF into Google Drive.\n` +
         `The dashboard was refreshed using the current sheet data.`,
         ui.ButtonSet.OK
       );
@@ -461,6 +463,14 @@ function getFullDocumentText(doc) {
     if (header) {
       const hText = header.getText().trim();
       if (hText) lines.unshift(hText);
+    }
+  } catch (e) { }
+
+  try {
+    const footer = doc.getFooter();
+    if (footer) {
+      const fText = footer.getText().trim();
+      if (fText) lines.push(fText);
     }
   } catch (e) { }
 
@@ -543,7 +553,9 @@ function parseNBEStatementText(text) {
     totalDebit: 0,
     dueDate: "",
     creditLimit: CONFIG.CREDIT_LIMIT,
-    statementDate: ""
+    statementDate: "",
+    sumDebits: 0,
+    sumCredits: 0
   };
 
   if (!text) return { meta: meta, transactions: [] };
@@ -564,66 +576,60 @@ function parseNBEStatementText(text) {
     meta.totalDebit = parseFloat(mTot[2].replace(/,/g, ""));
   }
 
-  const mDueLimit = text.match(/Due Date[:\s\t]+([0-9]{1,2}[\s\-\/\.][A-Za-z]+[\s\-\/\.][0-9]{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})[\s\S]*?Credit Limit[:\s\t]+([\d,]+\.?\d*)/i);
+  const mDueLimit = text.match(/Due Date[:\s\t]+([0-9]{1,2}[\s\-\/\.]+[A-Za-z]+[\s\-\/\.]+[0-9]{2,4}|\d{1,2}\s*[\/\-\.]\s*\d{1,2}\s*[\/\-\.]\s*\d{2,4})[\s\S]*?Credit Limit[:\s\t]+([\d,]+\.?\d*)/i);
   if (mDueLimit) {
     meta.dueDate = mDueLimit[1].trim();
     meta.creditLimit = parseFloat(mDueLimit[2].replace(/,/g, ""));
   }
 
-  const mStmt = text.match(/Statement Date[:\s\t]+([0-9]{1,2}[\s\-\/\.][A-Za-z]+[\s\-\/\.][0-9]{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i);
+  const mStmt = text.match(/Statement Date[:\s\t]+([0-9]{1,2}[\s\-\/\.]+[A-Za-z]+[\s\-\/\.]+[0-9]{2,4}|\d{1,2}\s*[\/\-\.]\s*\d{1,2}\s*[\/\-\.]\s*\d{2,4})/i);
   if (mStmt) {
     meta.statementDate = mStmt[1].trim();
   }
 
-  // 2. Universal Date Pattern:
-  // Matches:
-  // - Full English months: "31 August 2026", "05 July 2024"
-  // - Abbreviated 3-letter months: "31 Aug 2026", "30 Jul 2024", "01 Sep 2026"
-  // - Hyphenated / Slash / Dotted month dates: "30-Jul-2024", "31-Aug-2026", "30/Aug/2024", "30.08.2024"
-  // - Month names first: "Aug 31, 2026", "July 30, 2024"
-  // - Numeric dates: "31/08/2026", "30-07-2024", "31.08.26"
-  // - Ordinal numbers: "1st August 2026", "31st August 2026"
-  const datePattern = /(?:\b\d{1,2}(?:st|nd|rd|th)?[\s\-\/\.](?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[\s\-\/\.]\d{2,4}\b|\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[\s\-\/\.]\d{1,2}(?:st|nd|rd|th)?,?[\s\-\/\.]\d{2,4}\b|\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b)/gi;
+  // 2. Enhanced Universal Date Pattern:
+  // Supports tabs, multi-spaces, optional year for months, dotted/hyphenated/slashed formats
+  const datePattern = /(?:\b\d{1,2}(?:st|nd|rd|th)?[\s\-\/\.]+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?:[\s\-\/\.]+\d{2,4})?\b|\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[\s\-\/\.]+\d{1,2}(?:st|nd|rd|th)?,?(?:[\s\-\/\.]+\d{2,4})?\b|\b\d{1,2}\s*[\/\-\.]\s*\d{1,2}\s*[\/\-\.]\s*\d{2,4}\b)/gi;
+
+  const feePattern = /\b(?:STAMP\s*DUTY|STAMPTAX|FINANCE\s*CHARGE|INTEREST\s*CHARGE|SMS\s*(?:ALERT|SERVICE)|LATE\s*PAYMENT|OVERLIMIT|ANNUAL\s*MEMBERSHIP|ADMINISTRATIVE\s*EXPENSE)\b/i;
 
   const lines = text.split(/\r?\n/);
   const transactions = [];
 
   for (let i = 0; i < lines.length; i++) {
-    let rawLine = lines[i].trim();
+    const rawLine = lines[i].trim();
     if (!rawLine) continue;
 
-    // Skip pure page headers and metadata labels that have no transaction data
+    // Skip pure page headers, metadata labels, and column header titles
     if (/^Page\s+No\.?\s+\d+/i.test(rawLine)) continue;
     if (/^(?:Statement\s+Date|Due\s+Date|Opening\s+Balance|Closing\s+Balance|Total\s+(?:of\s+)?(?:Credit|Debit)|Credit\s+Limit)[:\s\t]/i.test(rawLine)) continue;
     if (/^Transaction\s+Date\s+Posting\s+Date/i.test(rawLine)) continue;
     if (/^National\s+Bank\s+of\s+Egypt\s*$/i.test(rawLine)) continue;
+    if (/^Card\s+Number[:\s\t]+[0-9\*]+\s*$/i.test(rawLine)) continue;
 
-    // Check if line contains a date
+    // Reset datePattern lastIndex before matching
+    datePattern.lastIndex = 0;
     let dates = rawLine.match(datePattern);
-    if (!dates || dates.length === 0) continue;
 
-    // If line has a date but no numeric amount, check if amount wrapped to the next line in OCR
-    const hasDecimal = /[\d,]+\.\d{2}/.test(rawLine);
-    const hasTaggedAmount = /\b\d+(?:\.\d{2})?\s*(?:EGP|CR|-)\b/i.test(rawLine);
-    if (!hasDecimal && !hasTaggedAmount && i + 1 < lines.length) {
-      const nextLine = lines[i + 1].trim();
-      const nextHasDate = nextLine.match(datePattern);
-      const nextHasAmount = /[\d,]+\.\d{2}/.test(nextLine) || /\b\d+(?:\.\d{2})?\s*(?:EGP|CR|-)\b/i.test(nextLine);
-      if (!nextHasDate && nextHasAmount) {
-        rawLine = rawLine + " " + nextLine;
-        i++; // advance since next line was merged
-        dates = rawLine.match(datePattern);
-      }
+    // If line has no date but is a known bank fee/charge with a numeric amount, use statementDate
+    let isFeeLineWithoutDate = false;
+    if ((!dates || dates.length === 0) && feePattern.test(rawLine) && /[\d,]+\.?\d*/.test(rawLine)) {
+      isFeeLineWithoutDate = true;
+      dates = [meta.statementDate || "Statement Date"];
     }
+
+    if (!dates || dates.length === 0) continue;
 
     const txDate = dates[0];
     const postDate = dates.length > 1 ? dates[1] : txDate;
 
     // Remove dates from rawLine to parse transaction details
     let rest = rawLine;
-    dates.slice(0, 2).forEach(d => {
-      rest = rest.replace(d, " ");
-    });
+    if (!isFeeLineWithoutDate) {
+      dates.slice(0, 2).forEach(d => {
+        rest = rest.replace(d, " ");
+      });
+    }
 
     let txType = "DEBIT";
     let instCurrent = null;
@@ -631,13 +637,13 @@ function parseNBEStatementText(text) {
     let authCode = "";
     let amount = 0;
 
-    // Check for installment indicator (e.g. "11 OF 12", "09 OF 12", "02 OF 06")
-    const mInst = rest.match(/(\d+)\s+OF\s+(\d+)/i);
+    // Check for installment indicator (e.g. "11 OF 12", "09 OF 12", "02/06")
+    const mInst = rest.match(/(\d+)\s+(?:OF|\/)\s+(\d+)/i);
     if (mInst) {
       txType = "INSTALLMENT";
       instCurrent = parseInt(mInst[1], 10);
       instTotal = parseInt(mInst[2], 10);
-    } else if (/\b(?:PAYMENT|DIRECT DEBIT|REFUND|CREDIT|DEPOSIT|SETTLEMENT)\b|\bCR\b/i.test(rest)) {
+    } else if (/\b(?:PAYMENT|DIRECT DEBIT|REFUND|CREDIT|DEPOSIT|SETTLEMENT)\b|\bCR\b|[\d,]+\.?\d*\s*CR\b/i.test(rest)) {
       txType = "CREDIT";
     }
 
@@ -647,27 +653,32 @@ function parseNBEStatementText(text) {
     if (mFx) {
       amount = parseFloat(mFx[2].replace(/,/g, ""));
     } else {
-      // Case 2: EGP explicitly tagged (e.g. "384.00 EGP" or "EGP 384.00")
-      const mEgp = rest.match(/([\d,]+\.?\d*)\s*EGP/i) || rest.match(/EGP\s*([\d,]+\.?\d*)/i);
-      if (mEgp) {
-        amount = parseFloat(mEgp[1].replace(/,/g, ""));
+      // Case 2: Credit with CR or minus (e.g. "10000 CR", "10,000.00 CR", "10,000.00-", "-10,000.00")
+      const mCr = rest.match(/([\d,]+\.?\d*)\s*CR\b/i) || rest.match(/([\d,]+\.?\d*)-/) || rest.match(/-([\d,]+\.?\d*)/);
+      if (mCr) {
+        amount = parseFloat(mCr[1].replace(/,/g, ""));
       } else {
-        // Case 3: Credit with CR or minus (e.g. "10000 CR" or "10,000.00 CR")
-        const mCr = rest.match(/([\d,]+\.?\d*)\s*CR\b/i) || rest.match(/([\d,]+\.?\d*)-/);
-        if (mCr) {
-          amount = parseFloat(mCr[1].replace(/,/g, ""));
+        // Case 3: EGP or LE explicitly tagged (e.g. "384.00 EGP", "EGP 384.00", "12.5 EGP", "2.90 EGP")
+        const mEgp = rest.match(/([\d,]+\.?\d*)\s*(?:EGP|LE|L\.E\.)\b/i) || rest.match(/\b(?:EGP|LE|L\.E\.)\s*([\d,]+\.?\d*)/i);
+        if (mEgp) {
+          amount = parseFloat(mEgp[1].replace(/,/g, ""));
         } else {
-          // Case 4: Scan for all decimal numbers
-          const allAmts = rest.match(/[\d,]+\.\d{2}/g);
-          if (allAmts && allAmts.length > 0) {
-            // If multiple decimal numbers, take the last one (billed amount)
-            amount = parseFloat(allAmts[allAmts.length - 1].replace(/,/g, ""));
+          // Case 4: Any numbers with decimal point (e.g. "833.25", "12.5")
+          const allDecimals = rest.match(/[\d,]+\.\d+/g);
+          if (allDecimals && allDecimals.length > 0) {
+            // Take the last decimal number (billing amount in table columns)
+            amount = parseFloat(allDecimals[allDecimals.length - 1].replace(/,/g, ""));
           } else {
-            // Case 5: Integer amount at the end of line or before status
-            const intAmts = rest.match(/\b\d{1,7}\b/g);
-            if (intAmts && intAmts.length > 0) {
-              const cand = parseFloat(intAmts[intAmts.length - 1]);
-              if (!isNaN(cand) && cand > 0) amount = cand;
+            // Case 5: Integer amount (e.g. "10000", "100")
+            // Make sure not to pick a 6-digit auth code if an integer amount precedes it
+            const intCandidates = rest.match(/\b\d{1,7}\b/g);
+            if (intCandidates && intCandidates.length > 0) {
+              if (intCandidates.length >= 2 && intCandidates[intCandidates.length - 1].length === 6) {
+                // Last is likely auth code, second to last is amount
+                amount = parseFloat(intCandidates[intCandidates.length - 2]);
+              } else {
+                amount = parseFloat(intCandidates[intCandidates.length - 1]);
+              }
             }
           }
         }
@@ -689,9 +700,12 @@ function parseNBEStatementText(text) {
     // Clean up description: strip amounts, currencies, delimiters, card tokens
     let desc = rest
       .replace(new RegExp("\\b" + amount.toFixed(2) + "\\b", "g"), " ")
-      .replace(/[\d,]+\.\d{2}/g, " ")
-      .replace(/\b(?:EGP|USD|EUR|GBP|SAR|AED|CR)\b/gi, " ")
-      .replace(/[0-9\*]{12,19}/g, " ") // strip card numbers
+      .replace(new RegExp("\\b" + amount + "\\b", "g"), " ")
+      .replace(/[\d,]+\.\d+/g, " ")
+      .replace(/\b(?:EGP|USD|EUR|GBP|SAR|AED|LE|L\.E\.|CR)\b/gi, " ")
+      .replace(/\b\d{4}\s+[\*xX]{4}\s+[\*xX]{4}\s+\d{4}\b/g, " ") // strip spaced card numbers
+      .replace(/\b\d{4}\s*\*{4,}\s*\d{4}\b/g, " ")
+      .replace(/[0-9\*]{12,19}/g, " ")
       .replace(/[\t\|\*]+/g, " ");
 
     if (authCode) {
@@ -718,6 +732,8 @@ function parseNBEStatementText(text) {
   // 3. Mathematical Reconciliation Check
   const sumDebits = transactions.filter(t => t.type === "DEBIT" || t.type === "INSTALLMENT").reduce((s, t) => s + t.amount, 0);
   const sumCredits = transactions.filter(t => t.type === "CREDIT").reduce((s, t) => s + t.amount, 0);
+  meta.sumDebits = sumDebits;
+  meta.sumCredits = sumCredits;
 
   Logger.log(`[Statement Parser] Extracted ${transactions.length} items. Total Debits: ${sumDebits.toFixed(2)} (Stmt Meta: ${meta.totalDebit.toFixed(2)}), Total Credits: ${sumCredits.toFixed(2)} (Stmt Meta: ${meta.totalCredit.toFixed(2)})`);
 
@@ -735,6 +751,28 @@ function checkAndProcessNewStatements() {
     const file = files.next();
     if (file.getMimeType() === MimeType.PDF) {
       pdfFiles.push(file);
+    }
+  }
+
+  // If no PDF found in rootFolder, automatically check processedFolder for the most recent statement
+  let isFromProcessed = false;
+  if (pdfFiles.length === 0) {
+    const procFiles = processedFolder.getFiles();
+    let latestFile = null;
+    let latestTime = 0;
+    while (procFiles.hasNext()) {
+      const f = procFiles.next();
+      if (f.getMimeType() === MimeType.PDF) {
+        const t = f.getLastUpdated().getTime();
+        if (t > latestTime) {
+          latestTime = t;
+          latestFile = f;
+        }
+      }
+    }
+    if (latestFile) {
+      pdfFiles.push(latestFile);
+      isFromProcessed = true;
     }
   }
 
@@ -764,8 +802,10 @@ function checkAndProcessNewStatements() {
       result.lastMeta = parsed.meta;
       result.totalTxCount += parsed.transactions.length;
 
-      // Move file to Processed folder
-      file.moveTo(processedFolder);
+      // Move file to Processed folder if not already there
+      if (!isFromProcessed) {
+        file.moveTo(processedFolder);
+      }
     }
   });
 
