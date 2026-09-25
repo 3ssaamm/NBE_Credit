@@ -600,9 +600,12 @@ function parseNBEStatementText(text) {
     const rawLine = lines[i].trim();
     if (!rawLine) continue;
 
-    // Skip pure page headers, metadata labels, and column header titles
+    // Skip pure page headers, metadata labels, print timestamps, and column header titles
     if (/^Page\s+No\.?\s+\d+/i.test(rawLine)) continue;
-    if (/^(?:Statement\s+Date|Due\s+Date|Opening\s+Balance|Closing\s+Balance|Total\s+(?:of\s+)?(?:Credit|Debit)|Credit\s+Limit)[:\s\t]/i.test(rawLine)) continue;
+    if (/\bas of \d{1,2}:\d{2}(?::\d{2})?\b/i.test(rawLine)) continue;
+    if (/\b(?:printed|generated)\s+(?:on|at)\b/i.test(rawLine)) continue;
+    if (/\b(?:Minimum\s+Payment|Min\.?\s+Payment)\b/i.test(rawLine)) continue;
+    if (/^(?:Statement\s+Date|Due\s+Date|Payment\s+Due\s+Date|Opening\s+Balance|Closing\s+Balance|Total\s+(?:of\s+)?(?:Credit|Debit)|Credit\s+Limit|Available\s+Credit)[:\s\t]/i.test(rawLine)) continue;
     if (/^Transaction\s+Date\s+Posting\s+Date/i.test(rawLine)) continue;
     if (/^National\s+Bank\s+of\s+Egypt\s*$/i.test(rawLine)) continue;
     if (/^Card\s+Number[:\s\t]+[0-9\*]+\s*$/i.test(rawLine)) continue;
@@ -636,6 +639,7 @@ function parseNBEStatementText(text) {
     let instTotal = null;
     let authCode = "";
     let amount = 0;
+    const maxAmountCap = Math.max(meta.creditLimit * 1.5, 200000);
 
     // Check for installment indicator (e.g. "11 OF 12", "09 OF 12", "02/06")
     const mInst = rest.match(/(\d+)\s+(?:OF|\/)\s+(\d+)/i);
@@ -651,33 +655,46 @@ function parseNBEStatementText(text) {
     // Case 1: Foreign currency converted to EGP (e.g. "50.00 USD 2,457.58 EGP")
     const mFx = rest.match(/([\d,]+\.?\d*)\s*(?:USD|EUR|GBP|SAR|AED)\s+([\d,]+\.?\d*)\s*(?:EGP)?/i);
     if (mFx) {
-      amount = parseFloat(mFx[2].replace(/,/g, ""));
+      const parsedFx = parseFloat(mFx[2].replace(/,/g, ""));
+      if (!isNaN(parsedFx) && parsedFx > 0 && parsedFx <= maxAmountCap) {
+        amount = parsedFx;
+      }
     } else {
       // Case 2: Credit with CR or minus (e.g. "10000 CR", "10,000.00 CR", "10,000.00-", "-10,000.00")
       const mCr = rest.match(/([\d,]+\.?\d*)\s*CR\b/i) || rest.match(/([\d,]+\.?\d*)-/) || rest.match(/-([\d,]+\.?\d*)/);
       if (mCr) {
-        amount = parseFloat(mCr[1].replace(/,/g, ""));
+        const parsedCr = parseFloat(mCr[1].replace(/,/g, ""));
+        if (!isNaN(parsedCr) && parsedCr > 0 && parsedCr <= maxAmountCap) {
+          amount = parsedCr;
+        }
       } else {
         // Case 3: EGP or LE explicitly tagged (e.g. "384.00 EGP", "EGP 384.00", "12.5 EGP", "2.90 EGP")
         const mEgp = rest.match(/([\d,]+\.?\d*)\s*(?:EGP|LE|L\.E\.)\b/i) || rest.match(/\b(?:EGP|LE|L\.E\.)\s*([\d,]+\.?\d*)/i);
         if (mEgp) {
-          amount = parseFloat(mEgp[1].replace(/,/g, ""));
+          const parsedEgp = parseFloat(mEgp[1].replace(/,/g, ""));
+          if (!isNaN(parsedEgp) && parsedEgp > 0 && parsedEgp <= maxAmountCap) {
+            amount = parsedEgp;
+          }
         } else {
           // Case 4: Any numbers with decimal point (e.g. "833.25", "12.5")
-          const allDecimals = rest.match(/[\d,]+\.\d+/g);
-          if (allDecimals && allDecimals.length > 0) {
+          const allDecimals = (rest.match(/[\d,]+\.\d+/g) || [])
+            .map(s => parseFloat(s.replace(/,/g, "")))
+            .filter(n => !isNaN(n) && n > 0 && n <= maxAmountCap);
+          if (allDecimals.length > 0) {
             // Take the last decimal number (billing amount in table columns)
-            amount = parseFloat(allDecimals[allDecimals.length - 1].replace(/,/g, ""));
+            amount = allDecimals[allDecimals.length - 1];
           } else {
-            // Case 5: Integer amount (e.g. "10000", "100")
+            // Case 5: Integer amount (e.g. "10000", "100", "16200")
             // Make sure not to pick a 6-digit auth code if an integer amount precedes it
-            const intCandidates = rest.match(/\b\d{1,7}\b/g);
-            if (intCandidates && intCandidates.length > 0) {
-              if (intCandidates.length >= 2 && intCandidates[intCandidates.length - 1].length === 6) {
+            const intCandidates = (rest.match(/\b\d{1,7}\b/g) || [])
+              .map(s => parseFloat(s))
+              .filter(n => !isNaN(n) && n > 0 && n <= maxAmountCap);
+            if (intCandidates.length > 0) {
+              if (intCandidates.length >= 2 && String(intCandidates[intCandidates.length - 1]).length === 6) {
                 // Last is likely auth code, second to last is amount
-                amount = parseFloat(intCandidates[intCandidates.length - 2]);
+                amount = intCandidates[intCandidates.length - 2];
               } else {
-                amount = parseFloat(intCandidates[intCandidates.length - 1]);
+                amount = intCandidates[intCandidates.length - 1];
               }
             }
           }
@@ -697,12 +714,14 @@ function parseNBEStatementText(text) {
       }
     }
 
-    // Clean up description: strip amounts, currencies, delimiters, card tokens
+    // Clean up description: strip amounts, currencies, delimiters, card tokens, reference numbers
     let desc = rest
       .replace(new RegExp("\\b" + amount.toFixed(2) + "\\b", "g"), " ")
       .replace(new RegExp("\\b" + amount + "\\b", "g"), " ")
       .replace(/[\d,]+\.\d+/g, " ")
+      .replace(/\b\d{10,20}\b/g, " ") // strip long reference numbers
       .replace(/\b(?:EGP|USD|EUR|GBP|SAR|AED|LE|L\.E\.|CR)\b/gi, " ")
+      .replace(/\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b\s*[,]?/gi, " ")
       .replace(/\b\d{4}\s+[\*xX]{4}\s+[\*xX]{4}\s+\d{4}\b/g, " ") // strip spaced card numbers
       .replace(/\b\d{4}\s*\*{4,}\s*\d{4}\b/g, " ")
       .replace(/[0-9\*]{12,19}/g, " ")
@@ -711,7 +730,9 @@ function parseNBEStatementText(text) {
     if (authCode) {
       desc = desc.replace(new RegExp("\\b" + authCode + "\\b", "g"), " ");
     }
-    desc = desc.replace(/\s+/g, " ").trim();
+    desc = desc.replace(/\s+/g, " ")
+      .replace(/^[\s,;:\-\|]+/, "")
+      .trim();
     if (!desc) desc = "Bank Statement Charge";
 
     // NO DEDUPLICATION OF DISTINCT DOCUMENT ROWS!
