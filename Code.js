@@ -368,7 +368,7 @@ function updateBankStatementStatusRow(desc, amt, statusText, color) {
       const rDesc = String(rows[i][0] || "").trim();
       const rAmt = parseFloat(rows[i][2]);
       if (Math.abs(rAmt - amt) < 0.05 && (rDesc === desc || rDesc.includes(desc.substring(0, 15)) || desc.includes(rDesc.substring(0, 15)))) {
-        const targetCell = stmtSheet.getRange(7 + i, 8);
+        const targetCell = stmtSheet.getRange(7 + i, 7);
         targetCell.setValue(statusText);
         if (color) targetCell.setBackground(color);
         break;
@@ -708,9 +708,10 @@ function parseNBEStatementText(text) {
       }
     }
 
-    // Case 2: Credit with CR or minus (e.g. "10000 CR", "10,000.00 CR")
+    // Case 2: Credit with explicit CR only (e.g. "10000 CR", "16,200.00 CR")
+    // Do NOT match hyphens in phone numbers ("650-2530000") or store codes ("-02GEGY")!
     if (amount <= 0) {
-      const mCr = rest.match(/([\d,]+(?:\.\d+)?)\s*CR\b/i) || rest.match(/\b([\d,]+(?:\.\d+)?)-/) || rest.match(/(?:^|\s)-([\d,]+(?:\.\d+)?)/);
+      const mCr = rest.match(/([\d,]+(?:\.\d+)?)\s*CR\b/i);
       if (mCr) {
         const parsedCr = parseFloat(mCr[1].replace(/,/g, ""));
         if (!isNaN(parsedCr) && parsedCr > 0 && parsedCr <= maxAmountCap) {
@@ -730,7 +731,7 @@ function parseNBEStatementText(text) {
       }
     }
 
-    // Case 4: Any numbers with decimal point (e.g. "833.25", "12.5")
+    // Case 4: Any numbers with decimal point (e.g. "833.25", "12.5", "104.99")
     if (amount <= 0) {
       const allDecimals = (rest.match(/[\d,]+\.\d+/g) || [])
         .map(s => parseFloat(s.replace(/,/g, "")))
@@ -740,9 +741,13 @@ function parseNBEStatementText(text) {
       }
     }
 
-    // Case 5: Integer amount (e.g. "10000", "100", "16200")
+    // Case 5: Integer amount (e.g. "10000", "100", "150", "8", "75")
     if (amount <= 0) {
-      const intCandidates = (rest.match(/\b\d{1,7}\b/g) || [])
+      const cleanRestForInt = rest
+        .replace(/\b\d{3}[-\s]*\d{7,8}\b/g, " ")
+        .replace(/\b\d{10,20}\b/g, " ");
+
+      const intCandidates = (cleanRestForInt.match(/\b\d{1,7}\b/g) || [])
         .map(s => parseFloat(s))
         .filter(n => !isNaN(n) && n > 0 && n <= maxAmountCap);
       if (intCandidates.length > 0) {
@@ -756,21 +761,13 @@ function parseNBEStatementText(text) {
 
     if (isNaN(amount) || amount <= 0) continue;
 
-    // Auth Code extraction: only search for 5-8 digit integer that is NOT the amount itself
-    const authCandidates = rest.match(/\b\d{5,8}\b/g) || [];
-    for (const cand of authCandidates) {
-      const num = parseFloat(cand);
-      if (num !== amount && cand !== meta.card) {
-        authCode = cand;
-        break;
-      }
-    }
-
     // Clean up description: strip amounts, currencies, delimiters, card tokens, reference numbers
     let desc = rest
       .replace(new RegExp("\\b" + amount.toFixed(2) + "\\b", "g"), " ")
       .replace(new RegExp("\\b" + amount + "\\b", "g"), " ")
       .replace(/[\d,]+\.\d+/g, " ")
+      .replace(/\b\d{3}[-\s]*\d{7,8}\b/g, " ") // strip phone numbers like 650-2530000
+      .replace(/\b\d{5,8}\b/g, " ") // strip 5-8 digit auth/reference codes
       .replace(/\b\d{10,20}\b/g, " ") // strip long reference numbers
       .replace(/\b(?:EGP|USD|EUR|GBP|SAR|AED|LE|L\.E\.|CR)\b/gi, " ")
       .replace(/\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b\s*[,]?/gi, " ")
@@ -779,9 +776,6 @@ function parseNBEStatementText(text) {
       .replace(/[0-9\*]{12,19}/g, " ")
       .replace(/[\t\|\*]+/g, " ");
 
-    if (authCode) {
-      desc = desc.replace(new RegExp("\\b" + authCode + "\\b", "g"), " ");
-    }
     desc = desc.replace(/\s+/g, " ")
       .replace(/^[\s,;:\-\|]+/, "")
       .trim();
@@ -801,7 +795,6 @@ function parseNBEStatementText(text) {
       desc: desc,
       amount: amount,
       type: txType,
-      authCode: authCode,
       instCurrent: instCurrent,
       instTotal: instTotal
     });
@@ -907,7 +900,7 @@ function writeStatementToSheet(ss, meta, transactions) {
   sheet.clear();
 
   // Summary Banner
-  sheet.getRange("A1:H1").merge()
+  sheet.getRange("A1:G1").merge()
     .setValue("NBE Credit Card Statement — " + (meta.statementDate || "Latest"))
     .setFontWeight("bold")
     .setFontSize(14)
@@ -935,7 +928,7 @@ function writeStatementToSheet(ss, meta, transactions) {
 
   // Table Headers
   const startRow = 6;
-  const headers = ["#", "Tx Date", "Posting Date", "Description", "Type", "Amount (EGP)", "Auth Code", "Assigned Payer / Status"];
+  const headers = ["#", "Tx Date", "Posting Date", "Description", "Type", "Amount (EGP)", "Assigned Payer / Status"];
   const headerRange = sheet.getRange(startRow, 1, 1, headers.length);
   headerRange.setValues([headers])
     .setFontWeight("bold")
@@ -955,7 +948,6 @@ function writeStatementToSheet(ss, meta, transactions) {
         t.desc,
         t.type,
         t.amount,
-        t.authCode,
         initStatus
       ];
     });
@@ -1917,19 +1909,19 @@ function runReconciliation(ss, tz) {
     }
   });
 
-  stmtSheet.getRange(6, 8).setValue("Assigned Payer / Status")
+  stmtSheet.getRange(6, 7).setValue("Assigned Payer / Status")
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.HEADER)
     .setBorder(true, true, true, true, false, false);
 
   const statusValues = stmtRowStatus.map(s => [s.text]);
   const statusColors = stmtRowStatus.map(s => [s.color]);
-  const hRange = stmtSheet.getRange(7, 8, stmtData.length, 1);
+  const hRange = stmtSheet.getRange(7, 7, stmtData.length, 1);
   hRange.setValues(statusValues);
   hRange.setBackgrounds(statusColors);
   hRange.setFontWeight("bold");
   hRange.setFontSize(9);
-  stmtSheet.autoResizeColumns(1, 8);
+  stmtSheet.autoResizeColumns(1, 7);
 
   reconSheet.autoResizeColumns(1, 8);
 }
@@ -3104,7 +3096,7 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
 
   if (stmtSheet && stmtSheet.getLastRow() >= 7) {
     const lastR = stmtSheet.getLastRow();
-    const rows = stmtSheet.getRange(7, 1, lastR - 6, 8).getValues();
+    const rows = stmtSheet.getRange(7, 1, lastR - 6, 7).getValues();
     rows.forEach((r, idx) => {
       const type = String(r[4] || "").trim().toUpperCase();
       const amt = parseFloat(r[5]);
@@ -3296,14 +3288,14 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
   const unassignedDebits = [];
   if (stmtSheet && stmtSheet.getLastRow() >= 7) {
     const lastR = stmtSheet.getLastRow();
-    const rows = stmtSheet.getRange(7, 1, lastR - 6, 8).getValues();
+    const rows = stmtSheet.getRange(7, 1, lastR - 6, 7).getValues();
     rows.forEach((r, idx) => {
       const type = String(r[4] || "").trim().toUpperCase();
       const amt = parseFloat(r[5]);
       const desc = String(r[3] || "").trim();
       const rawDate = r[1];
       const pDate = parseDateValue(rawDate, tz);
-      const status = String(r[7] || "").trim();
+      const status = String(r[6] || "").trim();
 
       if (type === "DEBIT" && !isNaN(amt) && amt > 0) {
         // Check if assigned in assignedChargesList
