@@ -67,21 +67,33 @@ function parseDateValue(rawDate, tz) {
   return null;
 }
 
-function getDueDateForPurchase(purchaseDate, tz, statementDate, statementDueDate) {
+function getDueDateForPurchase(purchaseDate, tz, statementDate, statementDueDate, stmtStartDate) {
   if (!purchaseDate || isNaN(purchaseDate.getTime())) return null;
   const targetTz = tz || "Africa/Cairo";
 
-  // If active statement info is available, anchor any in-period transaction directly to statementDueDate
+  // If active statement info is available, anchor strictly within the PDF statement window [stmtStartDate, statementDate]
   if (statementDate && statementDueDate) {
     const sEnd = new Date(statementDate.getFullYear(), statementDate.getMonth(), statementDate.getDate(), 23, 59, 59, 999);
-    // Billing cycle starts the day after previous cutoff (~35 days prior)
-    const sStart = new Date(statementDate.getFullYear(), statementDate.getMonth() - 1, statementDate.getDate() - 2, 0, 0, 0, 0);
+    // STRICT PDF STATEMENT DATES:
+    // If stmtStartDate is known (from PDF earliest transaction date), use it directly!
+    // Never reach back arbitrarily to June 29!
+    const sStart = stmtStartDate
+      ? new Date(stmtStartDate.getFullYear(), stmtStartDate.getMonth(), stmtStartDate.getDate(), 0, 0, 0, 0)
+      : new Date(statementDate.getFullYear(), statementDate.getMonth(), 1, 0, 0, 0, 0);
+
     if (purchaseDate >= sStart && purchaseDate <= sEnd) {
       return statementDueDate;
     }
+
+    // If purchase was made before sStart, it belonged to a prior billing cycle!
+    if (purchaseDate < sStart) {
+      const pMonth = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
+      const pYear = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
+      return new Date(pYear, pMonth + 1, 1);
+    }
   }
 
-  // Standard NBE Consumer Credit Card Billing Cycle:
+  // Standard NBE Consumer Credit Card Billing:
   // Statements close on the last day of each calendar month (e.g. 31 Jan, 28 Feb, 31 Mar, ... 31 Aug).
   // Payment is due on the 25th of the following month (month + 1).
   // All purchases made during month M are billed on month M statement, due in month M + 1.
@@ -186,7 +198,7 @@ function onEdit(e) {
     let assignedMap = {};
     try {
       assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
-    } catch (err) {}
+    } catch (err) { }
 
     if (payer) {
       const isNeglected = (payer === "🚫 Neglect / Ignore" || payer.toLowerCase().includes("neglect"));
@@ -246,7 +258,7 @@ function onEdit(e) {
         const scriptProps = PropertiesService.getScriptProperties();
         const rawJson = scriptProps.getProperty("CONFIRMED_MATCHES") || "[]";
         let setKeys = [];
-        try { setKeys = JSON.parse(rawJson); } catch (err) {}
+        try { setKeys = JSON.parse(rawJson); } catch (err) { }
         if (!setKeys.includes(stKey)) {
           setKeys.push(stKey);
           scriptProps.setProperty("CONFIRMED_MATCHES", JSON.stringify(setKeys));
@@ -285,7 +297,7 @@ function onEdit(e) {
     let neglectedKeys = [];
     try {
       neglectedKeys = JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]");
-    } catch (err) {}
+    } catch (err) { }
 
     if (isChecked) {
       if (!neglectedKeys.includes(txKeyNorm)) neglectedKeys.push(txKeyNorm);
@@ -332,7 +344,7 @@ function updateBankStatementStatusRow(desc, amt, statusText, color) {
         break;
       }
     }
-  } catch (err) {}
+  } catch (err) { }
 }
 
 function setupDailyTrigger() {
@@ -408,6 +420,53 @@ function getOrCreateFolder(parent, name) {
   return parent ? parent.createFolder(name) : DriveApp.createFolder(name);
 }
 
+function getFullDocumentText(doc) {
+  if (!doc) return "";
+  const body = doc.getBody();
+  const numChildren = body.getNumChildren();
+  const lines = [];
+
+  for (let i = 0; i < numChildren; i++) {
+    const child = body.getChild(i);
+    const type = child.getType();
+
+    if (type === DocumentApp.ElementType.PARAGRAPH) {
+      const pText = child.asParagraph().getText().trim();
+      if (pText) lines.push(pText);
+    } else if (type === DocumentApp.ElementType.TABLE) {
+      const table = child.asTable();
+      const numRows = table.getNumRows();
+      for (let r = 0; r < numRows; r++) {
+        const row = table.getRow(r);
+        const numCells = row.getNumCells();
+        const cellTexts = [];
+        for (let c = 0; c < numCells; c++) {
+          const cText = row.getCell(c).getText().trim().replace(/[\r\n]+/g, " ");
+          if (cText) cellTexts.push(cText);
+        }
+        if (cellTexts.length > 0) {
+          // Join cells with tabs so OCR table columns are cleanly separated
+          lines.push(cellTexts.join("\t"));
+        }
+      }
+    } else if (type === DocumentApp.ElementType.LIST_ITEM) {
+      const liText = child.asListItem().getText().trim();
+      if (liText) lines.push(liText);
+    }
+  }
+
+  // Also include headers and footers if present
+  try {
+    const header = doc.getHeader();
+    if (header) {
+      const hText = header.getText().trim();
+      if (hText) lines.unshift(hText);
+    }
+  } catch (e) { }
+
+  return lines.join("\n");
+}
+
 function extractTextFromPDF(file) {
   // Method 1: Drive Advanced Service (if enabled)
   try {
@@ -419,7 +478,7 @@ function extractTextFromPDF(file) {
       const docFile = Drive.Files.insert(resource, file.getBlob(), { ocr: true, ocrLanguage: "en" });
       if (docFile && docFile.id) {
         const doc = DocumentApp.openById(docFile.id);
-        const text = doc.getBody().getText();
+        const text = getFullDocumentText(doc);
         DriveApp.getFileById(docFile.id).setTrashed(true);
         return text;
       }
@@ -470,7 +529,7 @@ function extractTextFromPDF(file) {
   const fileData = JSON.parse(response.getContentText());
   const docId = fileData.id;
   const doc = DocumentApp.openById(docId);
-  const text = doc.getBody().getText();
+  const text = getFullDocumentText(doc);
   DriveApp.getFileById(docId).setTrashed(true); // Delete temporary Google Doc
   return text;
 }
@@ -487,79 +546,159 @@ function parseNBEStatementText(text) {
     statementDate: ""
   };
 
-  const mCard = text.match(/Card Number\s+([0-9\*]+)/);
+  if (!text) return { meta: meta, transactions: [] };
+
+  // 1. Parse Metadata
+  const mCard = text.match(/Card (?:Number|No\.?)[:\s\t]+([0-9\*]+)/i);
   if (mCard) meta.card = mCard[1];
 
-  const mOpenClose = text.match(/Opening Balance\s+([\d,]+\.?\d*)\s+Closing Balance\s+([\d,]+\.?\d*)/);
+  const mOpenClose = text.match(/Opening Balance[:\s\t]+([\d,]+\.?\d*)[\s\S]*?Closing Balance[:\s\t]+([\d,]+\.?\d*)/i);
   if (mOpenClose) {
     meta.openingBalance = parseFloat(mOpenClose[1].replace(/,/g, ""));
     meta.closingBalance = parseFloat(mOpenClose[2].replace(/,/g, ""));
   }
 
-  const mTot = text.match(/Total of Credit\s+([\d,]+\.?\d*)\s+Total of Debit\s+([\d,]+\.?\d*)/);
+  const mTot = text.match(/Total (?:of )?Credit[:\s\t]+([\d,]+\.?\d*)[\s\S]*?Total (?:of )?Debit[:\s\t]+([\d,]+\.?\d*)/i);
   if (mTot) {
     meta.totalCredit = parseFloat(mTot[1].replace(/,/g, ""));
     meta.totalDebit = parseFloat(mTot[2].replace(/,/g, ""));
   }
 
-  const mDueLimit = text.match(/Due Date\s+([0-9]+\s+[A-Za-z]+\s+[0-9]+)\s+Credit Limit\s+([\d,]+\.?\d*)/);
+  const mDueLimit = text.match(/Due Date[:\s\t]+([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})[\s\S]*?Credit Limit[:\s\t]+([\d,]+\.?\d*)/i);
   if (mDueLimit) {
     meta.dueDate = mDueLimit[1].trim();
     meta.creditLimit = parseFloat(mDueLimit[2].replace(/,/g, ""));
   }
 
-  const mStmt = text.match(/Statement Date\s+([0-9]+\s+[A-Za-z]+\s+[0-9]+)/);
+  const mStmt = text.match(/Statement Date[:\s\t]+([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i);
   if (mStmt) {
     meta.statementDate = mStmt[1].trim();
   }
 
-  // Parse transaction items
-  const dateRegexStr = "(?:\\d{1,2}\\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4})";
-  const blockPattern = new RegExp("(" + dateRegexStr + "\\s+" + dateRegexStr + "[\\s\\S]*?)(?=" + dateRegexStr + "\\s+" + dateRegexStr + "|Page\\s+No\\.|\\Z)", "g");
-  
-  const matches = text.match(blockPattern) || [];
+  // 2. Comprehensive Date Pattern:
+  // Supports:
+  // - Full English months: "31 August 2026", "05 July 2024"
+  // - Abbreviated 3-letter months: "31 Aug 2026", "30 Jul 2024", "01 Sep 2026"
+  // - Month names first: "Aug 31, 2026", "July 30, 2024"
+  // - Numeric dates: "31/08/2026", "30-07-2024", "31.08.26"
+  const datePattern = /(?:\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{2,4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{2,4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/gi;
+
+  const lines = text.split(/\r?\n/);
   const transactions = [];
+  const seenLineKeys = new Set();
 
-  matches.forEach(m => {
-    const rawBlock = m.trim().replace(/\n/g, " ");
-    const mDates = rawBlock.match(new RegExp("^(" + dateRegexStr + ")\\s+(" + dateRegexStr + ")\\s+([\\s\\S]+)$"));
-    if (!mDates) return;
+  function processTxCandidate(rawLine) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) return;
 
-    const txDate = mDates[1];
-    const postDate = mDates[2];
-    const body = mDates[3].trim();
+    // Skip known page headers, disclaimers, and metadata lines
+    if (/^(?:Page\s+No|National\s+Bank|Statement\s+Date|Due\s+Date|Transaction\s+Date|Posting\s+Date|Card\s+Number|Opening\s+Balance|Total\s+of|Credit\s+Limit|Closing\s+Balance)/i.test(trimmed)) {
+      return;
+    }
 
-    const amtMatch = body.match(/([\d,]+\.?\d*)\s+EGP\s+([\d,]+\.?\d*)(?:\s+(\d+))?/);
-    if (!amtMatch) return;
+    const dates = trimmed.match(datePattern);
+    if (!dates || dates.length === 0) return;
 
-    const amt = parseFloat(amtMatch[1].replace(/,/g, ""));
-    const authCode = amtMatch[3] || "";
-    const desc = body.substring(0, amtMatch.index).trim();
+    // Date must appear near the beginning of the transaction line
+    const firstDateIdx = trimmed.search(datePattern);
+    if (firstDateIdx > 15) return;
+
+    const txDate = dates[0];
+    const postDate = dates.length > 1 ? dates[1] : txDate;
+
+    // Strip the dates from the transaction line to parse body
+    let rest = trimmed;
+    dates.slice(0, 2).forEach(d => {
+      rest = rest.replace(d, " ");
+    });
 
     let txType = "DEBIT";
     let instCurrent = null;
     let instTotal = null;
+    let authCode = "";
+    let amount = 0;
 
-    const instMatch = desc.match(/(\d+)\s+OF\s+(\d+)/i);
-    if (instMatch) {
+    // Check for installment indicator (e.g. "11 OF 12", "09 OF 12", "02 OF 06")
+    const mInst = rest.match(/(\d+)\s+OF\s+(\d+)/i);
+    if (mInst) {
       txType = "INSTALLMENT";
-      instCurrent = parseInt(instMatch[1], 10);
-      instTotal = parseInt(instMatch[2], 10);
-    } else if (desc.toUpperCase().includes("PAYMENT") || desc.toUpperCase().includes("DIRECT DEBIT")) {
+      instCurrent = parseInt(mInst[1], 10);
+      instTotal = parseInt(mInst[2], 10);
+    } else if (/\b(?:PAYMENT|DIRECT DEBIT|REFUND|CREDIT|DEPOSIT|SETTLEMENT)\b|\bCR\b/i.test(rest)) {
       txType = "CREDIT";
     }
+
+    // Extract auth code (5-8 digits at end or preceded by space/tab)
+    const mAuth = rest.match(/\b(\d{5,8})\b\s*$/);
+    if (mAuth) {
+      authCode = mAuth[1];
+      rest = rest.substring(0, mAuth.index).trim();
+    }
+
+    // Amount extraction:
+    // Case 1: EGP explicitly tagged (e.g. "384.00 EGP" or "EGP 384.00" or "50.00 USD 2,457.58 EGP")
+    const mEgp = rest.match(/([\d,]+\.\d{2})\s*EGP/i) || rest.match(/EGP\s*([\d,]+\.\d{2})/i);
+    if (mEgp) {
+      amount = parseFloat(mEgp[1].replace(/,/g, ""));
+    } else {
+      // Case 2: Scan for all decimal amounts, take the primary transaction amount
+      const allAmts = rest.match(/[\d,]+\.\d{2}/g);
+      if (allAmts && allAmts.length > 0) {
+        amount = parseFloat(allAmts[allAmts.length - 1].replace(/,/g, ""));
+      } else {
+        // Case 3: Integer amount (e.g. "10000 CR" or "5000")
+        const intAmts = rest.match(/\b[\d,]+(?:\.00)?\b/g);
+        if (intAmts && intAmts.length > 0) {
+          const cand = parseFloat(intAmts[intAmts.length - 1].replace(/,/g, ""));
+          if (!isNaN(cand) && cand > 0) amount = cand;
+        }
+      }
+    }
+
+    if (isNaN(amount) || amount <= 0) return;
+
+    // Clean up description: remove numbers, currency codes, delimiters
+    let desc = rest
+      .replace(/[\d,]+\.\d{2}/g, " ")
+      .replace(/\b(?:EGP|USD|EUR|GBP|SAR|AED|CR)\b/gi, " ")
+      .replace(/[\t\|\*]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!desc) desc = "Bank Statement Charge";
+
+    const dedupeKey = `${txDate}_${amount.toFixed(2)}_${desc.substring(0, 25)}`;
+    if (seenLineKeys.has(dedupeKey)) return;
+    seenLineKeys.add(dedupeKey);
 
     transactions.push({
       txDate: txDate,
       postDate: postDate,
       desc: desc,
-      amount: amt,
+      amount: amount,
       type: txType,
       authCode: authCode,
       instCurrent: instCurrent,
       instTotal: instTotal
     });
-  });
+  }
+
+  // Pass A: Line-by-line / Table row scan
+  lines.forEach(l => processTxCandidate(l));
+
+  // Pass B: If line scan yielded very few items, run fallback block pattern
+  if (transactions.length === 0 || (meta.totalDebit > 0 && transactions.filter(t => t.type === "DEBIT" || t.type === "INSTALLMENT").reduce((s, t) => s + t.amount, 0) < meta.totalDebit * 0.5)) {
+    const singleDatePatternStr = "(?:\\d{1,2}\\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{2,4}|\\d{1,2}[\\/\\-\\.]\\d{1,2}[\\/\\-\\.]\\d{2,4})";
+    const blockRegex = new RegExp("(" + singleDatePatternStr + "[\\s\\S]*?)(?=" + singleDatePatternStr + "|Page\\s+No\\.|\\Z)", "gi");
+    const blocks = text.match(blockRegex) || [];
+    blocks.forEach(b => processTxCandidate(b.replace(/[\r\n]+/g, " ")));
+  }
+
+  // 3. Mathematical Reconciliation Check
+  const sumDebits = transactions.filter(t => t.type === "DEBIT" || t.type === "INSTALLMENT").reduce((s, t) => s + t.amount, 0);
+  const sumCredits = transactions.filter(t => t.type === "CREDIT").reduce((s, t) => s + t.amount, 0);
+
+  Logger.log(`[Statement Parser] Extracted ${transactions.length} items. Total Debits: ${sumDebits.toFixed(2)} (Stmt Meta: ${meta.totalDebit.toFixed(2)}), Total Credits: ${sumCredits.toFixed(2)} (Stmt Meta: ${meta.totalCredit.toFixed(2)})`);
 
   return { meta: meta, transactions: transactions };
 }
@@ -924,7 +1063,7 @@ function hasMerchantKeywordOverlap(desc1, desc2) {
   const words1 = c1.match(/[a-z0-9]{4,}/g) || [];
   const words2 = c2.match(/[a-z0-9]{4,}/g) || [];
   return words1.some(w => words2.includes(w) || c2.includes(w)) ||
-         words2.some(w => words1.includes(w) || c1.includes(w));
+    words2.some(w => words1.includes(w) || c1.includes(w));
 }
 
 function isNeglectedPayer(name) {
@@ -1005,7 +1144,7 @@ function getAllUniquePayers(ss) {
         });
       }
     });
-  } catch (e) {}
+  } catch (e) { }
 
   // Also include payers from visible Reconciliation sheet Table 2
   try {
@@ -1033,7 +1172,7 @@ function getAllUniquePayers(ss) {
         }
       }
     }
-  } catch (e) {}
+  } catch (e) { }
 
   const result = Array.from(peopleSet)
     .map(p => normalizePersonName(p))
@@ -1045,51 +1184,27 @@ function getAllUniquePayers(ss) {
 function getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate) {
   if (!stmtDate && !minStmtTxDate) return { start: null, end: null };
 
-  let pEnd = null;
   let pStart = null;
+  let pEnd = null;
 
+  // STRICT RULE: If the bank statement has transactions, the cycle start date IS
+  // the earliest transaction date found in the PDF (e.g. July 30).
+  // "YOU FOLLOW THE DATES IN THE PDF!!"
+  if (minStmtTxDate) {
+    pStart = new Date(minStmtTxDate.getFullYear(), minStmtTxDate.getMonth(), minStmtTxDate.getDate(), 0, 0, 0, 0);
+  } else if (stmtDate) {
+    // Fallback only if statement has no transactions: 1st of statement month
+    pStart = new Date(stmtDate.getFullYear(), stmtDate.getMonth(), 1, 0, 0, 0, 0);
+  }
+
+  // Cycle end date is the statement cutoff date (end of day)
   if (stmtDate) {
     pEnd = new Date(stmtDate.getFullYear(), stmtDate.getMonth(), stmtDate.getDate(), 23, 59, 59, 999);
-
-    const sYear = stmtDate.getFullYear();
-    const sMonth = stmtDate.getMonth(); // 0-indexed (0=Jan)
-    const sDay = stmtDate.getDate();
-
-    // Previous month index and year
-    const prevMonth = sMonth === 0 ? 11 : sMonth - 1;
-    const prevYear = sMonth === 0 ? sYear - 1 : sYear;
-
-    // Number of days in previous month
-    const daysInPrevMonth = new Date(sYear, sMonth, 0).getDate();
-    const prevCutoffDay = Math.min(sDay, daysInPrevMonth);
-
-    // Cycle starts the day after previous cutoff
-    let cycleStartDay = prevCutoffDay + 1;
-    let cycleStartMonth = prevMonth;
-    let cycleStartYear = prevYear;
-
-    if (cycleStartDay > daysInPrevMonth) {
-      cycleStartDay = 1;
-      cycleStartMonth = sMonth;
-      cycleStartYear = sYear;
-    }
-
-    pStart = new Date(cycleStartYear, cycleStartMonth, cycleStartDay, 0, 0, 0, 0);
   }
-
-  // If statement transactions start earlier, expand pStart to encompass them
-  if (minStmtTxDate) {
-    const minDateStart = new Date(minStmtTxDate.getFullYear(), minStmtTxDate.getMonth(), minStmtTxDate.getDate(), 0, 0, 0, 0);
-    if (!pStart || minDateStart < pStart) {
-      pStart = minDateStart;
-    }
-  }
-
-  // If statement transactions end later, expand pEnd to encompass them
   if (maxStmtTxDate) {
-    const maxDateEnd = new Date(maxStmtTxDate.getFullYear(), maxStmtTxDate.getMonth(), maxStmtTxDate.getDate(), 23, 59, 59, 999);
-    if (!pEnd || maxDateEnd > pEnd) {
-      pEnd = maxDateEnd;
+    const maxEnd = new Date(maxStmtTxDate.getFullYear(), maxStmtTxDate.getMonth(), maxStmtTxDate.getDate(), 23, 59, 59, 999);
+    if (!pEnd || maxEnd > pEnd) {
+      pEnd = maxEnd;
     }
   }
 
@@ -1104,7 +1219,7 @@ function runReconciliation(ss, tz) {
   let assignedMap = {};
   try {
     assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
-  } catch (err) {}
+  } catch (err) { }
 
   if (reconSheet.getLastRow() >= 5) {
     const lastR = reconSheet.getLastRow();
@@ -1281,17 +1396,31 @@ function runReconciliation(ss, tz) {
   let confirmedMatchKeys = new Set();
   try {
     confirmedMatchKeys = new Set(JSON.parse(confirmedMatchesJson));
-  } catch (e) {}
+  } catch (e) { }
 
   stmtDebits.forEach(st => {
     const stKey = `${st.dateStr}_${st.amount.toFixed(2)}_${st.desc.substring(0, 20)}`;
     if (confirmedMatchKeys.has(stKey)) {
       st.matched = true;
       st.matchType = "CONFIRMED";
+      // Find matching items in txDebits and mark them matched so they don't appear in Table 3!
+      const singleMatch = txDebits.find(tx => !tx.matched && Math.abs(tx.amount - st.amount) <= 0.05);
+      if (singleMatch) {
+        singleMatch.matched = true;
+        st.matchedItems.push(singleMatch);
+      } else {
+        const combo = findSubsetCombination(txDebits.filter(tx => !tx.matched), st.amount, 6, 0.10);
+        if (combo) {
+          combo.forEach(c => {
+            c.matched = true;
+            st.matchedItems.push(c);
+          });
+        }
+      }
     }
   });
 
-  // Pass 1: 1-to-1 Exact Match (Amount exact, Date within 5 days, Keyword Overlap)
+  // Pass 1: 1-to-1 Exact Match ONLY (Amount exact within 0.05, Date within 3 days, Keyword Overlap)
   stmtDebits.forEach(st => {
     if (st.matched) return;
     const match = txDebits.find(tx => {
@@ -1301,7 +1430,7 @@ function runReconciliation(ss, tz) {
 
       if (st.date) {
         const daysDiff = Math.abs((tx.date.getTime() - st.date.getTime()) / (1000 * 60 * 60 * 24));
-        if (daysDiff > 5) return false;
+        if (daysDiff > 3) return false;
       }
 
       return hasMerchantKeywordOverlap(st.desc, tx.desc);
@@ -1315,38 +1444,8 @@ function runReconciliation(ss, tz) {
     }
   });
 
-// (findSubsetCombination moved to top-level Section 4 for shared use across debits & installments)
-
-  // Pass 2: N-Way Split Matches (2, 3, 4, 5, or 6 people split 1 statement charge)
-  stmtDebits.forEach(st => {
-    if (st.matched) return;
-
-    const candidates = txDebits.filter(tx => {
-      if (tx.matched) return false;
-      if (st.date) {
-        const daysDiff = Math.abs((tx.date.getTime() - st.date.getTime()) / (1000 * 60 * 60 * 24));
-        return daysDiff <= 5;
-      }
-      return true;
-    });
-
-    if (candidates.length < 2) return;
-
-    const combo = findSubsetCombination(candidates, st.amount, 6, 0.10);
-    if (combo) {
-      const keywordMatch = combo.some(item => hasMerchantKeywordOverlap(st.desc, item.desc));
-      if (keywordMatch) {
-        st.matched = true;
-        st.matchType = "SPLIT";
-        combo.forEach(item => {
-          item.matched = true;
-          st.matchedItems.push(item);
-        });
-      }
-    }
-  });
-
-  // Pass 3: Suggested Matches (Needs user confirmation)
+  // Pass 2: SUGGESTED MATCHES (ALL Splits & Approximate Matches MUST BE CONFIRMED BY USER!)
+  // NO AUTO-MATCHING OR AUTO-ASSIGNING ALLOWED!
   const suggestedMatches = [];
 
   stmtDebits.forEach(st => {
@@ -1356,32 +1455,34 @@ function runReconciliation(ss, tz) {
       if (tx.matched) return false;
       if (st.date) {
         const daysDiff = Math.abs((tx.date.getTime() - st.date.getTime()) / (1000 * 60 * 60 * 24));
-        return daysDiff <= 4;
+        return daysDiff <= 5;
       }
       return true;
     });
 
     if (nearby.length === 0) return;
 
-    // Case A: Exact 1-to-1 amount match, but different description or typo
+    // Case A: 1-to-1 exact amount match, but different description / aggregator / typo
     const singleAmtMatch = nearby.find(tx => Math.abs(tx.amount - st.amount) < 0.05);
     if (singleAmtMatch) {
       suggestedMatches.push({
         stmt: st,
         sheetItems: [singleAmtMatch],
-        reason: `Exact amount (${st.amount.toFixed(2)}), dates within 4 days — check shop name`
+        reason: `Exact amount (${st.amount.toFixed(2)} EGP), dates within 5 days — check shop name / aggregator`
       });
       return;
     }
 
-    // Case B: N-way split sum matches (2 to 6 items) without keyword overlap
+    // Case B: N-way split sum matches (2 to 6 items sum to 1 statement charge)
     const combo = findSubsetCombination(nearby, st.amount, 6, 0.10);
     if (combo) {
       const peopleList = combo.map(it => it.person).join(" + ");
+      const keywordOverlap = combo.some(item => hasMerchantKeywordOverlap(st.desc, item.desc));
+      const reasonSuffix = keywordOverlap ? ` (Merchant match: ${st.desc})` : "";
       suggestedMatches.push({
         stmt: st,
         sheetItems: combo,
-        reason: `${combo.length}-way split sum matches ${st.amount.toFixed(2)} (${peopleList})`
+        reason: `${combo.length}-way split sum matches ${st.amount.toFixed(2)} EGP (${peopleList})${reasonSuffix}`
       });
       return;
     }
@@ -1495,7 +1596,7 @@ function runReconciliation(ss, tz) {
     let assignedMap = {};
     try {
       assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
-    } catch (err) {}
+    } catch (err) { }
 
     const missRows = missingInSheet.map((m, idx) => {
       const itemNum = String(idx + 1);
@@ -1572,7 +1673,7 @@ function runReconciliation(ss, tz) {
     let neglectedKeys = [];
     try {
       neglectedKeys = JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]");
-    } catch (e) {}
+    } catch (e) { }
 
     const unmatRows = unmatchedTxDebits.map((tx, idx) => {
       const isNearCutoff = (stmtPeriod.end && Math.abs((stmtPeriod.end.getTime() - tx.date.getTime()) / (1000 * 60 * 60 * 24)) <= 2);
@@ -1663,7 +1764,7 @@ function runReconciliation(ss, tz) {
         const cKey = `${String(st.dateStr)}_${st.amount.toFixed(2)}_${st.desc.substring(0, 30)}`;
         const scriptProps = PropertiesService.getScriptProperties();
         let assignedMap = {};
-        try { assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}"); } catch (e) {}
+        try { assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}"); } catch (e) { }
         if (assignedMap[cKey] && assignedMap[cKey].payer) {
           if (assignedMap[cKey].payer === "NEGLECT") {
             stmtRowStatus[idx] = { text: "🚫 Neglected / Ignored", color: "#eeeeee" };
@@ -1716,6 +1817,8 @@ function calculateCardBalance(ss, tz) {
   let openingBalance = 0;
   let totalDebit = 0;
   let totalCredit = 0;
+  let minStmtTxDate = null;
+  let maxStmtTxDate = null;
 
   // Read latest statement closing balance if available
   const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
@@ -1737,10 +1840,26 @@ function calculateCardBalance(ss, tz) {
     statementDate = parseDateValue(stmtDateVal, tz);
     const dueDateVal = stmtSheet.getRange("D2").getValue();
     statementDueDate = parseDateValue(dueDateVal, tz);
+
+    if (stmtSheet.getLastRow() >= 7) {
+      const lastRow = stmtSheet.getLastRow();
+      const txDates = stmtSheet.getRange(7, 2, lastRow - 6, 2).getValues();
+      txDates.forEach(r => {
+        const d1 = parseDateValue(r[0], tz);
+        const d2 = parseDateValue(r[1], tz);
+        const d = d1 || d2;
+        if (d) {
+          if (!minStmtTxDate || d < minStmtTxDate) minStmtTxDate = d;
+          if (!maxStmtTxDate || d > maxStmtTxDate) maxStmtTxDate = d;
+        }
+      });
+    }
   }
 
+  const stmtPeriod = getStatementPeriod(statementDate, minStmtTxDate, maxStmtTxDate);
+
   if (!statementDueDate && statementDate) {
-    statementDueDate = getDueDateForPurchase(statementDate, tz);
+    statementDueDate = getDueDateForPurchase(statementDate, tz, statementDate, null, stmtPeriod.start);
   }
 
   // Calculate Remaining Installments Principal Blocked
@@ -1796,7 +1915,7 @@ function calculateCardBalance(ss, tz) {
     if (statementDueDate) {
       stmtDueMonthLabel = Utilities.formatDate(statementDueDate, tz, "MMMM yyyy").toLowerCase();
     } else if (statementDate) {
-      const stmtDueDate = getDueDateForPurchase(statementDate, tz);
+      const stmtDueDate = getDueDateForPurchase(statementDate, tz, statementDate, null, stmtPeriod.start);
       if (stmtDueDate) stmtDueMonthLabel = Utilities.formatDate(stmtDueDate, tz, "MMMM yyyy").toLowerCase();
     }
 
@@ -1816,6 +1935,9 @@ function calculateCardBalance(ss, tz) {
     totalCredit: totalCredit,
     statementDate: statementDate,
     statementDueDate: statementDueDate,
+    minStmtTxDate: minStmtTxDate,
+    maxStmtTxDate: maxStmtTxDate,
+    stmtPeriod: stmtPeriod,
     isCurrentBillPaid: isCurrentBillPaid,
     totalBlockedInstallments: totalBlockedInstallments,
     unbilledNewPurchases: unbilledNewPurchases,
@@ -1837,7 +1959,7 @@ function updateLiveDashboard(options) {
   // Permanently delete legacy 'Monthly Debts' sheet if it exists
   const oldDebtsSheet = ss.getSheetByName("Monthly Debts");
   if (oldDebtsSheet) {
-    try { ss.deleteSheet(oldDebtsSheet); } catch (e) {}
+    try { ss.deleteSheet(oldDebtsSheet); } catch (e) { }
   }
 
   if (!transactionsSheet || !installmentsSheet || !historySheet) {
@@ -1946,8 +2068,9 @@ function updateLiveDashboard(options) {
   let neglectedTxKeys = new Set();
   try {
     neglectedTxKeys = new Set(JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]"));
-  } catch (err) {}
+  } catch (err) { }
 
+  const stmtPeriod = cardBal.stmtPeriod || getStatementPeriod(cardBal.statementDate, cardBal.minStmtTxDate, cardBal.maxStmtTxDate);
   const existingTransactionsForDedupe = [];
   if (transactionsSheet.getLastRow() >= 2) {
     const txData = transactionsSheet.getRange(2, 1, transactionsSheet.getLastRow() - 1, 5).getValues();
@@ -1961,6 +2084,18 @@ function updateLiveDashboard(options) {
       const purchaseDate = parseDateValue(rawDate, tz);
       const amount = parseFloat(rawAmount);
       if (!purchaseDate || isNaN(amount) || amount <= 0) return;
+
+      // STRICT PDF STATEMENT PERIOD FILTER:
+      // "YOU FOLLOW THE DATES IN THE PDF!!"
+      // Transactions strictly before stmtPeriod.start (e.g. June 29 when PDF starts July 30)
+      // belong to prior billing cycles and MUST NOT be assigned to the active statement bill!
+      if (stmtPeriod.start && purchaseDate < stmtPeriod.start) {
+        return;
+      }
+      if (stmtPeriod.end && purchaseDate > stmtPeriod.end) {
+        // Purchases strictly after cutoff are unbilled new purchases
+        return;
+      }
 
       // Check if user neglected/excluded this transaction in Reconciliation Table 3
       const dStr = Utilities.formatDate(purchaseDate, tz, "yyyy-MM-dd");
@@ -1979,7 +2114,7 @@ function updateLiveDashboard(options) {
         rawPerson: rawPerson
       });
 
-      const dueDate = getDueDateForPurchase(purchaseDate, tz, cardBal.statementDate, activeStatementDueDate);
+      const dueDate = getDueDateForPurchase(purchaseDate, tz, cardBal.statementDate, activeStatementDueDate, stmtPeriod.start);
       if (!dueDate) return;
 
       const people = splitPayerNames(rawPerson);
@@ -2094,7 +2229,7 @@ function updateLiveDashboard(options) {
     let assignedMap = {};
     try {
       assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
-    } catch (err) {}
+    } catch (err) { }
     Object.keys(assignedMap).forEach(k => {
       const item = assignedMap[k];
       if (item && item.amount > 0 && item.desc && item.payer) {
@@ -2443,7 +2578,7 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
       const existingFilter = sheet.getFilter();
       if (existingFilter) existingFilter.remove();
       sheet.getRange(headerRowForFilter, 1, regRows.length + 1, itemHeaders.length).createFilter();
-    } catch (e) {}
+    } catch (e) { }
 
     curRow += regRows.length + 3;
   } else {
@@ -2786,8 +2921,8 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
       } else {
         const isReflected = debtLineItems.some(it => {
           return it.isMissingFromSheet &&
-                 Math.abs(it.originalAmount - item.amount) < 0.05 &&
-                 payers.includes(it.person);
+            Math.abs(it.originalAmount - item.amount) < 0.05 &&
+            payers.includes(it.person);
         });
         statusText = isReflected ? "✅ Reflected in Debt Breakdown" : "🚨 Missing from Debt Breakdown!";
       }
@@ -2917,8 +3052,8 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
 
   sheet.getRange(curRow, 1, 1, 7).merge()
     .setValue(`Bank Statement Billed EMIs: ${stmtInstallmentsBilledTotal.toFixed(2)} EGP (${stmtInstallmentCount} items) | ` +
-              `Active Sheet Due: ${activeData.installmentsTotal.toFixed(2)} EGP | ` +
-              `Unbilled Sheet Installments (55-Day Policy / Pending): ${unbilledSheetInstallments.length} item(s) | Status: ${instStatusBadge}`)
+      `Active Sheet Due: ${activeData.installmentsTotal.toFixed(2)} EGP | ` +
+      `Unbilled Sheet Installments (55-Day Policy / Pending): ${unbilledSheetInstallments.length} item(s) | Status: ${instStatusBadge}`)
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(Math.abs(instDiff) < 0.50 ? CONFIG.COLORS.PRIMARY : "#b71c1c");
@@ -3035,15 +3170,15 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
         // Check if assigned in assignedChargesList
         const isAssigned = (assignedChargesList || []).some(a => {
           return Math.abs(a.amount - amt) < 0.05 &&
-                 (cleanMerchantName(a.desc).toLowerCase() === cleanMerchantName(desc).toLowerCase() || a.desc.includes(desc.substring(0, 15)));
+            (cleanMerchantName(a.desc).toLowerCase() === cleanMerchantName(desc).toLowerCase() || a.desc.includes(desc.substring(0, 15)));
         });
 
         // Check if matched to a purchase in Transactions
         const isMatched = debtLineItems.some(it => {
           return it.category === "Purchase" &&
-                 it.sortKey === activeSortKey &&
-                 Math.abs(it.originalAmount - amt) < 0.05 &&
-                 hasMerchantKeywordOverlap(desc, it.desc);
+            it.sortKey === activeSortKey &&
+            Math.abs(it.originalAmount - amt) < 0.05 &&
+            hasMerchantKeywordOverlap(desc, it.desc);
         });
 
         if (!isAssigned && !isMatched && !status.includes("Confirmed")) {
@@ -3104,8 +3239,12 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
   // TABLE 5: 📋 PURCHASES IN TRANSACTIONS NOT FOUND ON BANK STATEMENT
   // ==========================================
   const unbilledPurchases = [];
+  const stmtPeriod = cardBal.stmtPeriod || getStatementPeriod(cardBal.statementDate, cardBal.minStmtTxDate, cardBal.maxStmtTxDate);
   (existingTxList || []).forEach(tx => {
-    const dueDate = getDueDateForPurchase(tx.date, tz, cardBal.statementDate, activeStatementDueDate);
+    if (stmtPeriod.start && tx.date < stmtPeriod.start) return;
+    if (stmtPeriod.end && tx.date > stmtPeriod.end) return;
+
+    const dueDate = getDueDateForPurchase(tx.date, tz, cardBal.statementDate, activeStatementDueDate, stmtPeriod.start);
     if (!dueDate) return;
     const sKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
     if (sKey !== activeSortKey) return;
