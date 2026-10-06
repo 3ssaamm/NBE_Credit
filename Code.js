@@ -102,7 +102,20 @@ function getDueDateForPurchase(purchaseDate, tz, statementDate, statementDueDate
   if (!purchaseDate || isNaN(purchaseDate.getTime())) return null;
   const targetTz = tz || "Africa/Cairo";
 
+  const day = parseInt(Utilities.formatDate(purchaseDate, targetTz, "d"), 10);
+  const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
+  const year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
+
+  // Day 31 Rule: In NBE credit card billing, the statement cycle closes on the 30th (or month-end).
+  // A transaction made on the 31st of month M-1 (e.g. August 31st) is part of month M's billing cycle (September),
+  // which is billed at the end of month M and due on month M+1, 25th (October 25th).
+  // Therefore, in Monthly Overview forecasting, any purchase on day 31 rolls over to month + 2 due date!
+  if (day === 31) {
+    return new Date(year, month + 2, 1);
+  }
+
   // If active statement info is available, anchor strictly within the PDF statement window [stmtStartDate, statementDate]
+  // (Excluding day 31, which rolls over to the upcoming cycle)
   if (statementDate && statementDueDate) {
     const sEnd = new Date(statementDate.getFullYear(), statementDate.getMonth(), statementDate.getDate(), 23, 59, 59, 999);
     // STRICT PDF STATEMENT DATES:
@@ -124,12 +137,10 @@ function getDueDateForPurchase(purchaseDate, tz, statementDate, statementDueDate
     }
   }
 
-  // Standard NBE Consumer Credit Card Billing:
-  // Statements close on the last day of each calendar month (e.g. 31 Jan, 28 Feb, 31 Mar, ... 31 Aug).
+  // Standard NBE Consumer Credit Card Billing for days 1-30:
+  // Statements close on the 30th of each calendar month.
   // Payment is due on the 25th of the following month (month + 1).
-  // All purchases made during month M are billed on month M statement, due in month M + 1.
-  const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
-  const year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
+  // All purchases made during month M (days 1-30) are billed on month M statement, due in month M + 1.
   return new Date(year, month + 1, 1);
 }
 
@@ -2039,7 +2050,11 @@ function calculateCardBalance(ss, tz) {
       const pDate = parseDateValue(row[1], tz);
       const amt = parseFloat(row[4]);
       if (pDate && !isNaN(amt) && amt > 0) {
-        if (stmtCutoff && pDate > stmtCutoff) {
+        const pDay = parseInt(Utilities.formatDate(pDate, tz, "d"), 10);
+        // Include purchases strictly after statement cutoff, OR on day 31 of statement month (start of next billing cycle)
+        const isUpcomingCycle = (stmtCutoff && pDate > stmtCutoff) ||
+          (pDay === 31 && stmtCutoff && pDate.getMonth() === stmtCutoff.getMonth() && pDate.getFullYear() === stmtCutoff.getFullYear());
+        if (isUpcomingCycle) {
           unbilledNewPurchases += amt;
         }
       }
@@ -2247,9 +2262,17 @@ function updateLiveDashboard(options) {
         return;
       }
 
+      // Calculate Due Date:
+      // Purchases within statement window get activeStatementDueDate.
+      // Day 31 and post-cutoff purchases roll over to upcoming billing cycles!
+      const dueDate = getDueDateForPurchase(purchaseDate, tz, cardBal.statementDate, activeStatementDueDate, stmtPeriod.start);
+      if (!dueDate) return;
+
+      const dueSortKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
+
       // Deduplication list for active statement audit against statement debits:
-      // Only include purchases that fall strictly within the active statement window [stmtPeriod.start, stmtPeriod.end]
-      if (!stmtPeriod.end || purchaseDate <= stmtPeriod.end) {
+      // Only include purchases that strictly belong to the active statement cycle (not upcoming cycles)
+      if (dueSortKey === activeStatementSortKey && (!stmtPeriod.end || purchaseDate <= stmtPeriod.end)) {
         existingTransactionsForDedupe.push({
           date: purchaseDate,
           rawDate: rawDate,
@@ -2258,12 +2281,6 @@ function updateLiveDashboard(options) {
           rawPerson: rawPerson
         });
       }
-
-      // Calculate Due Date:
-      // Purchases within statement window get activeStatementDueDate.
-      // Purchases after cutoff (unbilled new purchases) get month + 1 due date for upcoming cycles!
-      const dueDate = getDueDateForPurchase(purchaseDate, tz, cardBal.statementDate, activeStatementDueDate, stmtPeriod.start);
-      if (!dueDate) return;
 
       const people = splitPayerNames(rawPerson);
       if (people.length === 0) return;
