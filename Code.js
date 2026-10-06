@@ -74,10 +74,25 @@ function safeSetScriptProperty(key, val) {
 
 function parseDateValue(rawDate, tz) {
   if (!rawDate) return null;
-  if (rawDate instanceof Date && !isNaN(rawDate.getTime())) return rawDate;
+  if (rawDate instanceof Date && !isNaN(rawDate.getTime())) {
+    let y = rawDate.getFullYear();
+    let m = rawDate.getMonth();
+    let d = rawDate.getDate();
+    if (rawDate.getUTCDate() === 31 && d !== 31) {
+      d = 31;
+      m = rawDate.getUTCMonth();
+      y = rawDate.getUTCFullYear();
+    }
+    return new Date(y, m, d, 12, 0, 0);
+  }
   if (typeof rawDate === "number" && rawDate > 30000) {
     const d = new Date(Math.round((rawDate - 25569) * 86400 * 1000));
-    if (!isNaN(d.getTime())) return d;
+    if (!isNaN(d.getTime())) {
+      let y = d.getUTCFullYear();
+      let m = d.getUTCMonth();
+      let day = d.getUTCDate();
+      return new Date(y, m, day, 12, 0, 0);
+    }
   }
   const s = String(rawDate).trim();
   if (!s) return null;
@@ -85,7 +100,7 @@ function parseDateValue(rawDate, tz) {
   // Try YYYY-MM-DD
   const iso = s.match(/^(\d{4})[-\/\.](\d{1,2})[-\/\.](\d{1,2})/);
   if (iso) {
-    const d = new Date(parseInt(iso[1], 10), parseInt(iso[2], 10) - 1, parseInt(iso[3], 10));
+    const d = new Date(parseInt(iso[1], 10), parseInt(iso[2], 10) - 1, parseInt(iso[3], 10), 12, 0, 0);
     if (!isNaN(d.getTime())) return d;
   }
 
@@ -106,7 +121,7 @@ function parseDateValue(rawDate, tz) {
       day = p1;
       month = p2 - 1;
     }
-    const d = new Date(y, month, day);
+    const d = new Date(y, month, day, 12, 0, 0);
     if (!isNaN(d.getTime())) return d;
   }
 
@@ -118,17 +133,27 @@ function parseDateValue(rawDate, tz) {
   };
   const named1 = s.match(/^(\d{1,2})(?:st|nd|rd|th)?[\s\-\/\.]+([a-zA-Z]+)[\s\-\/\.]+(\d{4})/i);
   if (named1 && monthMap[named1[2].toLowerCase()] !== undefined) {
-    const d = new Date(parseInt(named1[3], 10), monthMap[named1[2].toLowerCase()], parseInt(named1[1], 10));
+    const d = new Date(parseInt(named1[3], 10), monthMap[named1[2].toLowerCase()], parseInt(named1[1], 10), 12, 0, 0);
     if (!isNaN(d.getTime())) return d;
   }
   const named2 = s.match(/^([a-zA-Z]+)[\s\-\/\.]+(\d{1,2})(?:st|nd|rd|th)?,?[\s\-\/\.]+(\d{4})/i);
   if (named2 && monthMap[named2[1].toLowerCase()] !== undefined) {
-    const d = new Date(parseInt(named2[3], 10), monthMap[named2[1].toLowerCase()], parseInt(named2[2], 10));
+    const d = new Date(parseInt(named2[3], 10), monthMap[named2[1].toLowerCase()], parseInt(named2[2], 10), 12, 0, 0);
     if (!isNaN(d.getTime())) return d;
   }
 
   const d = new Date(s);
-  if (!isNaN(d.getTime())) return d;
+  if (!isNaN(d.getTime())) {
+    let y = d.getFullYear();
+    let m = d.getMonth();
+    let day = d.getDate();
+    if (d.getUTCDate() === 31 && day !== 31) {
+      day = 31;
+      m = d.getUTCMonth();
+      y = d.getUTCFullYear();
+    }
+    return new Date(y, m, day, 12, 0, 0);
+  }
   return null;
 }
 
@@ -144,9 +169,21 @@ function getBillingCycleForPurchase(purchaseDate, tz) {
   if (!purchaseDate || isNaN(purchaseDate.getTime())) return null;
   const targetTz = tz || "Africa/Cairo";
 
-  const day = parseInt(Utilities.formatDate(purchaseDate, targetTz, "d"), 10);
-  const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1; // 0-11
-  const year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
+  let day = parseInt(Utilities.formatDate(purchaseDate, targetTz, "d"), 10);
+  let month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1; // 0-11
+  let year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
+
+  // Timezone safeguard: if date object is on the 31st locally or in UTC, ensure day is 31
+  if (purchaseDate.getDate() === 31 || purchaseDate.getUTCDate() === 31) {
+    day = 31;
+    if (purchaseDate.getDate() === 31) {
+      month = purchaseDate.getMonth();
+      year = purchaseDate.getFullYear();
+    } else {
+      month = purchaseDate.getUTCMonth();
+      year = purchaseDate.getUTCFullYear();
+    }
+  }
 
   let cycleYear = year;
   let cycleMonth = month; // 0-11
@@ -167,9 +204,9 @@ function getBillingCycleForPurchase(purchaseDate, tz) {
     dueMonth = 0;
     dueYear++;
   }
-  const dueDate = new Date(dueYear, dueMonth, 25);
+  const dueDate = new Date(dueYear, dueMonth, 25, 12, 0, 0);
   // Months are keyed & labeled by PAYMENT DUE month (e.g. Aug 31 purchase -> "October 2026", due Oct 25)
-  const cycleDate = new Date(dueYear, dueMonth, 1);
+  const cycleDate = new Date(dueYear, dueMonth, 1, 12, 0, 0);
 
   const cycleSortKey = Utilities.formatDate(cycleDate, targetTz, "yyyy-MM");
   const cycleLabel = Utilities.formatDate(cycleDate, targetTz, "MMMM yyyy");
@@ -212,8 +249,8 @@ function getBillingCycleForInstallment(purchaseDate, installmentIndex, tz) {
   }
 
   // Keyed & labeled by PAYMENT DUE month
-  const cycleDate = new Date(dueYear, dueMonth, 1);
-  const dueDate = new Date(dueYear, dueMonth, 25);
+  const cycleDate = new Date(dueYear, dueMonth, 1, 12, 0, 0);
+  const dueDate = new Date(dueYear, dueMonth, 25, 12, 0, 0);
 
   const cycleSortKey = Utilities.formatDate(cycleDate, targetTz, "yyyy-MM");
   const cycleLabel = Utilities.formatDate(cycleDate, targetTz, "MMMM yyyy");
@@ -2409,12 +2446,14 @@ function updateLiveDashboard(options) {
           }));
         }
         if (isForecast) {
-          addForecastItem(Object.assign({}, base, {
+          const fItem = Object.assign({}, base, {
             cycleSortKey: cycleInfo.cycleSortKey,
             cycleLabel: cycleInfo.cycleLabel,
             dueDate: cycleInfo.dueDate,
             dueDateLabel: cycleInfo.dueDateLabel
-          }));
+          });
+          addForecastItem(fItem);
+          addDebtItem(fItem);
         }
       });
     });
@@ -3037,9 +3076,10 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
   });
 
   upcomingKeys.forEach(k => {
+    const src = upcomingSource[k] || allDebts[k] || {};
     matrixCols.push({
       key: k,
-      header: (allDebts[k].label || k) + " (Forecast)",
+      header: (src.label || k) + " (Forecast)",
       type: "upcoming"
     });
   });
@@ -3072,7 +3112,10 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     if (idx === 0) return "TOTAL MONTH BILL (EGP)";
     if (c.type === "hist") return HISTORICAL_MONTHS[c.key].totalBill;
     if (c.type === "active") return activeData.total || (HISTORICAL_MONTHS[c.key] ? HISTORICAL_MONTHS[c.key].totalBill : 0);
-    if (c.type === "upcoming") return (upcomingSource[c.key] ? upcomingSource[c.key].total : 0);
+    if (c.type === "upcoming") {
+      const src = upcomingSource[c.key] || allDebts[c.key];
+      return src ? src.total : 0;
+    }
     return 0;
   });
   sheet.getRange(curRow, 1, 1, matrixCols.length).setValues([totalBillRow])
@@ -3114,7 +3157,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
         const bk = activeData.peopleBreakdown[person];
         val = bk ? bk.total : (activeData.people[person] || (HISTORICAL_MONTHS[col.key] && HISTORICAL_MONTHS[col.key].people[person] ? HISTORICAL_MONTHS[col.key].people[person] : 0));
       } else if (col.type === "upcoming") {
-        const mD = upcomingSource[col.key];
+        const mD = upcomingSource[col.key] || allDebts[col.key];
         if (mD) {
           const bk = mD.peopleBreakdown[person];
           val = bk ? bk.total : (mD.people[person] || 0);
@@ -3159,7 +3202,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     curRow += 3;
   } else {
     upcomingKeys.forEach(mKey => {
-      const mData = upcomingSource[mKey];
+      const mData = upcomingSource[mKey] || allDebts[mKey] || { total: 0, purchasesTotal: 0, installmentsTotal: 0, peopleBreakdown: {} };
       const mLabel = mData.label || mKey;
       const mDueDateStr = mData.dueDateLabel || (mData.dueDate ? Utilities.formatDate(mData.dueDate, tz, "MMMM d, yyyy") : "25th");
 
