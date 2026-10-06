@@ -72,6 +72,17 @@ function safeSetScriptProperty(key, val) {
 }
 
 
+function getColumnLetter(colIndex) {
+  let letter = "";
+  let temp = colIndex;
+  while (temp > 0) {
+    const rem = (temp - 1) % 26;
+    letter = String.fromCharCode(65 + rem) + letter;
+    temp = Math.floor((temp - 1) / 26);
+  }
+  return letter;
+}
+
 function parseDateValue(rawDate, tz) {
   if (!rawDate) return null;
   const targetTz = tz || "Africa/Cairo";
@@ -1189,10 +1200,14 @@ function writeStatementToSheet(ss, meta, transactions) {
     .setBackground(CONFIG.COLORS.PRIMARY)
     .setFontColor("#ffffff");
 
+  const totalDebitFormula = transactions.length > 0 ? "=SUMIF(E7:E, \"<>CREDIT\", F7:F)" : (meta.totalDebit || 0);
+  const totalCreditFormula = transactions.length > 0 ? "=SUMIF(E7:E, \"CREDIT\", F7:F)" : (meta.totalCredit || 0);
+  const netCalculatedFormula = transactions.length > 0 ? "=B3+F3-B4" : "";
+
   const metaRows = [
     ["Statement Date:", meta.statementDate, "Due Date:", meta.dueDate, "Credit Limit:", meta.creditLimit],
-    ["Opening Balance:", meta.openingBalance, "Closing Balance:", meta.closingBalance, "Total Debit:", meta.totalDebit],
-    ["Total Credit:", meta.totalCredit, "Card Number:", meta.card, "", ""]
+    ["Opening Balance:", meta.openingBalance, "Closing Balance:", meta.closingBalance, "Total Debit:", totalDebitFormula],
+    ["Total Credit:", totalCreditFormula, "Card Number:", meta.card, "Net Calculated Balance:", netCalculatedFormula]
   ];
 
   const metaRange = sheet.getRange(2, 1, metaRows.length, 6);
@@ -2971,18 +2986,23 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     return bk && bk.total > 0;
   });
 
-  const sumRows = activePeople.map(p => {
+  const table1StartRow = curRow;
+  const activeTotalRowIndex = curRow + activePeople.length;
+
+  const sumRows = activePeople.map((p, idx) => {
     const bk = activeData.peopleBreakdown[p] || { purchases: 0, installments: 0, missingFromSheet: 0, total: 0 };
-    const pct = bankBill > 0 ? (bk.total / bankBill) : (activeData.total > 0 ? bk.total / activeData.total : 0);
-    const pStatus = isCurrentPaid ? "✅ Paid" : "🕒 Pending Payment";
+    const curPersonRow = table1StartRow + idx;
+    const totalShareFormula = `=SUM(B${curPersonRow}:D${curPersonRow})`;
+    const pctFormula = `=IF($D$5>0, E${curPersonRow}/$D$5, IF($E$${activeTotalRowIndex}>0, E${curPersonRow}/$E$${activeTotalRowIndex}, 0))`;
+    const pStatusFormula = `=IF(ISNUMBER(MATCH("${activeMonthLabel}", 'Payment History'!$A:$A, 0)), "✅ Paid", "🕒 Pending Payment")`;
     return [
       p,
       bk.purchases,
       bk.installments,
       bk.missingFromSheet,
-      bk.total,
-      pct,
-      pStatus
+      totalShareFormula,
+      pctFormula,
+      pStatusFormula
     ];
   });
 
@@ -3002,16 +3022,15 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     curRow += sumRows.length;
   }
 
-  // Total Row for Active Bill
-  const totalPct = bankBill > 0 ? (activeData.total / bankBill) : 1.00;
+  // Total Row for Active Bill (Pure Native Reactive Formulas)
   const activeTotalRow = [
     "TOTAL ACTIVE STATEMENT BILL",
-    activeData.purchasesTotal,
-    activeData.installmentsTotal,
-    activeData.missingFromSheetTotal,
-    activeData.total,
-    totalPct,
-    isCurrentPaid ? "✅ Settled with NBE" : "⚠️ Must Pay NBE"
+    sumRows.length > 0 ? `=SUM(B${table1StartRow}:B${activeTotalRowIndex - 1})` : activeData.purchasesTotal,
+    sumRows.length > 0 ? `=SUM(C${table1StartRow}:C${activeTotalRowIndex - 1})` : activeData.installmentsTotal,
+    sumRows.length > 0 ? `=SUM(D${table1StartRow}:D${activeTotalRowIndex - 1})` : activeData.missingFromSheetTotal,
+    sumRows.length > 0 ? `=SUM(E${table1StartRow}:E${activeTotalRowIndex - 1})` : activeData.total,
+    `=IF($D$5>0, E${activeTotalRowIndex}/$D$5, 1.0)`,
+    `=IF(ISNUMBER(MATCH("${activeMonthLabel}", 'Payment History'!$A:$A, 0)), "✅ Settled with NBE", "⚠️ Must Pay NBE")`
   ];
 
   sheet.getRange(curRow, 1, 1, summaryHeaders.length).setValues([activeTotalRow])
@@ -3020,6 +3039,18 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     .setBorder(true, true, true, true, true, true);
   sheet.getRange(curRow, 2, 1, 4).setNumberFormat("#,##0.00");
   sheet.getRange(curRow, 6, 1, 1).setNumberFormat("0.0%");
+
+  // Bind Overview KPI Card to Table 1 Total Cell Reactively!
+  if (sumRows.length > 0) {
+    try {
+      sheet.getRange(6, 4).setValue(`=E${activeTotalRowIndex}`);
+      sheet.getRange(6, 6).setValue("=D6-D5");
+      sheet.getRange(7, 4).setValue(`=B${activeTotalRowIndex}`);
+      sheet.getRange(7, 6).setValue(`=C${activeTotalRowIndex}`);
+      sheet.getRange(5, 6).setValue(`=IF(ABS(F6)<1.0, "✅ Perfect Match (0.00 EGP difference)", IF(F6>0, "ℹ️ Family debts exceed bank bill by +" & TEXT(F6, "#,##0.00") & " EGP", "⚠️ Bank bill exceeds recorded shares by -" & TEXT(ABS(F6), "#,##0.00") & " EGP"))`);
+    } catch (kpiBindErr) { }
+  }
+
   curRow += 3;
 
   // ==========================================
@@ -3362,60 +3393,55 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     .setBorder(true, true, true, true, true, true);
   curRow++;
 
-  // Row 1: TOTAL MONTH BILL
-  const totalBillRow = matrixCols.map((c, idx) => {
-    if (idx === 0) return "TOTAL MONTH BILL (EGP)";
-    if (c.type === "hist") return HISTORICAL_MONTHS[c.key].totalBill;
-    if (c.type === "active") return activeData.total || (HISTORICAL_MONTHS[c.key] ? HISTORICAL_MONTHS[c.key].totalBill : 0);
-    if (c.type === "upcoming") {
-      const src = upcomingSource[c.key] || allDebts[c.key];
-      return src ? src.total : 0;
-    }
-    return 0;
-  });
-  sheet.getRange(curRow, 1, 1, matrixCols.length).setValues([totalBillRow])
-    .setFontWeight("bold")
-    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
-    .setBorder(true, true, true, true, true, true);
-  sheet.getRange(curRow, 2, 1, matrixCols.length - 1).setNumberFormat("#,##0.00");
+  const totalBillRowIndex = curRow;
   curRow++;
 
-  // Row 2: Status
+  const statusRowIndex = curRow;
+  curRow++;
+
+  const personStartRow = curRow;
+  const personEndRow = personStartRow + sortedPeople.length - 1;
+
+  // Row 1: TOTAL MONTH BILL (Live SUM formula over all person rows!)
+  const totalBillRow = matrixCols.map((c, idx) => {
+    if (idx === 0) return "TOTAL MONTH BILL (EGP)";
+    const colLetter = getColumnLetter(idx + 1);
+    return `=SUM(${colLetter}${personStartRow}:${colLetter}${personEndRow})`;
+  });
+
+  // Row 2: Status (Dynamic MATCH against Payment History for active statement)
   const statusRow = matrixCols.map((c, idx) => {
     if (idx === 0) return "Cycle Status";
     if (c.type === "hist") return "✅ Settled";
-    if (c.type === "active") return (paidMonthsSet.has(activeMonthLabel.toLowerCase()) ? "✅ Settled" : "💳 Active Statement");
+    if (c.type === "active") {
+      return `=IF(ISNUMBER(MATCH("${activeMonthLabel}", 'Payment History'!$A:$A, 0)), "✅ Settled", "💳 Active Statement")`;
+    }
     if (c.type === "upcoming") return "🕒 Forecast";
     return "";
   });
-  sheet.getRange(curRow, 1, 1, matrixCols.length).setValues([statusRow])
-    .setFontWeight("bold")
-    .setFontSize(9)
-    .setBorder(true, true, true, true, true, true);
-  for (let cIdx = 1; cIdx < matrixCols.length; cIdx++) {
-    const colType = matrixCols[cIdx].type;
-    const bg = colType === "hist" ? CONFIG.COLORS.PAID : (colType === "active" ? CONFIG.COLORS.DUE_SOON : CONFIG.COLORS.UPCOMING);
-    sheet.getRange(curRow, cIdx + 1).setBackground(bg);
-  }
-  curRow++;
 
-  // Person Rows
+  // Person Rows with native declarative formulas for active and upcoming columns!
   const matrixPersonRows = [];
-  sortedPeople.forEach(person => {
+  sortedPeople.forEach((person, pIdx) => {
+    const curPersonRow = personStartRow + pIdx;
     const pRow = [person];
     for (let cIdx = 1; cIdx < matrixCols.length; cIdx++) {
       const col = matrixCols[cIdx];
       let val = 0;
       if (col.type === "hist") {
-        val = HISTORICAL_MONTHS[col.key].people[person] || 0;
+        val = HISTORICAL_MONTHS[col.key]?.people[person] || 0;
       } else if (col.type === "active") {
-        const bk = activeData.peopleBreakdown[person];
-        val = bk ? bk.total : (activeData.people[person] || (HISTORICAL_MONTHS[col.key] && HISTORICAL_MONTHS[col.key].people[person] ? HISTORICAL_MONTHS[col.key].people[person] : 0));
+        val = `=IFERROR(VLOOKUP($A${curPersonRow}, 'Debt Breakdown'!$A:$E, 5, FALSE), 0)`;
       } else if (col.type === "upcoming") {
         const mD = upcomingSource[col.key] || allDebts[col.key];
-        if (mD) {
-          const bk = mD.peopleBreakdown[person];
-          val = bk ? bk.total : (mD.people[person] || 0);
+        const pInstallment = (mD && mD.peopleBreakdown && mD.peopleBreakdown[person]) ? (mD.peopleBreakdown[person].installments || 0) : 0;
+        const [uY, uM] = col.key.split("-").map(Number);
+        const win = getPurchaseDateWindow(uY, uM);
+        const sumifsPart = `SUMIFS('Transactions'!$E:$E, 'Transactions'!$D:$D, $A${curPersonRow}, 'Transactions'!$B:$B, ">="&DATE(${win.startYear},${win.startMonth},${win.startDay}), 'Transactions'!$B:$B, "<="&DATE(${win.endYear},${win.endMonth},${win.endDay}))`;
+        if (pInstallment > 0) {
+          val = `=${sumifsPart} + ${pInstallment.toFixed(2)}`;
+        } else {
+          val = `=${sumifsPart}`;
         }
       }
       pRow.push(val);
@@ -3423,13 +3449,29 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     matrixPersonRows.push(pRow);
   });
 
-  if (matrixPersonRows.length > 0) {
-    sheet.getRange(curRow, 1, matrixPersonRows.length, matrixCols.length).setValues(matrixPersonRows);
-    sheet.getRange(curRow, 1, matrixPersonRows.length, 1).setFontWeight("bold");
-    sheet.getRange(curRow, 2, matrixPersonRows.length, matrixCols.length - 1).setNumberFormat("#,##0.00");
-    sheet.getRange(curRow, 1, matrixPersonRows.length, matrixCols.length).setBorder(true, true, true, true, true, true);
-    curRow += matrixPersonRows.length + 3;
+  sheet.getRange(totalBillRowIndex, 1, 1, matrixCols.length).setValues([totalBillRow])
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
+    .setBorder(true, true, true, true, true, true);
+  sheet.getRange(totalBillRowIndex, 2, 1, matrixCols.length - 1).setNumberFormat("#,##0.00");
+
+  sheet.getRange(statusRowIndex, 1, 1, matrixCols.length).setValues([statusRow])
+    .setFontWeight("bold")
+    .setFontSize(9)
+    .setBorder(true, true, true, true, true, true);
+  for (let cIdx = 1; cIdx < matrixCols.length; cIdx++) {
+    const colType = matrixCols[cIdx].type;
+    const bg = colType === "hist" ? CONFIG.COLORS.PAID : (colType === "active" ? CONFIG.COLORS.DUE_SOON : CONFIG.COLORS.UPCOMING);
+    sheet.getRange(statusRowIndex, cIdx + 1).setBackground(bg);
   }
+
+  if (matrixPersonRows.length > 0) {
+    sheet.getRange(personStartRow, 1, matrixPersonRows.length, matrixCols.length).setValues(matrixPersonRows);
+    sheet.getRange(personStartRow, 1, matrixPersonRows.length, 1).setFontWeight("bold");
+    sheet.getRange(personStartRow, 2, matrixPersonRows.length, matrixCols.length - 1).setNumberFormat("#,##0.00");
+    sheet.getRange(personStartRow, 1, matrixPersonRows.length, matrixCols.length).setBorder(true, true, true, true, true, true);
+  }
+  curRow = personEndRow + 4;
 
   // ==========================================
   // SECTION 2: 🕒 UPCOMING BILLING CYCLES (Forecasted from Transactions & Installments)
@@ -3567,9 +3609,12 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     curRow++;
 
     const hPeople = Object.keys(hist.people).sort();
-    const hRows = hPeople.map(p => {
+    const hStartRow = curRow;
+    const hTotalRowIndex = curRow + hPeople.length;
+    const hRows = hPeople.map((p, idx) => {
       const amt = hist.people[p];
-      const pct = hist.totalBill > 0 ? (amt / hist.totalBill) : 0;
+      const hCurRow = hStartRow + idx;
+      const pct = `=IF($B$${hTotalRowIndex}>0, B${hCurRow}/$B$${hTotalRowIndex}, 0)`;
       return [p, amt, pct, "✅ Paid"];
     });
 
@@ -3584,7 +3629,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     }
 
     // Total Row
-    const hTotalRow = ["TOTAL BILL (" + hist.label + ")", hist.totalBill, 1.00, "✅ Settled with NBE"];
+    const hTotalRow = ["TOTAL BILL (" + hist.label + ")", `=SUM(B${hStartRow}:B${curRow - 1})`, 1.00, "✅ Settled with NBE"];
     sheet.getRange(curRow, 1, 1, histHeaders.length).setValues([hTotalRow])
       .setFontWeight("bold")
       .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
@@ -3683,8 +3728,8 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
   }
 
   const kpiData = [
-    ["🏦 Bank Closing Balance (Must Pay):", bankBill, "👥 Total Family Shares in Debt Breakdown:", familyTotal, "⚖️ Net Discrepancy:", netDiff, "Status:", statusBadge],
-    ["🛒 Purchases Total (Sheet):", activeData.purchasesTotal, "📦 Installments Total (Sheet):", activeData.installmentsTotal, "⚠️ Missing Assigned (Recon Table 2):", activeData.missingFromSheetTotal, "🚫 Neglected Debits (Table 2):", neglectedDebitsTotal],
+    ["🏦 Bank Closing Balance (Must Pay):", bankBill, "👥 Total Family Shares in Debt Breakdown:", "='Debt Breakdown'!D6", "⚖️ Net Discrepancy:", "=D5-B5", "Status:", `=IF(ABS(F5)<0.05, "✅ Perfect Match (0.00 EGP difference)", IF(F5>0, "⚠️ Family Shares Exceed Bank Bill by +" & TEXT(F5, "#,##0.00") & " EGP", "🚨 Bank Bill Exceeds Shares by -" & TEXT(ABS(F5), "#,##0.00") & " EGP (Missing Items!)"))`],
+    ["🛒 Purchases Total (Sheet):", "='Debt Breakdown'!D7", "📦 Installments Total (Sheet):", "='Debt Breakdown'!F7", "⚠️ Missing Assigned (Recon Table 2):", activeData.missingFromSheetTotal, "🚫 Neglected Debits (Table 2):", neglectedDebitsTotal],
     ["💳 Statement Total Debits:", cardBal.totalDebit || 0, "💰 Statement Credits / Payments:", cardBal.totalCredit || 0, "Available Balance Now:", cardBal.availableBalanceNow, "Available Post-Settlement:", cardBal.availableAfterSettlement]
   ];
 
@@ -3730,6 +3775,7 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
   sheet.getRange(curRow, 1, 1, t1Headers.length).setValues([t1Headers]).setFontWeight("bold").setBackground(CONFIG.COLORS.HEADER).setBorder(true, true, true, true, true, true);
   curRow++;
 
+  const t1StartRow = curRow;
   const personComparisonRows = [];
   const personRowColors = [];
 
@@ -3755,7 +3801,10 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
     return (bk.purchases > 0 || bk.installments > 0 || pReconAssigned > 0 || bk.total > 0);
   });
 
-  auditPeople.forEach(p => {
+  const t1TotalRowIndex = t1StartRow + auditPeople.length;
+
+  auditPeople.forEach((p, idx) => {
+    const curPersonRow = t1StartRow + idx;
     const bk = (activeData.peopleBreakdown && activeData.peopleBreakdown[p]) || { purchases: 0, installments: 0, missingFromSheet: 0, total: 0 };
     const pPurchases = bk.purchases || 0;
     const pInstallments = bk.installments || 0;
@@ -3770,28 +3819,22 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
       }
     });
 
-    const pExpectedTotal = pPurchases + pInstallments + pReconAssigned;
-    const pReflectedTotal = bk.total || 0;
-    const pDiff = pReflectedTotal - pExpectedTotal;
+    const pExpectedFormula = `=SUM(B${curPersonRow}:D${curPersonRow})`;
+    const pReflectedFormula = `=IFERROR(VLOOKUP($A${curPersonRow}, 'Debt Breakdown'!$A:$E, 5, FALSE), 0)`;
+    const pDiffFormula = `=F${curPersonRow}-E${curPersonRow}`;
+    const pStatusFormula = `=IF(ABS(G${curPersonRow})<0.05, "✅ In Sync (0.00 EGP)", IF(G${curPersonRow}<-0.05, "🚨 Missing in Debt Breakdown! (" & TEXT(ABS(G${curPersonRow}), "#,##0.00") & " EGP)", "⚠️ Exceeds Expected by +" & TEXT(G${curPersonRow}, "#,##0.00") & " EGP"))`;
 
     grandExpPurchases += pPurchases;
     grandExpInstallments += pInstallments;
     grandExpReconAssigned += pReconAssigned;
-    grandExpTotal += pExpectedTotal;
-    grandReflectedTotal += pReflectedTotal;
-    grandPersonDiff += pDiff;
+    grandExpTotal += (pPurchases + pInstallments + pReconAssigned);
+    grandReflectedTotal += (bk.total || 0);
+    grandPersonDiff += ((bk.total || 0) - (pPurchases + pInstallments + pReconAssigned));
 
-    let pStatus = "✅ In Sync (0.00 EGP)";
     let rowColor = CONFIG.COLORS.PAID;
-
-    if (Math.abs(pDiff) >= 0.05) {
-      if (pDiff < -0.05) {
-        pStatus = `🚨 Missing in Debt Breakdown! (${Math.abs(pDiff).toFixed(2)} EGP unreflected)`;
-        rowColor = CONFIG.COLORS.OVERDUE;
-      } else {
-        pStatus = `⚠️ Exceeds Expected by +${pDiff.toFixed(2)} EGP`;
-        rowColor = CONFIG.COLORS.DUE_SOON;
-      }
+    const pDiffVal = (bk.total || 0) - (pPurchases + pInstallments + pReconAssigned);
+    if (Math.abs(pDiffVal) >= 0.05) {
+      rowColor = pDiffVal < -0.05 ? CONFIG.COLORS.OVERDUE : CONFIG.COLORS.DUE_SOON;
     }
 
     personComparisonRows.push([
@@ -3799,10 +3842,10 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
       pPurchases,
       pInstallments,
       pReconAssigned,
-      pExpectedTotal,
-      pReflectedTotal,
-      pDiff,
-      pStatus
+      pExpectedFormula,
+      pReflectedFormula,
+      pDiffFormula,
+      pStatusFormula
     ]);
     personRowColors.push(rowColor);
   });
@@ -3818,16 +3861,16 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
     curRow += personComparisonRows.length;
   }
 
-  // Summary Row for Table 1
+  // Summary Row for Table 1 (Live SUM formulas)
   const t1TotalRow = [
     "TOTAL ALL FAMILY MEMBERS",
-    grandExpPurchases,
-    grandExpInstallments,
-    grandExpReconAssigned,
-    grandExpTotal,
-    grandReflectedTotal,
-    grandPersonDiff,
-    Math.abs(grandPersonDiff) < 0.05 ? "✅ All Sheets 100% In Sync" : `🚨 Net Discrepancy: ${grandPersonDiff.toFixed(2)} EGP`
+    personComparisonRows.length > 0 ? `=SUM(B${t1StartRow}:B${t1TotalRowIndex - 1})` : grandExpPurchases,
+    personComparisonRows.length > 0 ? `=SUM(C${t1StartRow}:C${t1TotalRowIndex - 1})` : grandExpInstallments,
+    personComparisonRows.length > 0 ? `=SUM(D${t1StartRow}:D${t1TotalRowIndex - 1})` : grandExpReconAssigned,
+    personComparisonRows.length > 0 ? `=SUM(E${t1StartRow}:E${t1TotalRowIndex - 1})` : grandExpTotal,
+    personComparisonRows.length > 0 ? `=SUM(F${t1StartRow}:F${t1TotalRowIndex - 1})` : grandReflectedTotal,
+    personComparisonRows.length > 0 ? `=SUM(G${t1StartRow}:G${t1TotalRowIndex - 1})` : grandPersonDiff,
+    `=IF(ABS(G${t1TotalRowIndex})<0.05, "✅ All Sheets 100% In Sync", "🚨 Discrepancy Detected")`
   ];
   sheet.getRange(curRow, 1, 1, t1Headers.length).setValues([t1TotalRow])
     .setFontWeight("bold")
