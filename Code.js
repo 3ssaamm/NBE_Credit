@@ -17,6 +17,7 @@ const CONFIG = {
     TRANSACTIONS: "Transactions",
     INSTALLMENTS: "Installments",
     DEBT_BREAKDOWN: "Debt Breakdown",
+    MONTHLY_OVERVIEW: "Monthly Overview",
     PAYMENT_HISTORY: "Payment History",
     BANK_STATEMENT: "Bank Statement",
     RECONCILIATION: "Reconciliation",
@@ -156,6 +157,7 @@ function onOpen() {
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
     .addSeparator()
     .addItem("📊 Go to Debt Breakdown Sheet", "menuGoToDebtBreakdown")
+    .addItem("📅 Go to Monthly Overview Sheet", "menuGoToMonthlyOverview")
     .addItem("🔍 Go to Audit & Differences Sheet", "menuGoToAuditDifferences")
     .addSeparator()
     .addItem("⏰ Setup Daily Auto-Check", "setupDailyTrigger")
@@ -168,6 +170,18 @@ function menuGoToDebtBreakdown() {
   if (!sheet) {
     updateLiveDashboard();
     sheet = ss.getSheetByName(CONFIG.SHEETS.DEBT_BREAKDOWN);
+  }
+  if (sheet) {
+    ss.setActiveSheet(sheet);
+  }
+}
+
+function menuGoToMonthlyOverview() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(CONFIG.SHEETS.MONTHLY_OVERVIEW);
+  if (!sheet) {
+    updateLiveDashboard();
+    sheet = ss.getSheetByName(CONFIG.SHEETS.MONTHLY_OVERVIEW);
   }
   if (sheet) {
     ss.setActiveSheet(sheet);
@@ -2219,12 +2233,8 @@ function updateLiveDashboard(options) {
       // STRICT PDF STATEMENT PERIOD FILTER:
       // "YOU FOLLOW THE DATES IN THE PDF!!"
       // Transactions strictly before stmtPeriod.start (e.g. June 29 when PDF starts July 30)
-      // belong to prior billing cycles and MUST NOT be assigned to the active statement bill!
+      // belong to prior billing cycles that are already captured in historical data.
       if (stmtPeriod.start && purchaseDate < stmtPeriod.start) {
-        return;
-      }
-      if (stmtPeriod.end && purchaseDate > stmtPeriod.end) {
-        // Purchases strictly after cutoff are unbilled new purchases
         return;
       }
 
@@ -2237,14 +2247,21 @@ function updateLiveDashboard(options) {
         return;
       }
 
-      existingTransactionsForDedupe.push({
-        date: purchaseDate,
-        rawDate: rawDate,
-        desc: desc,
-        amount: amount,
-        rawPerson: rawPerson
-      });
+      // Deduplication list for active statement audit against statement debits:
+      // Only include purchases that fall strictly within the active statement window [stmtPeriod.start, stmtPeriod.end]
+      if (!stmtPeriod.end || purchaseDate <= stmtPeriod.end) {
+        existingTransactionsForDedupe.push({
+          date: purchaseDate,
+          rawDate: rawDate,
+          desc: desc,
+          amount: amount,
+          rawPerson: rawPerson
+        });
+      }
 
+      // Calculate Due Date:
+      // Purchases within statement window get activeStatementDueDate.
+      // Purchases after cutoff (unbilled new purchases) get month + 1 due date for upcoming cycles!
       const dueDate = getDueDateForPurchase(purchaseDate, tz, cardBal.statementDate, activeStatementDueDate, stmtPeriod.start);
       if (!dueDate) return;
 
@@ -2406,7 +2423,7 @@ function updateLiveDashboard(options) {
     });
   });
 
-  // Collect and sort unique people: combine all known sheet payers + any in debtLineItems
+  // Collect and sort unique people: combine all known sheet payers + any in debtLineItems + historical people
   const allKnownPeople = getAllUniquePayers(ss);
   const allPeopleSet = new Set(allKnownPeople);
   debtLineItems.forEach(it => {
@@ -2414,14 +2431,18 @@ function updateLiveDashboard(options) {
       allPeopleSet.add(it.person);
     }
   });
+  ["Abdo", "Dad", "Mai", "Mido", "Muhanad", "Mum", "Zoza"].forEach(p => allPeopleSet.add(p));
   const sortedPeople = Array.from(allPeopleSet)
     .filter(p => p && !isNeglectedPayer(p) && p.toLowerCase() !== "shared")
     .sort((a, b) => a.localeCompare(b));
 
-  // 4. Render Dedicated 'Debt Breakdown' Sheet
+  // 4. Render Dedicated 'Debt Breakdown' Sheet (Active Statement ONLY)
   renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeStatementDueDate, assignedMissingCount, assignedMissingTotal);
 
-  // 5. Render Dedicated 'Audit & Differences' Sheet
+  // 5. Render Dedicated 'Monthly Overview' Sheet (Upcoming Forecasts & Previous Cycles)
+  renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, activeStatementDueDate);
+
+  // 6. Render Dedicated 'Audit & Differences' Sheet
   renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, activeStatementDueDate, reconAssignedList, neglectedTxKeys, existingTransactionsForDedupe, sortedPeople, assignedChargesList);
 }
 
@@ -2717,42 +2738,294 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     curRow += 3;
   }
 
-  // ==========================================
-  // SECTION 3: 📅 OTHER BILLING CYCLES (Individual Tables for Each Month)
-  // ==========================================
-  const otherKeys = Object.keys(allDebts).sort().filter(k => k !== activeSortKey);
+  // Footer Link to Monthly Overview Sheet
+  sheet.getRange(curRow, 1, 1, 9).merge()
+    .setValue("👉 Note: For upcoming billing cycle forecasts and previous months (March – August 2026), please switch to the 'Monthly Overview' sheet.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  curRow += 2;
 
-  if (otherKeys.length > 0) {
-    sheet.getRange(curRow, 1, 1, 7).merge()
-      .setValue("📅 Other Billing Cycles (Individual Monthly Tables)")
-      .setFontWeight("bold")
-      .setFontSize(13)
-      .setBackground(CONFIG.COLORS.PRIMARY)
-      .setFontColor("#ffffff");
-    curRow++;
+  sheet.autoResizeColumns(1, 9);
+}
 
+function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, activeStatementDueDate) {
+  const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.MONTHLY_OVERVIEW);
+  sheet.clear();
+  sheet.setHiddenGridlines(false);
+
+  const activeSortKey = Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
+  const activeMonthLabel = Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
+  const activeData = allDebts[activeSortKey] || { total: 0, purchasesTotal: 0, installmentsTotal: 0, people: {}, peopleBreakdown: {} };
+
+  // Hardcoded historical months data (Audited March 2026 – August 2026)
+  const HISTORICAL_MONTHS = {
+    "2026-03": {
+      label: "March 2026",
+      dueDateLabel: "March 25, 2026",
+      totalBill: 13628.57,
+      status: "Paid",
+      people: {
+        "Dad": 1210.33,
+        "Mai": 6233.32,
+        "Mido": 2726.90,
+        "Muhanad": 2560.02,
+        "Mum": 420.00,
+        "Zoza": 478.00
+      }
+    },
+    "2026-04": {
+      label: "April 2026",
+      dueDateLabel: "April 25, 2026",
+      totalBill: 13991.09,
+      status: "Paid",
+      people: {
+        "Dad": 1339.15,
+        "Mai": 6549.51,
+        "Mido": 4794.27,
+        "Muhanad": 106.17,
+        "Mum": 420.00,
+        "Zoza": 782.00
+      }
+    },
+    "2026-05": {
+      label: "May 2026",
+      dueDateLabel: "May 25, 2026",
+      totalBill: 29851.56,
+      status: "Paid",
+      people: {
+        "Abdo": 17143.00,
+        "Dad": 1445.33,
+        "Mai": 6014.71,
+        "Mido": 4250.35,
+        "Muhanad": 106.17,
+        "Mum": 420.00,
+        "Zoza": 472.00
+      }
+    },
+    "2026-06": {
+      label: "June 2026",
+      dueDateLabel: "June 25, 2026",
+      totalBill: 10473.17,
+      status: "Paid",
+      people: {
+        "Abdo": 335.00,
+        "Dad": 1210.33,
+        "Mai": 2463.61,
+        "Mido": 4596.09,
+        "Muhanad": 106.17,
+        "Mum": 1244.07,
+        "Zoza": 517.90
+      }
+    },
+    "2026-07": {
+      label: "July 2026",
+      dueDateLabel: "July 25, 2026",
+      totalBill: 28379.62,
+      status: "Paid",
+      people: {
+        "Dad": 1350.33,
+        "Mai": 21696.49,
+        "Mido": 4214.56,
+        "Muhanad": 106.17,
+        "Mum": 494.07,
+        "Zoza": 518.00
+      }
+    },
+    "2026-08": {
+      label: "August 2026",
+      dueDateLabel: "August 25, 2026",
+      totalBill: 22867.63,
+      status: "Paid",
+      people: {
+        "Abdo": 5272.39,
+        "Dad": 1210.33,
+        "Mai": 6380.39,
+        "Mido": 8886.28,
+        "Muhanad": 106.17,
+        "Mum": 494.07,
+        "Zoza": 518.00
+      }
+    }
+  };
+
+  // Banner
+  sheet.getRange("A1:K1").merge()
+    .setValue("📅 NBE Credit Card — Monthly Overview (Upcoming Forecasts & Previous History)")
+    .setFontWeight("bold")
+    .setFontSize(14)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff");
+
+  sheet.getRange("A2:K2").merge()
+    .setValue("Multi-month debt overview: upcoming future dues forecasted dynamically from Transactions and Installments, alongside audited historical billing cycles.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+
+  let curRow = 4;
+
+  // Upcoming keys (strictly future months)
+  const upcomingKeys = Object.keys(allDebts).filter(k => k > activeSortKey).sort();
+  const histKeys = Object.keys(HISTORICAL_MONTHS).sort();
+
+  // ==========================================
+  // SECTION 1: 📊 MULTI-MONTH COMPARISON MATRIX (Full Timeline View)
+  // ==========================================
+  const matrixCols = [
+    { key: "label", header: "Family Member", type: "header" }
+  ];
+
+  histKeys.forEach(k => {
+    matrixCols.push({
+      key: k,
+      header: HISTORICAL_MONTHS[k].label,
+      type: "hist"
+    });
+  });
+
+  matrixCols.push({
+    key: activeSortKey,
+    header: activeMonthLabel + " (Active)",
+    type: "active"
+  });
+
+  upcomingKeys.forEach(k => {
+    matrixCols.push({
+      key: k,
+      header: (allDebts[k].label || k) + " (Forecast)",
+      type: "upcoming"
+    });
+  });
+
+  sheet.getRange(curRow, 1, 1, matrixCols.length).merge()
+    .setValue("📊 Section 1: Multi-Month Comparison Matrix (Timeline Overview)")
+    .setFontWeight("bold")
+    .setFontSize(12)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff");
+  curRow++;
+
+  sheet.getRange(curRow, 1, 1, matrixCols.length).merge()
+    .setValue("Side-by-side comparison of family shares across all billing cycles: historical audited statements, active statement, and future projections.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  curRow += 2;
+
+  // Headers
+  const matrixHeaderRow = matrixCols.map(c => c.header);
+  sheet.getRange(curRow, 1, 1, matrixCols.length).setValues([matrixHeaderRow])
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.HEADER)
+    .setBorder(true, true, true, true, true, true);
+  curRow++;
+
+  // Row 1: TOTAL MONTH BILL
+  const totalBillRow = matrixCols.map((c, idx) => {
+    if (idx === 0) return "TOTAL MONTH BILL (EGP)";
+    if (c.type === "hist") return HISTORICAL_MONTHS[c.key].totalBill;
+    if (c.type === "active") return activeData.total;
+    if (c.type === "upcoming") return (allDebts[c.key] ? allDebts[c.key].total : 0);
+    return 0;
+  });
+  sheet.getRange(curRow, 1, 1, matrixCols.length).setValues([totalBillRow])
+    .setFontWeight("bold")
+    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
+    .setBorder(true, true, true, true, true, true);
+  sheet.getRange(curRow, 2, 1, matrixCols.length - 1).setNumberFormat("#,##0.00");
+  curRow++;
+
+  // Row 2: Status
+  const statusRow = matrixCols.map((c, idx) => {
+    if (idx === 0) return "Cycle Status";
+    if (c.type === "hist") return "✅ Settled";
+    if (c.type === "active") return (paidMonthsSet.has(activeMonthLabel.toLowerCase()) ? "✅ Settled" : "💳 Active Statement");
+    if (c.type === "upcoming") return "🕒 Forecast";
+    return "";
+  });
+  sheet.getRange(curRow, 1, 1, matrixCols.length).setValues([statusRow])
+    .setFontWeight("bold")
+    .setFontSize(9)
+    .setBorder(true, true, true, true, true, true);
+  for (let cIdx = 1; cIdx < matrixCols.length; cIdx++) {
+    const colType = matrixCols[cIdx].type;
+    const bg = colType === "hist" ? CONFIG.COLORS.PAID : (colType === "active" ? CONFIG.COLORS.DUE_SOON : CONFIG.COLORS.UPCOMING);
+    sheet.getRange(curRow, cIdx + 1).setBackground(bg);
+  }
+  curRow++;
+
+  // Person Rows
+  const matrixPersonRows = [];
+  sortedPeople.forEach(person => {
+    const pRow = [person];
+    for (let cIdx = 1; cIdx < matrixCols.length; cIdx++) {
+      const col = matrixCols[cIdx];
+      let val = 0;
+      if (col.type === "hist") {
+        val = HISTORICAL_MONTHS[col.key].people[person] || 0;
+      } else if (col.type === "active") {
+        const bk = activeData.peopleBreakdown[person];
+        val = bk ? bk.total : (activeData.people[person] || 0);
+      } else if (col.type === "upcoming") {
+        const mD = allDebts[col.key];
+        if (mD) {
+          const bk = mD.peopleBreakdown[person];
+          val = bk ? bk.total : (mD.people[person] || 0);
+        }
+      }
+      pRow.push(val);
+    }
+    matrixPersonRows.push(pRow);
+  });
+
+  if (matrixPersonRows.length > 0) {
+    sheet.getRange(curRow, 1, matrixPersonRows.length, matrixCols.length).setValues(matrixPersonRows);
+    sheet.getRange(curRow, 1, matrixPersonRows.length, 1).setFontWeight("bold");
+    sheet.getRange(curRow, 2, matrixPersonRows.length, matrixCols.length - 1).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 1, matrixPersonRows.length, matrixCols.length).setBorder(true, true, true, true, true, true);
+    curRow += matrixPersonRows.length + 3;
+  }
+
+  // ==========================================
+  // SECTION 2: 🕒 UPCOMING BILLING CYCLES (Forecasted from Transactions & Installments)
+  // ==========================================
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("🕒 Section 2: Upcoming Billing Cycles (Forecasted from Transactions & Installments)")
+    .setFontWeight("bold")
+    .setFontSize(12)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff");
+  curRow++;
+
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("Upcoming months dynamically projected from active installments and new post-cutoff purchases recorded in Transactions.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  curRow += 2;
+
+  if (upcomingKeys.length === 0) {
     sheet.getRange(curRow, 1, 1, 7).merge()
-      .setValue("Upcoming and previous monthly dues. Each month has its own dedicated breakdown table below.")
+      .setValue("ℹ️ No upcoming installment charges or post-cutoff purchases currently recorded.")
       .setFontStyle("italic")
-      .setFontSize(9)
       .setFontColor(CONFIG.COLORS.TEXT_MUTED);
-    curRow += 2;
-
-    otherKeys.forEach(mKey => {
+    curRow += 3;
+  } else {
+    upcomingKeys.forEach(mKey => {
       const mData = allDebts[mKey];
-      const mLabel = mData.label;
-      const isPaid = paidMonthsSet.has(mLabel.toLowerCase());
+      const mLabel = mData.label || mKey;
 
       // Header Bar for this month
-      const mTitle = `📅 ${mLabel} (Due 25th) — Total Due: ${mData.total.toFixed(2)} EGP ${isPaid ? "✅ [PAID]" : "🕒 [UPCOMING]"}`;
-      sheet.getRange(curRow, 1, 1, 5).merge()
+      const mTitle = `📅 ${mLabel} (Payment Due 25th) — Forecast Total: ${mData.total.toFixed(2)} EGP — 🕒 [UPCOMING FORECAST]`;
+      sheet.getRange(curRow, 1, 1, 6).merge()
         .setValue(mTitle)
         .setFontWeight("bold")
         .setFontSize(11)
-        .setBackground(isPaid ? CONFIG.COLORS.PAID : CONFIG.COLORS.HEADER);
+        .setBackground(CONFIG.COLORS.ACCENT_BLUE);
       curRow++;
 
-      const mHeaders = ["Person", "🛒 Purchases (EGP)", "📦 Installments (EGP)", "Total Due (EGP)", "% of Month Bill"];
+      const mHeaders = ["Person", "🛒 Purchases (EGP)", "📦 Installments (EGP)", "Total Due (EGP)", "% of Month Bill", "Status"];
       sheet.getRange(curRow, 1, 1, mHeaders.length).setValues([mHeaders])
         .setFontWeight("bold")
         .setBackground(CONFIG.COLORS.HEADER)
@@ -2763,7 +3036,7 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
       const mRows = mPeople.map(p => {
         const bk = mData.peopleBreakdown[p] || { purchases: 0, installments: 0, total: 0 };
         const pct = mData.total > 0 ? (bk.total / mData.total) : 0;
-        return [p, bk.purchases, bk.installments, bk.total, pct];
+        return [p, bk.purchases, bk.installments, bk.total, pct, "🕒 Upcoming Forecast"];
       });
 
       if (mRows.length > 0) {
@@ -2771,11 +3044,12 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
         sheet.getRange(curRow, 2, mRows.length, 3).setNumberFormat("#,##0.00");
         sheet.getRange(curRow, 5, mRows.length, 1).setNumberFormat("0.0%");
         sheet.getRange(curRow, 1, mRows.length, 1).setFontWeight("bold");
+        sheet.getRange(curRow, 6, mRows.length, 1).setBackground(CONFIG.COLORS.UPCOMING);
         curRow += mRows.length;
       }
 
       // Total Row for this month
-      const mTotalRow = ["TOTAL (" + mLabel + ")", mData.purchasesTotal, mData.installmentsTotal, mData.total, 1.00];
+      const mTotalRow = ["TOTAL (" + mLabel + ")", mData.purchasesTotal, mData.installmentsTotal, mData.total, 1.00, "🕒 Upcoming Due"];
       sheet.getRange(curRow, 1, 1, mHeaders.length).setValues([mTotalRow])
         .setFontWeight("bold")
         .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
@@ -2783,10 +3057,109 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
       sheet.getRange(curRow, 2, 1, 3).setNumberFormat("#,##0.00");
       sheet.getRange(curRow, 5, 1, 1).setNumberFormat("0.0%");
       curRow += 2;
+
+      // Itemized charges for this upcoming month (Installment breakdown)
+      const futureItems = debtLineItems.filter(it => it.sortKey === mKey);
+      if (futureItems.length > 0) {
+        sheet.getRange(curRow, 1, 1, 7).merge()
+          .setValue(`📋 Itemized Upcoming Charges for ${mLabel} (${futureItems.length} items)`)
+          .setFontWeight("bold")
+          .setFontSize(10)
+          .setBackground(CONFIG.COLORS.HEADER);
+        curRow++;
+
+        const fHeaders = ["#", "Person", "Category", "Description / Merchant", "Installment Progress", "Share (EGP)", "Original Amount (EGP)"];
+        sheet.getRange(curRow, 1, 1, fHeaders.length).setValues([fHeaders])
+          .setFontWeight("bold")
+          .setFontSize(9)
+          .setBackground(CONFIG.COLORS.HEADER)
+          .setBorder(true, true, true, true, true, true);
+        curRow++;
+
+        const fRows = futureItems.map((it, idx) => {
+          const catLabel = it.category === "Installment" ? "📦 Installment" : "🛒 One-Time Purchase";
+          return [
+            idx + 1,
+            it.person,
+            catLabel,
+            it.desc,
+            it.installmentInfo || "-",
+            it.amount,
+            it.originalAmount || it.amount
+          ];
+        });
+
+        sheet.getRange(curRow, 1, fRows.length, fHeaders.length).setValues(fRows);
+        sheet.getRange(curRow, 6, fRows.length, 2).setNumberFormat("#,##0.00");
+        sheet.getRange(curRow, 1, fRows.length, fHeaders.length).setBorder(true, true, true, true, true, true);
+        curRow += fRows.length + 2;
+      }
     });
   }
 
-  sheet.autoResizeColumns(1, 9);
+  // ==========================================
+  // SECTION 3: 📜 HISTORICAL BILLING CYCLES (Audited Statements: March 2026 – August 2026)
+  // ==========================================
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("📜 Section 3: Historical Billing Cycles (Audited Statements: March 2026 – August 2026)")
+    .setFontWeight("bold")
+    .setFontSize(12)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff");
+  curRow++;
+
+  sheet.getRange(curRow, 1, 1, 7).merge()
+    .setValue("Finalized, audited statement numbers and family shares for past billing cycles.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  curRow += 2;
+
+  histKeys.forEach(hKey => {
+    const hist = HISTORICAL_MONTHS[hKey];
+    sheet.getRange(curRow, 1, 1, 5).merge()
+      .setValue(`📜 ${hist.label} — Total Bill: ${hist.totalBill.toFixed(2)} EGP — ✅ [PAID / SETTLED]`)
+      .setFontWeight("bold")
+      .setFontSize(11)
+      .setBackground(CONFIG.COLORS.PAID);
+    curRow++;
+
+    const histHeaders = ["Person", "Amount Owed (EGP)", "% of Total Bill", "Status"];
+    sheet.getRange(curRow, 1, 1, histHeaders.length).setValues([histHeaders])
+      .setFontWeight("bold")
+      .setBackground(CONFIG.COLORS.HEADER)
+      .setBorder(true, true, true, true, true, true);
+    curRow++;
+
+    const hPeople = Object.keys(hist.people).sort();
+    const hRows = hPeople.map(p => {
+      const amt = hist.people[p];
+      const pct = hist.totalBill > 0 ? (amt / hist.totalBill) : 0;
+      return [p, amt, pct, "✅ Paid"];
+    });
+
+    if (hRows.length > 0) {
+      sheet.getRange(curRow, 1, hRows.length, histHeaders.length).setValues(hRows);
+      sheet.getRange(curRow, 2, hRows.length, 1).setNumberFormat("#,##0.00");
+      sheet.getRange(curRow, 3, hRows.length, 1).setNumberFormat("0.0%");
+      sheet.getRange(curRow, 1, hRows.length, 1).setFontWeight("bold");
+      sheet.getRange(curRow, 4, hRows.length, 1).setBackground(CONFIG.COLORS.PAID);
+      sheet.getRange(curRow, 1, hRows.length, histHeaders.length).setBorder(true, true, true, true, true, true);
+      curRow += hRows.length;
+    }
+
+    // Total Row
+    const hTotalRow = ["TOTAL BILL (" + hist.label + ")", hist.totalBill, 1.00, "✅ Settled with NBE"];
+    sheet.getRange(curRow, 1, 1, histHeaders.length).setValues([hTotalRow])
+      .setFontWeight("bold")
+      .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
+      .setBorder(true, true, true, true, true, true);
+    sheet.getRange(curRow, 2, 1, 1).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 3, 1, 1).setNumberFormat("0.0%");
+    curRow += 3;
+  });
+
+  sheet.autoResizeColumns(1, Math.max(9, matrixCols.length));
 }
 
 function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, activeStatementDueDate, reconAssignedList, neglectedTxKeys, existingTxList, sortedPeople, assignedChargesList) {
