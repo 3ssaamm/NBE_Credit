@@ -328,18 +328,17 @@ function onEdit(e) {
   const sheet = e.range.getSheet();
   const sheetName = sheet.getName();
 
-  // Instant dynamic recalculation for Transactions, Installments, or Payment History
-  if (sheetName === CONFIG.SHEETS.TRANSACTIONS || 
-      sheetName === CONFIG.SHEETS.INSTALLMENTS || 
-      sheetName === CONFIG.SHEETS.PAYMENT_HISTORY) {
+  // If user edits Transactions: native equations in Monthly Overview update spontaneously in-browser (sub-50ms)!
+  // No need to wipe and rewrite Monthly Overview on every keystroke.
+  if (sheetName === CONFIG.SHEETS.TRANSACTIONS) {
+    return;
+  }
+
+  // If user edits Installments or Payment History: re-sync static installment schedules in the background
+  if (sheetName === CONFIG.SHEETS.INSTALLMENTS || sheetName === CONFIG.SHEETS.PAYMENT_HISTORY) {
     if (e.range.getRow() >= 2) {
       try {
         updateLiveDashboard({ skipRecon: true });
-        SpreadsheetApp.getActiveSpreadsheet().toast(
-          "Monthly Overview & Debt Breakdown updated automatically!",
-          "⚡ Live Updated",
-          2
-        );
       } catch (err) {
         Logger.log("[onEdit] Auto-update error: " + (err ? (err.message || String(err)) : ""));
       }
@@ -2965,6 +2964,41 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   sheet.autoResizeColumns(1, 9);
 }
 
+function getPurchaseDateWindow(dueYear, dueMonth) {
+  let endMonth = dueMonth - 1;
+  let endYear = dueYear;
+  if (endMonth < 1) {
+    endMonth = 12;
+    endYear--;
+  }
+
+  let endDay = 30;
+  if (endMonth === 2) {
+    const isLeap = (endYear % 4 === 0 && endYear % 100 !== 0) || (endYear % 400 === 0);
+    endDay = isLeap ? 29 : 28;
+  }
+
+  let prevPrevMonth = endMonth - 1;
+  let prevPrevYear = endYear;
+  if (prevPrevMonth < 1) {
+    prevPrevMonth = 12;
+    prevPrevYear--;
+  }
+
+  const daysInPrevPrev = new Date(prevPrevYear, prevPrevMonth, 0).getDate();
+  let startYear, startMonth, startDay;
+  if (daysInPrevPrev === 31) {
+    startYear = prevPrevYear;
+    startMonth = prevPrevMonth;
+    startDay = 31;
+  } else {
+    startYear = endYear;
+    startMonth = endMonth;
+    startDay = 1;
+  }
+  return { startYear, startMonth, startDay, endYear, endMonth, endDay };
+}
+
 function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, activeCycleKey, activeCycleLabel, activeStatementDueDate, forecastDebts) {
   const upcomingSource = forecastDebts || allDebts;
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.MONTHLY_OVERVIEW);
@@ -3238,10 +3272,17 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
       const mLabel = mData.label || mKey;
       const mDueDateStr = mData.dueDateLabel || (mData.dueDate ? Utilities.formatDate(mData.dueDate, tz, "MMMM d, yyyy") : "25th");
 
-      // Header Bar for this month (named by payment-due month)
-      const mTitle = `📅 ${mLabel} — Due ${mDueDateStr} — Forecast Total: ${mData.total.toFixed(2)} EGP`;
+      const mPeople = sortedPeople.filter(p => (mData.peopleBreakdown[p] && mData.peopleBreakdown[p].total > 0));
+      const startDataRow = curRow + 2; // header title is curRow, headers are curRow + 1
+      const numPeople = mPeople.length;
+      const totalRowIndex = startDataRow + numPeople;
+
+      // Header Bar for this month with live forecast total formula referencing the total row
+      const titleFormula = numPeople > 0
+        ? `="📅 " & "${mLabel} — Due ${mDueDateStr} — Forecast Total: " & TEXT(D${totalRowIndex}, "#,##0.00") & " EGP"`
+        : `📅 ${mLabel} — Due ${mDueDateStr} — Forecast Total: 0.00 EGP`;
       sheet.getRange(curRow, 1, 1, 6).merge()
-        .setValue(mTitle)
+        .setValue(titleFormula)
         .setFontWeight("bold")
         .setFontSize(11)
         .setBackground(CONFIG.COLORS.ACCENT_BLUE);
@@ -3254,17 +3295,23 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
         .setBorder(true, true, true, true, true, true);
       curRow++;
 
-      const mPeople = sortedPeople.filter(p => (mData.peopleBreakdown[p] && mData.peopleBreakdown[p].total > 0));
-      const startDataRow = curRow;
-      const numPeople = mPeople.length;
-      const totalRowIndex = startDataRow + numPeople;
+      // Compute purchase cycle date window for this due month
+      const mMatch = mKey.match(/^(\d{4})-(\d{2})$/);
+      let pFormulaFunc = (personName, rIdx) => (mData.peopleBreakdown[personName]?.purchases || 0);
+      if (mMatch) {
+        const dYear = parseInt(mMatch[1], 10);
+        const dMonth = parseInt(mMatch[2], 10);
+        const w = getPurchaseDateWindow(dYear, dMonth);
+        pFormulaFunc = (personName, rIdx) => `=SUMIFS('Transactions'!$E:$E, 'Transactions'!$D:$D, $A${rIdx}, 'Transactions'!$B:$B, ">="&DATE(${w.startYear},${w.startMonth},${w.startDay}), 'Transactions'!$B:$B, "<="&DATE(${w.endYear},${w.endMonth},${w.endDay}))`;
+      }
 
       const mRows = mPeople.map((p, idx) => {
         const bk = mData.peopleBreakdown[p] || { purchases: 0, installments: 0, total: 0 };
         const currentRow = startDataRow + idx;
+        const purchaseValOrFormula = pFormulaFunc(p, currentRow);
         const totalFormula = `=B${currentRow}+C${currentRow}`;
         const pctFormula = `=IF($D$${totalRowIndex}>0, D${currentRow}/$D$${totalRowIndex}, 0)`;
-        return [p, bk.purchases, bk.installments, totalFormula, pctFormula, "🕒 Upcoming Forecast"];
+        return [p, purchaseValOrFormula, bk.installments, totalFormula, pctFormula, "🕒 Upcoming Forecast"];
       });
 
       if (mRows.length > 0) {
