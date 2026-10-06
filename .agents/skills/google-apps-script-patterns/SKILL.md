@@ -198,3 +198,37 @@ When receiving form submissions or webhook notifications:
   !Code.js
   ```
 - Push changes with `npx @google/clasp push -f` after syntax-validating with `node -c Code.js`.
+
+---
+
+## 7. Spreadsheet Layout, Column Fitting & The Merged-Banner AutoResize Pitfall
+
+### The Pitfall: Oversized Column 1
+In Google Sheets, calling `sheet.autoResizeColumns(1, N)` on any sheet containing a merged header banner in Row 1 (e.g. `sheet.getRange("A1:K1").merge().setValue("...")`) causes Google Sheets to calculate Column 1's width against the **entire merged text string**.
+- **Resulting Bug**: Column A (Column 1) blows out to 400–600 pixels wide, pushing all data tables off-screen and leaving massive empty whitespace next to names or `#` numbers.
+- **Row 1 Height**: If left unconfigured, high font sizes (14pt+) in merged banners cause Row 1 to expand to an overly tall, awkward height.
+
+### Production Pattern: Controlled Fitting & Explicit Overrides
+1. **Never auto-resize Column 1 over merged banners**:
+   Always auto-resize from column 2 onwards (`sheet.autoResizeColumns(2, numCols - 1)`), and set Column 1 explicitly with `sheet.setColumnWidth(1, targetWidth)`.
+2. **Explicit Row Heights for Banners**:
+   Set standard proportional row heights:
+   - Row 1 (Title Banner): `sheet.setRowHeight(1, 30)` (or 32px max).
+   - Row 2 (Subtitle): `sheet.setRowHeight(2, 20)`.
+   - Section header rows: `sheet.setRowHeight(r, 26)`.
+3. **Use a Universal Fitting Helper**:
+   ```javascript
+   function applySheetLayoutFitting(sheet, colWidthsMap, rowHeightsMap) {
+     if (!sheet) return;
+     // Set banner row heights
+     sheet.setRowHeight(1, rowHeightsMap?.[1] || 30);
+     sheet.setRowHeight(2, rowHeightsMap?.[2] || 20);
+     // Apply explicit column widths
+     if (colWidthsMap) {
+       Object.keys(colWidthsMap).forEach(col => {
+         sheet.setColumnWidth(parseInt(col, 10), colWidthsMap[col]);
+       });
+     }
+   }
+   ```
+

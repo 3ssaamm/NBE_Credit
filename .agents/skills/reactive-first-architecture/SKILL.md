@@ -113,3 +113,22 @@ Requirement
 │           ├── Write native formulas into summary cells
 │           └── Run heavy reconciliation on-demand, not on every edit
 ```
+
+---
+
+## 6. Visual Ergonomics & Layout Fitting Standards
+
+### Preventing Column A & Row 1 Distortion
+When generating dashboards and financial tables with title banners:
+1. **Never Call `sheet.autoResizeColumns(1, N)` across Merged Header Rows**:
+   Merged cells (e.g. `A1:K1`) cause Google Sheets to blow out Column A to 400+ pixels wide.
+   - Set Column A explicitly (`sheet.setColumnWidth(1, width)`).
+   - Only auto-resize data columns starting from column 2 (`sheet.autoResizeColumns(2, N - 1)`).
+2. **Explicit Row Heights for Banners**:
+   - Title Banner Row 1: `30px` (or max `32px`).
+   - Subtitle Row 2: `20px`.
+   - Section header bars: `26px`.
+   - Data rows: standard `21–23px`.
+3. **Table Width Budgeting**:
+   Multi-month matrix views must fit on standard desktop viewports (1280–1920px) without horizontal scrolling. Column widths for monthly cycles must be clamped to 100–115px.
+

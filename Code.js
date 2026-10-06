@@ -278,6 +278,7 @@ function onOpen() {
     .createMenu("💳 NBE Tracker")
     .addItem("📥 Process Latest Statement (Drive)", "menuProcessStatement")
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
+    .addItem("📐 Fix All Sheet Layouts & Fitting", "menuFixAllSheetLayouts")
     .addSeparator()
     .addItem("📊 Go to Debt Breakdown Sheet", "menuGoToDebtBreakdown")
     .addItem("📅 Go to Monthly Overview Sheet", "menuGoToMonthlyOverview")
@@ -321,6 +322,61 @@ function menuGoToAuditDifferences() {
   if (sheet) {
     ss.setActiveSheet(sheet);
   }
+}
+
+function menuFixAllSheetLayouts() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 1. Transactions Sheet
+  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+  if (txSheet) {
+    try {
+      txSheet.setRowHeight(1, 26);
+      txSheet.setColumnWidth(1, 45);
+      txSheet.setColumnWidth(2, 105);
+      txSheet.setColumnWidth(3, 240);
+      txSheet.setColumnWidth(4, 110);
+      txSheet.setColumnWidth(5, 110);
+    } catch (e) { }
+  }
+
+  // 2. Installments Sheet
+  const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  if (instSheet) {
+    try {
+      instSheet.setRowHeight(1, 26);
+      instSheet.setColumnWidth(1, 45);
+      instSheet.setColumnWidth(2, 105);
+      instSheet.setColumnWidth(3, 220);
+      instSheet.setColumnWidth(4, 110);
+      instSheet.setColumnWidth(5, 85);
+      instSheet.setColumnWidth(6, 105);
+      instSheet.setColumnWidth(7, 105);
+      instSheet.setColumnWidth(8, 105);
+      instSheet.setColumnWidth(9, 110);
+      instSheet.setColumnWidth(10, 85);
+      instSheet.setColumnWidth(11, 100);
+    } catch (e) { }
+  }
+
+  // 3. Payment History Sheet
+  const histSheet = ss.getSheetByName(CONFIG.SHEETS.PAYMENT_HISTORY);
+  if (histSheet) {
+    try {
+      histSheet.setRowHeight(1, 26);
+      histSheet.setColumnWidth(1, 120);
+      histSheet.setColumnWidth(2, 110);
+      histSheet.setColumnWidth(3, 110);
+      histSheet.setColumnWidth(4, 200);
+    } catch (e) { }
+  }
+
+  // 4. Update the dashboards (which re-applies exact fitting to Monthly Overview, Debt Breakdown, Bank Statement, Reconciliation, Audit & Differences)
+  updateLiveDashboard();
+
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast("All sheets fitted with standard proportional row heights and column widths!", "📐 Layouts Fitted", 4);
+  } catch (e) { }
 }
 
 function onEdit(e) {
@@ -1052,6 +1108,75 @@ function getOrCreateSheet(ss, sheetName) {
   return sheet;
 }
 
+/**
+ * Applies visual ergonomics, proper row heights, and proportional column widths to a sheet.
+ * Prevents the merged-banner autoResize pitfall where Column 1 expands to 400-600px.
+ * 
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet The Google Spreadsheet sheet object
+ * @param {Object} options Configuration object:
+ *   - bannerRow: row index of title banner (default 1)
+ *   - subtitleRow: row index of subtitle (default 2)
+ *   - bannerHeight: height in pixels (default 30)
+ *   - subtitleHeight: height in pixels (default 20)
+ *   - explicitColWidths: object mapping col index (1-based) to width in px, e.g. { 1: 165 }
+ *   - autoResizeStartCol: first column to auto-resize (default 2)
+ *   - autoResizeColCount: number of columns to auto-resize
+ *   - colWidthBounds: object mapping col index (or "default") to { min, max }
+ *   - customRowHeights: object mapping row index to height in px
+ */
+function applySheetLayoutFitting(sheet, options) {
+  if (!sheet) return;
+  const opts = options || {};
+
+  // 1. Explicit Row Heights for Banners & Subtitles
+  const bRow = opts.bannerRow || 1;
+  const sRow = opts.subtitleRow || 2;
+  try { sheet.setRowHeight(bRow, opts.bannerHeight || 30); } catch (e) { }
+  try { sheet.setRowHeight(sRow, opts.subtitleHeight || 20); } catch (e) { }
+
+  if (opts.customRowHeights) {
+    Object.keys(opts.customRowHeights).forEach(r => {
+      try { sheet.setRowHeight(parseInt(r, 10), opts.customRowHeights[r]); } catch (e) { }
+    });
+  }
+
+  // 2. Safe AutoResize (ALWAYS skip Column 1 if it starts a merged title banner!)
+  if (opts.autoResizeStartCol && opts.autoResizeColCount && opts.autoResizeColCount > 0) {
+    try {
+      sheet.autoResizeColumns(opts.autoResizeStartCol, opts.autoResizeColCount);
+    } catch (e) { }
+  }
+
+  // 3. Apply Explicit Column Width Overrides
+  if (opts.explicitColWidths) {
+    Object.keys(opts.explicitColWidths).forEach(c => {
+      try {
+        sheet.setColumnWidth(parseInt(c, 10), opts.explicitColWidths[c]);
+      } catch (e) { }
+    });
+  }
+
+  // 4. Clamp Column Widths within [min, max] Bounds
+  if (opts.colWidthBounds) {
+    const bounds = opts.colWidthBounds;
+    const startCol = opts.autoResizeStartCol || 2;
+    const endCol = startCol + (opts.autoResizeColCount || 0) - 1;
+    for (let c = startCol; c <= endCol; c++) {
+      const bound = bounds[c] || bounds.default;
+      if (bound) {
+        try {
+          const currentWidth = sheet.getColumnWidth(c);
+          if (bound.min && currentWidth < bound.min) {
+            sheet.setColumnWidth(c, bound.min);
+          } else if (bound.max && currentWidth > bound.max) {
+            sheet.setColumnWidth(c, bound.max);
+          }
+        } catch (e) { }
+      }
+    }
+  }
+}
+
 function writeStatementToSheet(ss, meta, transactions) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.BANK_STATEMENT);
   sheet.clear();
@@ -1126,7 +1251,20 @@ function writeStatementToSheet(ss, meta, transactions) {
     }
   }
 
-  sheet.autoResizeColumns(1, headers.length);
+  applySheetLayoutFitting(sheet, {
+    bannerRow: 1,
+    bannerHeight: 30,
+    customRowHeights: { 2: 22, 3: 22, 4: 22, 6: 26 },
+    explicitColWidths: {
+      1: 45,   // #
+      2: 105,  // Tx Date
+      3: 105,  // Posting Date
+      4: 240,  // Description
+      5: 90,   // Type
+      6: 115,  // Amount (EGP)
+      7: 170   // Assigned Payer / Status
+    }
+  });
 }
 
 // ==========================================
@@ -2078,9 +2216,41 @@ function runReconciliation(ss, tz) {
   hRange.setBackgrounds(statusColors);
   hRange.setFontWeight("bold");
   hRange.setFontSize(9);
-  stmtSheet.autoResizeColumns(1, 7);
+  applySheetLayoutFitting(stmtSheet, {
+    bannerRow: 1,
+    bannerHeight: 30,
+    customRowHeights: { 2: 22, 3: 22, 4: 22, 6: 26 },
+    explicitColWidths: {
+      1: 45,
+      2: 105,
+      3: 105,
+      4: 240,
+      5: 90,
+      6: 115,
+      7: 170
+    }
+  });
 
-  reconSheet.autoResizeColumns(1, 8);
+  applySheetLayoutFitting(reconSheet, {
+    bannerRow: 1,
+    bannerHeight: 30,
+    customRowHeights: { 2: 24 },
+    explicitColWidths: {
+      1: 45 // #
+    },
+    autoResizeStartCol: 2,
+    autoResizeColCount: 7,
+    colWidthBounds: {
+      2: { min: 100, max: 120 },
+      3: { min: 180, max: 260 },
+      4: { min: 100, max: 130 },
+      5: { min: 120, max: 220 },
+      6: { min: 120, max: 200 },
+      7: { min: 110, max: 150 },
+      8: { min: 120, max: 170 },
+      default: { min: 100, max: 220 }
+    }
+  });
 }
 
 function addAssignedChargesToTransactions() {
@@ -2961,7 +3131,24 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
   curRow += 2;
 
-  sheet.autoResizeColumns(1, 9);
+  applySheetLayoutFitting(sheet, {
+    bannerRow: 1,
+    bannerHeight: 30,
+    subtitleRow: 2,
+    subtitleHeight: 20,
+    customRowHeights: { 4: 26 },
+    explicitColWidths: {
+      1: 145, // Family Member / #
+      2: 110, // Purchases / Person
+      3: 105, // Installments / Category
+      4: 230, // Missing Tx / Description
+      5: 120, // Total Share / Installment Details
+      6: 110, // % of Statement / Purchase Date
+      7: 125, // Payment Status / Amount
+      8: 125, // Original Tx Amount
+      9: 170  // Statement Match Status
+    }
+  });
 }
 
 function getPurchaseDateWindow(dueYear, dueMonth) {
@@ -3156,6 +3343,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     .setFontSize(12)
     .setBackground(CONFIG.COLORS.PRIMARY)
     .setFontColor("#ffffff");
+  try { sheet.setRowHeight(curRow, 26); } catch (e) { }
   curRow++;
 
   sheet.getRange(curRow, 1, 1, matrixCols.length).merge()
@@ -3163,6 +3351,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  try { sheet.setRowHeight(curRow, 20); } catch (e) { }
   curRow += 2;
 
   // Headers
@@ -3251,6 +3440,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     .setFontSize(12)
     .setBackground(CONFIG.COLORS.PRIMARY)
     .setFontColor("#ffffff");
+  try { sheet.setRowHeight(curRow, 26); } catch (e) { }
   curRow++;
 
   sheet.getRange(curRow, 1, 1, 8).merge()
@@ -3258,6 +3448,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  try { sheet.setRowHeight(curRow, 20); } catch (e) { }
   curRow += 2;
 
   if (upcomingKeys.length === 0) {
@@ -3347,6 +3538,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     .setFontSize(12)
     .setBackground(CONFIG.COLORS.PRIMARY)
     .setFontColor("#ffffff");
+  try { sheet.setRowHeight(curRow, 26); } catch (e) { }
   curRow++;
 
   sheet.getRange(curRow, 1, 1, 8).merge()
@@ -3354,6 +3546,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
+  try { sheet.setRowHeight(curRow, 20); } catch (e) { }
   curRow += 2;
 
   const allHistKeys = Object.keys(HISTORICAL_MONTHS).sort();
@@ -3401,7 +3594,21 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     curRow += 3;
   });
 
-  sheet.autoResizeColumns(1, Math.max(9, matrixCols.length));
+  applySheetLayoutFitting(sheet, {
+    bannerRow: 1,
+    bannerHeight: 30,
+    subtitleRow: 2,
+    subtitleHeight: 20,
+    customRowHeights: { 4: 26 },
+    explicitColWidths: {
+      1: 165 // Family Member (fits longest name without horizontal blowout)
+    },
+    autoResizeStartCol: 2,
+    autoResizeColCount: matrixCols.length - 1,
+    colWidthBounds: {
+      default: { min: 105, max: 125 }
+    }
+  });
 }
 
 function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, activeCycleKey, activeCycleLabel, activeStatementDueDate, reconAssignedList, neglectedTxKeys, existingTxList, sortedPeople, assignedChargesList) {
@@ -4070,5 +4277,19 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
     curRow += t5Rows.length + 2;
   }
 
-  sheet.autoResizeColumns(1, 8);
+  applySheetLayoutFitting(sheet, {
+    bannerRow: 1,
+    bannerHeight: 30,
+    subtitleRow: 2,
+    subtitleHeight: 20,
+    customRowHeights: { 4: 26 },
+    explicitColWidths: {
+      1: 180 // Component / Metric / Family Member
+    },
+    autoResizeStartCol: 2,
+    autoResizeColCount: 7,
+    colWidthBounds: {
+      default: { min: 100, max: 180 }
+    }
+  });
 }
