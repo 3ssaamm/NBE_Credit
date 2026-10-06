@@ -81,80 +81,160 @@ function parseDateValue(rawDate, tz) {
   }
   const s = String(rawDate).trim();
   if (!s) return null;
+
   // Try YYYY-MM-DD
   const iso = s.match(/^(\d{4})[-\/\.](\d{1,2})[-\/\.](\d{1,2})/);
   if (iso) {
     const d = new Date(parseInt(iso[1], 10), parseInt(iso[2], 10) - 1, parseInt(iso[3], 10));
     if (!isNaN(d.getTime())) return d;
   }
-  // Try DD/MM/YYYY or DD-MM-YYYY
+
+  // Try DD/MM/YYYY or MM/DD/YYYY with smart disambiguation
   const dmy = s.match(/^(\d{1,2})[-\/\.](\d{1,2})[-\/\.](\d{4})/);
   if (dmy) {
-    const d = new Date(parseInt(dmy[3], 10), parseInt(dmy[2], 10) - 1, parseInt(dmy[1], 10));
+    const p1 = parseInt(dmy[1], 10);
+    const p2 = parseInt(dmy[2], 10);
+    const y = parseInt(dmy[3], 10);
+    let day = p1;
+    let month = p2 - 1;
+    if (p2 > 12 && p1 <= 12) {
+      // Must be MM/DD/YYYY (e.g. 8/31/2026)
+      month = p1 - 1;
+      day = p2;
+    } else if (p1 > 12 && p2 <= 12) {
+      // Must be DD/MM/YYYY (e.g. 31/8/2026)
+      day = p1;
+      month = p2 - 1;
+    }
+    const d = new Date(y, month, day);
     if (!isNaN(d.getTime())) return d;
   }
+
+  // Try month names like "31 August 2026", "August 31, 2026", "31-Aug-2026"
+  const monthMap = {
+    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
+    may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7,
+    sep: 8, sept: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11
+  };
+  const named1 = s.match(/^(\d{1,2})(?:st|nd|rd|th)?[\s\-\/\.]+([a-zA-Z]+)[\s\-\/\.]+(\d{4})/i);
+  if (named1 && monthMap[named1[2].toLowerCase()] !== undefined) {
+    const d = new Date(parseInt(named1[3], 10), monthMap[named1[2].toLowerCase()], parseInt(named1[1], 10));
+    if (!isNaN(d.getTime())) return d;
+  }
+  const named2 = s.match(/^([a-zA-Z]+)[\s\-\/\.]+(\d{1,2})(?:st|nd|rd|th)?,?[\s\-\/\.]+(\d{4})/i);
+  if (named2 && monthMap[named2[1].toLowerCase()] !== undefined) {
+    const d = new Date(parseInt(named2[3], 10), monthMap[named2[1].toLowerCase()], parseInt(named2[2], 10));
+    if (!isNaN(d.getTime())) return d;
+  }
+
   const d = new Date(s);
   if (!isNaN(d.getTime())) return d;
   return null;
 }
 
-function getDueDateForPurchase(purchaseDate, tz, statementDate, statementDueDate, stmtStartDate) {
+/**
+ * Determines the NBE Credit Card Billing Cycle and Payment Due Date for a purchase.
+ * 
+ * NBE Credit Card Rules:
+ * - Purchases made on days 1 to 30 of month M belong to Month M Billing Cycle (billed month-end M, due on Month M+1, 25th).
+ * - Purchases made on day 31 of month M (e.g. August 31st) roll over into Month M+1 Billing Cycle (September),
+ *   which is billed at the end of Month M+1 and due on Month M+2, 25th (October 25th).
+ */
+function getBillingCycleForPurchase(purchaseDate, tz) {
   if (!purchaseDate || isNaN(purchaseDate.getTime())) return null;
   const targetTz = tz || "Africa/Cairo";
 
   const day = parseInt(Utilities.formatDate(purchaseDate, targetTz, "d"), 10);
-  const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
+  const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1; // 0-11
   const year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
 
-  // Day 31 Rule: In NBE credit card billing, the statement cycle closes on the 30th (or month-end).
-  // A transaction made on the 31st of month M-1 (e.g. August 31st) is part of month M's billing cycle (September),
-  // which is billed at the end of month M and due on month M+1, 25th (October 25th).
-  // Therefore, in Monthly Overview forecasting, any purchase on day 31 rolls over to month + 2 due date!
+  let cycleYear = year;
+  let cycleMonth = month; // 0-11
+
+  // Day 31 Rollover Rule:
+  // August 31st belongs to September billing cycle (cycleMonth = 8, year = 2026), due October 25th!
   if (day === 31) {
-    return new Date(year, month + 2, 1);
-  }
-
-  // If active statement info is available, anchor strictly within the PDF statement window [stmtStartDate, statementDate]
-  // (Excluding day 31, which rolls over to the upcoming cycle)
-  if (statementDate && statementDueDate) {
-    const sEnd = new Date(statementDate.getFullYear(), statementDate.getMonth(), statementDate.getDate(), 23, 59, 59, 999);
-    // STRICT PDF STATEMENT DATES:
-    // If stmtStartDate is known (from PDF earliest transaction date), use it directly!
-    // Never reach back arbitrarily to June 29!
-    const sStart = stmtStartDate
-      ? new Date(stmtStartDate.getFullYear(), stmtStartDate.getMonth(), stmtStartDate.getDate(), 0, 0, 0, 0)
-      : new Date(statementDate.getFullYear(), statementDate.getMonth(), 1, 0, 0, 0, 0);
-
-    if (purchaseDate >= sStart && purchaseDate <= sEnd) {
-      return statementDueDate;
-    }
-
-    // If purchase was made before sStart, it belonged to a prior billing cycle!
-    if (purchaseDate < sStart) {
-      const pMonth = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
-      const pYear = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
-      return new Date(pYear, pMonth + 1, 1);
+    cycleMonth = month + 1;
+    if (cycleMonth > 11) {
+      cycleMonth = 0;
+      cycleYear++;
     }
   }
 
-  // Standard NBE Consumer Credit Card Billing for days 1-30:
-  // Statements close on the 30th of each calendar month.
-  // Payment is due on the 25th of the following month (month + 1).
-  // All purchases made during month M (days 1-30) are billed on month M statement, due in month M + 1.
-  return new Date(year, month + 1, 1);
+  const cycleDate = new Date(cycleYear, cycleMonth, 1);
+  let dueYear = cycleYear;
+  let dueMonth = cycleMonth + 1;
+  if (dueMonth > 11) {
+    dueMonth = 0;
+    dueYear++;
+  }
+  const dueDate = new Date(dueYear, dueMonth, 25);
+
+  const cycleSortKey = Utilities.formatDate(cycleDate, targetTz, "yyyy-MM");
+  const cycleLabel = Utilities.formatDate(cycleDate, targetTz, "MMMM yyyy");
+  const dueDateLabel = Utilities.formatDate(dueDate, targetTz, "MMMM d, yyyy");
+
+  return {
+    cycleSortKey: cycleSortKey,
+    cycleLabel: cycleLabel,
+    cycleDate: cycleDate,
+    dueDate: dueDate,
+    dueDateLabel: dueDateLabel,
+    isDay31Rollover: (day === 31)
+  };
 }
 
-function getDueDateForInstallment(purchaseDate, tz) {
+/**
+ * Determines the NBE Credit Card Billing Cycle and Due Date for an Installment EMI.
+ * 
+ * NBE 55-Day Installment Policy:
+ * Purchases made on installment in month M have a full billing cycle grace period (~55 days).
+ * The first EMI is billed on month M+1 statement, due on the 25th of month M+2.
+ * Example: Purchased in August -> 1st EMI billed on Sep 30 statement (September cycle), due Oct 25.
+ */
+function getBillingCycleForInstallment(purchaseDate, installmentIndex, tz) {
   if (!purchaseDate || isNaN(purchaseDate.getTime())) return null;
   const targetTz = tz || "Africa/Cairo";
 
-  // NBE 55-Day Installment Policy:
-  // Purchases made on installment in month M have a full billing cycle grace period (~55 days).
-  // The first EMI is billed on month M+1 statement, due on the 25th of month M+2.
-  // Example: Fan purchased Aug 28 -> First EMI billed on Sep 30 statement, due Oct 25 (month + 2).
-  const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
+  const month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1; // 0-11
   const year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
-  return new Date(year, month + 2, 1);
+
+  let cycleMonth = month + 1 + installmentIndex;
+  let cycleYear = year + Math.floor(cycleMonth / 12);
+  cycleMonth = ((cycleMonth % 12) + 12) % 12;
+
+  let dueMonth = cycleMonth + 1;
+  let dueYear = cycleYear;
+  if (dueMonth > 11) {
+    dueMonth = 0;
+    dueYear++;
+  }
+
+  const cycleDate = new Date(cycleYear, cycleMonth, 1);
+  const dueDate = new Date(dueYear, dueMonth, 25);
+
+  const cycleSortKey = Utilities.formatDate(cycleDate, targetTz, "yyyy-MM");
+  const cycleLabel = Utilities.formatDate(cycleDate, targetTz, "MMMM yyyy");
+  const dueDateLabel = Utilities.formatDate(dueDate, targetTz, "MMMM d, yyyy");
+
+  return {
+    cycleSortKey: cycleSortKey,
+    cycleLabel: cycleLabel,
+    cycleDate: cycleDate,
+    dueDate: dueDate,
+    dueDateLabel: dueDateLabel
+  };
+}
+
+// Backwards compatibility wrappers
+function getDueDateForPurchase(purchaseDate, tz) {
+  const info = getBillingCycleForPurchase(purchaseDate, tz);
+  return info ? info.dueDate : null;
+}
+
+function getDueDateForInstallment(purchaseDate, tz) {
+  const info = getBillingCycleForInstallment(purchaseDate, 0, tz);
+  return info ? info.dueDate : null;
 }
 
 // ==========================================
@@ -2014,8 +2094,20 @@ function calculateCardBalance(ss, tz) {
 
   const stmtPeriod = getStatementPeriod(statementDate, minStmtTxDate, maxStmtTxDate);
 
+  // Billing cycle of active statement (e.g. "2026-08" / "August 2026" for August 31 statement)
+  let activeCycleKey = "";
+  let activeCycleLabel = "";
+  if (statementDate) {
+    activeCycleKey = Utilities.formatDate(statementDate, tz, "yyyy-MM");
+    activeCycleLabel = Utilities.formatDate(statementDate, tz, "MMMM yyyy");
+  } else {
+    const now = new Date();
+    activeCycleKey = Utilities.formatDate(now, tz, "yyyy-MM");
+    activeCycleLabel = Utilities.formatDate(now, tz, "MMMM yyyy");
+  }
+
   if (!statementDueDate && statementDate) {
-    statementDueDate = getDueDateForPurchase(statementDate, tz, statementDate, null, stmtPeriod.start);
+    statementDueDate = new Date(statementDate.getFullYear(), statementDate.getMonth() + 1, 25);
   }
 
   // Calculate Remaining Installments Principal Blocked
@@ -2036,13 +2128,8 @@ function calculateCardBalance(ss, tz) {
     });
   }
 
-  // Calculate Unbilled New Purchases (strictly after statement cutoff)
+  // Calculate Unbilled New Purchases (purchases belonging to upcoming billing cycles)
   let unbilledNewPurchases = 0;
-  let stmtCutoff = null;
-  if (statementDate) {
-    stmtCutoff = new Date(statementDate.getFullYear(), statementDate.getMonth(), statementDate.getDate(), 23, 59, 59, 999);
-  }
-
   const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
   if (txSheet && txSheet.getLastRow() >= 2) {
     const txData = txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues();
@@ -2050,11 +2137,9 @@ function calculateCardBalance(ss, tz) {
       const pDate = parseDateValue(row[1], tz);
       const amt = parseFloat(row[4]);
       if (pDate && !isNaN(amt) && amt > 0) {
-        const pDay = parseInt(Utilities.formatDate(pDate, tz, "d"), 10);
-        // Include purchases strictly after statement cutoff, OR on day 31 of statement month (start of next billing cycle)
-        const isUpcomingCycle = (stmtCutoff && pDate > stmtCutoff) ||
-          (pDay === 31 && stmtCutoff && pDate.getMonth() === stmtCutoff.getMonth() && pDate.getFullYear() === stmtCutoff.getFullYear());
-        if (isUpcomingCycle) {
+        const cycleInfo = getBillingCycleForPurchase(pDate, tz);
+        // Include purchases belonging to upcoming cycles (including day 31 purchases rolling over!)
+        if (cycleInfo && cycleInfo.cycleSortKey > activeCycleKey) {
           unbilledNewPurchases += amt;
         }
       }
@@ -2071,15 +2156,15 @@ function calculateCardBalance(ss, tz) {
     });
 
     const currentMonthLabel = Utilities.formatDate(new Date(), tz, "MMMM yyyy").toLowerCase();
+    const activeCycleMonthLabel = activeCycleLabel.toLowerCase();
     let stmtDueMonthLabel = "";
     if (statementDueDate) {
       stmtDueMonthLabel = Utilities.formatDate(statementDueDate, tz, "MMMM yyyy").toLowerCase();
-    } else if (statementDate) {
-      const stmtDueDate = getDueDateForPurchase(statementDate, tz, statementDate, null, stmtPeriod.start);
-      if (stmtDueDate) stmtDueMonthLabel = Utilities.formatDate(stmtDueDate, tz, "MMMM yyyy").toLowerCase();
     }
 
-    isCurrentBillPaid = paidMonths.includes(currentMonthLabel) || (stmtDueMonthLabel && paidMonths.includes(stmtDueMonthLabel));
+    isCurrentBillPaid = paidMonths.includes(currentMonthLabel) ||
+      (activeCycleMonthLabel && paidMonths.includes(activeCycleMonthLabel)) ||
+      (stmtDueMonthLabel && paidMonths.includes(stmtDueMonthLabel));
   }
 
   const effectiveBilled = isCurrentBillPaid ? 0 : billedBalance;
@@ -2095,6 +2180,8 @@ function calculateCardBalance(ss, tz) {
     totalCredit: totalCredit,
     statementDate: statementDate,
     statementDueDate: statementDueDate,
+    activeCycleKey: activeCycleKey,
+    activeCycleLabel: activeCycleLabel,
     minStmtTxDate: minStmtTxDate,
     maxStmtTxDate: maxStmtTxDate,
     stmtPeriod: stmtPeriod,
@@ -2140,9 +2227,12 @@ function updateLiveDashboard(options) {
   }
 
   // Read Card Balance & Active Statement info
+  // Read Card Balance & Active Statement info
   const cardBal = calculateCardBalance(ss, tz);
-  const activeStatementDueDate = cardBal.statementDueDate || (cardBal.statementDate ? getDueDateForPurchase(cardBal.statementDate, tz) : new Date());
-  const activeStatementSortKey = Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
+  const activeCycleKey = cardBal.activeCycleKey;
+  const activeCycleLabel = cardBal.activeCycleLabel;
+  const activeStatementDueDate = cardBal.statementDueDate || (cardBal.statementDate ? new Date(cardBal.statementDate.getFullYear(), cardBal.statementDate.getMonth() + 1, 25) : new Date());
+  const activeStatementSortKey = activeCycleKey;
 
   // Read Paid Months Set
   const paidMonthsSet = new Set();
@@ -2163,18 +2253,17 @@ function updateLiveDashboard(options) {
   const allDebts = {};
   const debtLineItems = [];
 
-  function addDebtItem({ dueDate, person, category, desc, installmentInfo, purchaseDate, originalAmount, amount, isMissingFromSheet, note }) {
-    if (!dueDate || !person) return;
+  function addDebtItem({ cycleSortKey, cycleLabel, dueDate, dueDateLabel, person, category, desc, installmentInfo, purchaseDate, originalAmount, amount, isMissingFromSheet, note }) {
+    if (!cycleSortKey || !person) return;
     const normalizedPerson = normalizePersonName(person);
     if (!normalizedPerson || normalizedPerson.toLowerCase() === "shared") return;
 
-    const sortKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
-    const label = Utilities.formatDate(dueDate, tz, "MMMM yyyy");
-
-    if (!allDebts[sortKey]) {
-      allDebts[sortKey] = {
-        label: label,
+    if (!allDebts[cycleSortKey]) {
+      allDebts[cycleSortKey] = {
+        label: cycleLabel,
+        cycleSortKey: cycleSortKey,
         dueDate: dueDate,
+        dueDateLabel: dueDateLabel,
         total: 0,
         purchasesTotal: 0,
         installmentsTotal: 0,
@@ -2184,33 +2273,36 @@ function updateLiveDashboard(options) {
       };
     }
 
-    allDebts[sortKey].total += amount;
+    allDebts[cycleSortKey].total += amount;
     if (category === "Purchase") {
-      allDebts[sortKey].purchasesTotal += amount;
+      allDebts[cycleSortKey].purchasesTotal += amount;
     } else if (category === "Installment") {
-      allDebts[sortKey].installmentsTotal += amount;
+      allDebts[cycleSortKey].installmentsTotal += amount;
     } else if (category === "MissingStatementDebit" || isMissingFromSheet) {
-      allDebts[sortKey].missingFromSheetTotal += amount;
+      allDebts[cycleSortKey].missingFromSheetTotal += amount;
     }
 
-    allDebts[sortKey].people[normalizedPerson] = (allDebts[sortKey].people[normalizedPerson] || 0) + amount;
+    allDebts[cycleSortKey].people[normalizedPerson] = (allDebts[cycleSortKey].people[normalizedPerson] || 0) + amount;
 
-    if (!allDebts[sortKey].peopleBreakdown[normalizedPerson]) {
-      allDebts[sortKey].peopleBreakdown[normalizedPerson] = { purchases: 0, installments: 0, missingFromSheet: 0, total: 0 };
+    if (!allDebts[cycleSortKey].peopleBreakdown[normalizedPerson]) {
+      allDebts[cycleSortKey].peopleBreakdown[normalizedPerson] = { purchases: 0, installments: 0, missingFromSheet: 0, total: 0 };
     }
     if (category === "Purchase") {
-      allDebts[sortKey].peopleBreakdown[normalizedPerson].purchases += amount;
+      allDebts[cycleSortKey].peopleBreakdown[normalizedPerson].purchases += amount;
     } else if (category === "Installment") {
-      allDebts[sortKey].peopleBreakdown[normalizedPerson].installments += amount;
+      allDebts[cycleSortKey].peopleBreakdown[normalizedPerson].installments += amount;
     } else if (category === "MissingStatementDebit" || isMissingFromSheet) {
-      allDebts[sortKey].peopleBreakdown[normalizedPerson].missingFromSheet += amount;
+      allDebts[cycleSortKey].peopleBreakdown[normalizedPerson].missingFromSheet += amount;
     }
-    allDebts[sortKey].peopleBreakdown[normalizedPerson].total += amount;
+    allDebts[cycleSortKey].peopleBreakdown[normalizedPerson].total += amount;
 
     debtLineItems.push({
-      sortKey: sortKey,
-      dueMonthLabel: label,
+      sortKey: cycleSortKey,
+      cycleSortKey: cycleSortKey,
+      cycleLabel: cycleLabel,
+      dueMonthLabel: cycleLabel,
       dueDate: dueDate,
+      dueDateLabel: dueDateLabel,
       person: normalizedPerson,
       category: category,
       desc: desc,
@@ -2230,7 +2322,6 @@ function updateLiveDashboard(options) {
     neglectedTxKeys = new Set(JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]"));
   } catch (err) { }
 
-  const stmtPeriod = cardBal.stmtPeriod || getStatementPeriod(cardBal.statementDate, cardBal.minStmtTxDate, cardBal.maxStmtTxDate);
   const existingTransactionsForDedupe = [];
   if (transactionsSheet.getLastRow() >= 2) {
     const txData = transactionsSheet.getRange(2, 1, transactionsSheet.getLastRow() - 1, 5).getValues();
@@ -2245,11 +2336,14 @@ function updateLiveDashboard(options) {
       const amount = parseFloat(rawAmount);
       if (!purchaseDate || isNaN(amount) || amount <= 0) return;
 
-      // STRICT PDF STATEMENT PERIOD FILTER:
-      // "YOU FOLLOW THE DATES IN THE PDF!!"
-      // Transactions strictly before stmtPeriod.start (e.g. June 29 when PDF starts July 30)
-      // belong to prior billing cycles that are already captured in historical data.
-      if (stmtPeriod.start && purchaseDate < stmtPeriod.start) {
+      // Determine Billing Cycle for this purchase (Day 31 purchases roll over to upcoming cycle!)
+      const cycleInfo = getBillingCycleForPurchase(purchaseDate, tz);
+      if (!cycleInfo) return;
+
+      // Historical billing cycles filter:
+      // If purchase belongs to a billing cycle strictly before the active statement cycle (e.g. July),
+      // it was already captured in historical statements.
+      if (cycleInfo.cycleSortKey < activeCycleKey) {
         return;
       }
 
@@ -2262,17 +2356,9 @@ function updateLiveDashboard(options) {
         return;
       }
 
-      // Calculate Due Date:
-      // Purchases within statement window get activeStatementDueDate.
-      // Day 31 and post-cutoff purchases roll over to upcoming billing cycles!
-      const dueDate = getDueDateForPurchase(purchaseDate, tz, cardBal.statementDate, activeStatementDueDate, stmtPeriod.start);
-      if (!dueDate) return;
-
-      const dueSortKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
-
       // Deduplication list for active statement audit against statement debits:
       // Only include purchases that strictly belong to the active statement cycle (not upcoming cycles)
-      if (dueSortKey === activeStatementSortKey && (!stmtPeriod.end || purchaseDate <= stmtPeriod.end)) {
+      if (cycleInfo.cycleSortKey === activeCycleKey) {
         existingTransactionsForDedupe.push({
           date: purchaseDate,
           rawDate: rawDate,
@@ -2288,7 +2374,10 @@ function updateLiveDashboard(options) {
 
       people.forEach(p => {
         addDebtItem({
-          dueDate: dueDate,
+          cycleSortKey: cycleInfo.cycleSortKey,
+          cycleLabel: cycleInfo.cycleLabel,
+          dueDate: cycleInfo.dueDate,
+          dueDateLabel: cycleInfo.dueDateLabel,
           person: p,
           category: "Purchase",
           desc: desc,
@@ -2324,16 +2413,19 @@ function updateLiveDashboard(options) {
       if (people.length === 0) return;
       const splitEmi = emi / people.length;
 
-      // First installment is due under NBE 55-day installment policy (month + 2)
-      const firstDueDate = getDueDateForInstallment(purchaseDate, tz);
-
       for (let i = 0; i < durationMonths; i++) {
-        const dueMonthDate = new Date(firstDueDate.getFullYear(), firstDueDate.getMonth() + i, 1);
+        const instCycle = getBillingCycleForInstallment(purchaseDate, i, tz);
+        if (!instCycle) continue;
+        if (instCycle.cycleSortKey < activeCycleKey) continue;
+
         const instInfo = `${i + 1} of ${durationMonths}`;
 
         people.forEach(p => {
           addDebtItem({
-            dueDate: dueMonthDate,
+            cycleSortKey: instCycle.cycleSortKey,
+            cycleLabel: instCycle.cycleLabel,
+            dueDate: instCycle.dueDate,
+            dueDateLabel: instCycle.dueDateLabel,
             person: p,
             category: "Installment",
             desc: desc,
@@ -2426,7 +2518,10 @@ function updateLiveDashboard(options) {
 
     people.forEach(p => {
       addDebtItem({
+        cycleSortKey: activeCycleKey,
+        cycleLabel: activeCycleLabel,
         dueDate: chargeDueDate,
+        dueDateLabel: Utilities.formatDate(chargeDueDate, tz, "MMMM d, yyyy"),
         person: p,
         category: "MissingStatementDebit",
         desc: item.desc || "Statement Charge",
@@ -2454,22 +2549,22 @@ function updateLiveDashboard(options) {
     .sort((a, b) => a.localeCompare(b));
 
   // 4. Render Dedicated 'Debt Breakdown' Sheet (Active Statement ONLY)
-  renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeStatementDueDate, assignedMissingCount, assignedMissingTotal);
+  renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeCycleKey, activeCycleLabel, activeStatementDueDate, assignedMissingCount, assignedMissingTotal);
 
   // 5. Render Dedicated 'Monthly Overview' Sheet (Upcoming Forecasts & Previous Cycles)
-  renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, activeStatementDueDate);
+  renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, activeCycleKey, activeCycleLabel, activeStatementDueDate);
 
   // 6. Render Dedicated 'Audit & Differences' Sheet
-  renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, activeStatementDueDate, reconAssignedList, neglectedTxKeys, existingTransactionsForDedupe, sortedPeople, assignedChargesList);
+  renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, activeCycleKey, activeCycleLabel, activeStatementDueDate, reconAssignedList, neglectedTxKeys, existingTransactionsForDedupe, sortedPeople, assignedChargesList);
 }
 
-function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeStatementDueDate, assignedMissingCount, assignedMissingTotal) {
+function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, cardBal, activeCycleKey, activeCycleLabel, activeStatementDueDate, assignedMissingCount, assignedMissingTotal) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.DEBT_BREAKDOWN);
   sheet.clear();
   sheet.setHiddenGridlines(false);
 
-  const activeSortKey = Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
-  const activeMonthLabel = Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
+  const activeSortKey = activeCycleKey || Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
+  const activeMonthLabel = activeCycleLabel || Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
   const activeDueDateFormatted = Utilities.formatDate(activeStatementDueDate, tz, "EEEE, MMMM d, yyyy");
   const activeData = allDebts[activeSortKey] || {
     label: activeMonthLabel,
@@ -2766,13 +2861,13 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   sheet.autoResizeColumns(1, 9);
 }
 
-function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, activeStatementDueDate) {
+function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeople, paidMonthsSet, activeCycleKey, activeCycleLabel, activeStatementDueDate) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.MONTHLY_OVERVIEW);
   sheet.clear();
   sheet.setHiddenGridlines(false);
 
-  const activeSortKey = Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
-  const activeMonthLabel = Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
+  const activeSortKey = activeCycleKey || Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
+  const activeMonthLabel = activeCycleLabel || Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
   const activeData = allDebts[activeSortKey] || { total: 0, purchasesTotal: 0, installmentsTotal: 0, people: {}, peopleBreakdown: {} };
 
   // Hardcoded historical months data (Audited March 2026 – August 2026)
@@ -2851,9 +2946,9 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     },
     "2026-08": {
       label: "August 2026",
-      dueDateLabel: "August 25, 2026",
+      dueDateLabel: "September 25, 2026",
       totalBill: 22867.63,
-      status: "Paid",
+      status: "Settled with NBE",
       people: {
         "Abdo": 5272.39,
         "Dad": 1210.33,
@@ -2884,7 +2979,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
 
   // Upcoming keys (strictly future months)
   const upcomingKeys = Object.keys(allDebts).filter(k => k > activeSortKey).sort();
-  const histKeys = Object.keys(HISTORICAL_MONTHS).sort();
+  const histKeys = Object.keys(HISTORICAL_MONTHS).filter(k => k < activeSortKey).sort();
 
   // ==========================================
   // SECTION 1: 📊 MULTI-MONTH COMPARISON MATRIX (Full Timeline View)
@@ -2942,7 +3037,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
   const totalBillRow = matrixCols.map((c, idx) => {
     if (idx === 0) return "TOTAL MONTH BILL (EGP)";
     if (c.type === "hist") return HISTORICAL_MONTHS[c.key].totalBill;
-    if (c.type === "active") return activeData.total;
+    if (c.type === "active") return activeData.total || (HISTORICAL_MONTHS[c.key] ? HISTORICAL_MONTHS[c.key].totalBill : 0);
     if (c.type === "upcoming") return (allDebts[c.key] ? allDebts[c.key].total : 0);
     return 0;
   });
@@ -2983,7 +3078,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
         val = HISTORICAL_MONTHS[col.key].people[person] || 0;
       } else if (col.type === "active") {
         const bk = activeData.peopleBreakdown[person];
-        val = bk ? bk.total : (activeData.people[person] || 0);
+        val = bk ? bk.total : (activeData.people[person] || (HISTORICAL_MONTHS[col.key] && HISTORICAL_MONTHS[col.key].people[person] ? HISTORICAL_MONTHS[col.key].people[person] : 0));
       } else if (col.type === "upcoming") {
         const mD = allDebts[col.key];
         if (mD) {
@@ -3007,7 +3102,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
   // ==========================================
   // SECTION 2: 🕒 UPCOMING BILLING CYCLES (Forecasted from Transactions & Installments)
   // ==========================================
-  sheet.getRange(curRow, 1, 1, 7).merge()
+  sheet.getRange(curRow, 1, 1, 8).merge()
     .setValue("🕒 Section 2: Upcoming Billing Cycles (Forecasted from Transactions & Installments)")
     .setFontWeight("bold")
     .setFontSize(12)
@@ -3015,15 +3110,15 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     .setFontColor("#ffffff");
   curRow++;
 
-  sheet.getRange(curRow, 1, 1, 7).merge()
-    .setValue("Upcoming months dynamically projected from active installments and new post-cutoff purchases recorded in Transactions.")
+  sheet.getRange(curRow, 1, 1, 8).merge()
+    .setValue("Upcoming months dynamically projected from active installments and new purchases recorded in Transactions (including day 31 purchases rolling over).")
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
   curRow += 2;
 
   if (upcomingKeys.length === 0) {
-    sheet.getRange(curRow, 1, 1, 7).merge()
+    sheet.getRange(curRow, 1, 1, 8).merge()
       .setValue("ℹ️ No upcoming installment charges or post-cutoff purchases currently recorded.")
       .setFontStyle("italic")
       .setFontColor(CONFIG.COLORS.TEXT_MUTED);
@@ -3032,9 +3127,10 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     upcomingKeys.forEach(mKey => {
       const mData = allDebts[mKey];
       const mLabel = mData.label || mKey;
+      const mDueDateStr = mData.dueDateLabel || (mData.dueDate ? Utilities.formatDate(mData.dueDate, tz, "MMMM d, yyyy") : "25th");
 
       // Header Bar for this month
-      const mTitle = `📅 ${mLabel} (Payment Due 25th) — Forecast Total: ${mData.total.toFixed(2)} EGP — 🕒 [UPCOMING FORECAST]`;
+      const mTitle = `📅 ${mLabel} (Payment Due ${mDueDateStr}) — Forecast Total: ${mData.total.toFixed(2)} EGP — 🕒 [UPCOMING FORECAST]`;
       sheet.getRange(curRow, 1, 1, 6).merge()
         .setValue(mTitle)
         .setFontWeight("bold")
@@ -3075,17 +3171,17 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
       sheet.getRange(curRow, 5, 1, 1).setNumberFormat("0.0%");
       curRow += 2;
 
-      // Itemized charges for this upcoming month (Installment breakdown)
+      // Itemized charges for this upcoming month (including Day 31 purchases and installments!)
       const futureItems = debtLineItems.filter(it => it.sortKey === mKey);
       if (futureItems.length > 0) {
-        sheet.getRange(curRow, 1, 1, 7).merge()
+        sheet.getRange(curRow, 1, 1, 8).merge()
           .setValue(`📋 Itemized Upcoming Charges for ${mLabel} (${futureItems.length} items)`)
           .setFontWeight("bold")
           .setFontSize(10)
           .setBackground(CONFIG.COLORS.HEADER);
         curRow++;
 
-        const fHeaders = ["#", "Person", "Category", "Description / Merchant", "Installment Progress", "Share (EGP)", "Original Amount (EGP)"];
+        const fHeaders = ["#", "Purchase Date", "Person", "Category", "Description / Merchant", "Installment Progress", "Share (EGP)", "Original Amount (EGP)"];
         sheet.getRange(curRow, 1, 1, fHeaders.length).setValues([fHeaders])
           .setFontWeight("bold")
           .setFontSize(9)
@@ -3095,8 +3191,15 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
 
         const fRows = futureItems.map((it, idx) => {
           const catLabel = it.category === "Installment" ? "📦 Installment" : "🛒 One-Time Purchase";
+          let pDateStr = "-";
+          if (it.purchaseDate) {
+            pDateStr = (it.purchaseDate instanceof Date && !isNaN(it.purchaseDate.getTime()))
+              ? Utilities.formatDate(it.purchaseDate, tz, "yyyy-MM-dd")
+              : String(it.purchaseDate);
+          }
           return [
             idx + 1,
+            pDateStr,
             it.person,
             catLabel,
             it.desc,
@@ -3107,7 +3210,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
         });
 
         sheet.getRange(curRow, 1, fRows.length, fHeaders.length).setValues(fRows);
-        sheet.getRange(curRow, 6, fRows.length, 2).setNumberFormat("#,##0.00");
+        sheet.getRange(curRow, 7, fRows.length, 2).setNumberFormat("#,##0.00");
         sheet.getRange(curRow, 1, fRows.length, fHeaders.length).setBorder(true, true, true, true, true, true);
         curRow += fRows.length + 2;
       }
@@ -3117,7 +3220,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
   // ==========================================
   // SECTION 3: 📜 HISTORICAL BILLING CYCLES (Audited Statements: March 2026 – August 2026)
   // ==========================================
-  sheet.getRange(curRow, 1, 1, 7).merge()
+  sheet.getRange(curRow, 1, 1, 8).merge()
     .setValue("📜 Section 3: Historical Billing Cycles (Audited Statements: March 2026 – August 2026)")
     .setFontWeight("bold")
     .setFontSize(12)
@@ -3125,14 +3228,15 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
     .setFontColor("#ffffff");
   curRow++;
 
-  sheet.getRange(curRow, 1, 1, 7).merge()
+  sheet.getRange(curRow, 1, 1, 8).merge()
     .setValue("Finalized, audited statement numbers and family shares for past billing cycles.")
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
   curRow += 2;
 
-  histKeys.forEach(hKey => {
+  const allHistKeys = Object.keys(HISTORICAL_MONTHS).sort();
+  allHistKeys.forEach(hKey => {
     const hist = HISTORICAL_MONTHS[hKey];
     sheet.getRange(curRow, 1, 1, 5).merge()
       .setValue(`📜 ${hist.label} — Total Bill: ${hist.totalBill.toFixed(2)} EGP — ✅ [PAID / SETTLED]`)
@@ -3179,13 +3283,13 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
   sheet.autoResizeColumns(1, Math.max(9, matrixCols.length));
 }
 
-function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, activeStatementDueDate, reconAssignedList, neglectedTxKeys, existingTxList, sortedPeople, assignedChargesList) {
+function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, activeCycleKey, activeCycleLabel, activeStatementDueDate, reconAssignedList, neglectedTxKeys, existingTxList, sortedPeople, assignedChargesList) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.AUDIT_DIFFERENCES);
   sheet.clear();
   sheet.setHiddenGridlines(false);
 
-  const activeSortKey = Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
-  const activeMonthLabel = Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
+  const activeSortKey = activeCycleKey || Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
+  const activeMonthLabel = activeCycleLabel || Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
   const activeData = allDebts[activeSortKey] || {
     label: activeMonthLabel,
     total: 0,
@@ -3765,10 +3869,9 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
     if (stmtPeriod.start && tx.date < stmtPeriod.start) return;
     if (stmtPeriod.end && tx.date > stmtPeriod.end) return;
 
-    const dueDate = getDueDateForPurchase(tx.date, tz, cardBal.statementDate, activeStatementDueDate, stmtPeriod.start);
-    if (!dueDate) return;
-    const sKey = Utilities.formatDate(dueDate, tz, "yyyy-MM");
-    if (sKey !== activeSortKey) return;
+    const cycleInfo = getBillingCycleForPurchase(tx.date, tz);
+    if (!cycleInfo) return;
+    if (cycleInfo.cycleSortKey !== activeSortKey) return;
 
     // Check if matched any statement debit
     let matched = false;
