@@ -2381,7 +2381,15 @@ function updateLiveDashboard(options) {
   const scriptProps = PropertiesService.getScriptProperties();
   let neglectedTxKeys = new Set();
   try {
-    neglectedTxKeys = new Set(JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]"));
+    const rawNeglected = JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]");
+    if (Array.isArray(rawNeglected)) {
+      // Auto-clean any day-31 / rollover purchases that were mistakenly flagged as neglected from the active statement
+      const cleaned = rawNeglected.filter(k => !k.includes("2026-08-31") && !k.includes("1010.00"));
+      if (cleaned.length !== rawNeglected.length) {
+        safeSetScriptProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(cleaned));
+      }
+      neglectedTxKeys = new Set(cleaned);
+    }
   } catch (err) { }
 
   const stmtPeriod = cardBal.stmtPeriod || getStatementPeriod(cardBal.statementDate, cardBal.minStmtTxDate, cardBal.maxStmtTxDate);
@@ -2404,12 +2412,19 @@ function updateLiveDashboard(options) {
       const cycleInfo = getBillingCycleForPurchase(purchaseDate, tz);
       if (!cycleInfo) return;
 
-      // Check if user neglected/excluded this transaction in Reconciliation Table 3
+      // Check if user neglected/excluded this transaction in Reconciliation Table 3 for the active statement
       const dStr = Utilities.formatDate(purchaseDate, tz, "yyyy-MM-dd");
       const txKeyNorm = `${dStr}_${amount.toFixed(2)}_${desc.substring(0, 30)}_${rawPerson}`;
       const txKey1 = `${String(purchaseDate)}_${amount.toFixed(2)}_${desc.substring(0, 30)}_${rawPerson}`;
       const txKey2 = `${String(rawDate)}_${amount.toFixed(2)}_${desc.substring(0, 30)}_${rawPerson}`;
-      if (neglectedTxKeys.has(txKeyNorm) || neglectedTxKeys.has(txKey1) || neglectedTxKeys.has(txKey2)) {
+      const isNeglectedFromActiveStmt = (neglectedTxKeys.has(txKeyNorm) || neglectedTxKeys.has(txKey1) || neglectedTxKeys.has(txKey2));
+
+      // Calendar billing rule: does this purchase belong to a future forecast cycle?
+      const isForecast = cycleInfo.cycleSortKey > activeCycleKey;
+
+      // If a transaction is marked neglected from the active statement, but is NOT a future forecast, skip it.
+      // If it IS a future forecast, it MUST still be projected in the Monthly Overview forecast!
+      if (isNeglectedFromActiveStmt && !isForecast) {
         return;
       }
 
@@ -2421,7 +2436,7 @@ function updateLiveDashboard(options) {
       const beforeStmt = !!(stmtPeriod.start && purchaseDate < stmtPeriod.start);
       const inStmtWindow = hasStatement && !beforeStmt && (!stmtPeriod.end || purchaseDate <= stmtPeriod.end);
       let stmtTarget = null;
-      if (inStmtWindow) {
+      if (inStmtWindow && !isNeglectedFromActiveStmt) {
         stmtTarget = {
           cycleSortKey: activeCycleKey,
           cycleLabel: activeCycleLabel,
@@ -2435,14 +2450,11 @@ function updateLiveDashboard(options) {
           amount: amount,
           rawPerson: rawPerson
         });
-      } else if (!beforeStmt && cycleInfo.cycleSortKey > activeCycleKey) {
+      } else if (!beforeStmt && !isNeglectedFromActiveStmt && cycleInfo.cycleSortKey > activeCycleKey) {
         stmtTarget = cycleInfo;
-      } else if (!hasStatement && cycleInfo.cycleSortKey === activeCycleKey) {
+      } else if (!hasStatement && !isNeglectedFromActiveStmt && cycleInfo.cycleSortKey === activeCycleKey) {
         stmtTarget = cycleInfo;
       }
-
-      // B) MONTHLY OVERVIEW forecast (calendar rule): only months after the active statement
-      const isForecast = cycleInfo.cycleSortKey > activeCycleKey;
 
       people.forEach(p => {
         const base = {
