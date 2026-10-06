@@ -74,37 +74,37 @@ function safeSetScriptProperty(key, val) {
 
 function parseDateValue(rawDate, tz) {
   if (!rawDate) return null;
+  const targetTz = tz || "Africa/Cairo";
+
+  // Case 1: Already a Date object (use Utilities.formatDate with target timezone to prevent UTC midnight shift!)
   if (rawDate instanceof Date && !isNaN(rawDate.getTime())) {
-    let y = rawDate.getFullYear();
-    let m = rawDate.getMonth();
-    let d = rawDate.getDate();
-    if (rawDate.getUTCDate() === 31 && d !== 31) {
-      d = 31;
-      m = rawDate.getUTCMonth();
-      y = rawDate.getUTCFullYear();
-    }
+    const y = parseInt(Utilities.formatDate(rawDate, targetTz, "yyyy"), 10);
+    const m = parseInt(Utilities.formatDate(rawDate, targetTz, "M"), 10) - 1;
+    const d = parseInt(Utilities.formatDate(rawDate, targetTz, "d"), 10);
     return new Date(y, m, d, 12, 0, 0);
   }
+
+  // Case 2: Numeric Google Sheets serial date (e.g. 46265)
   if (typeof rawDate === "number" && rawDate > 30000) {
-    const d = new Date(Math.round((rawDate - 25569) * 86400 * 1000));
-    if (!isNaN(d.getTime())) {
-      let y = d.getUTCFullYear();
-      let m = d.getUTCMonth();
-      let day = d.getUTCDate();
-      return new Date(y, m, day, 12, 0, 0);
+    const dObj = new Date(Math.round((rawDate - 25569) * 86400 * 1000));
+    if (!isNaN(dObj.getTime())) {
+      const y = parseInt(Utilities.formatDate(dObj, targetTz, "yyyy"), 10);
+      const m = parseInt(Utilities.formatDate(dObj, targetTz, "M"), 10) - 1;
+      const d = parseInt(Utilities.formatDate(dObj, targetTz, "d"), 10);
+      return new Date(y, m, d, 12, 0, 0);
     }
   }
+
   const s = String(rawDate).trim();
   if (!s) return null;
 
-  // Try YYYY-MM-DD
+  // Case 3: ISO format YYYY-MM-DD
   const iso = s.match(/^(\d{4})[-\/\.](\d{1,2})[-\/\.](\d{1,2})/);
   if (iso) {
-    const d = new Date(parseInt(iso[1], 10), parseInt(iso[2], 10) - 1, parseInt(iso[3], 10), 12, 0, 0);
-    if (!isNaN(d.getTime())) return d;
+    return new Date(parseInt(iso[1], 10), parseInt(iso[2], 10) - 1, parseInt(iso[3], 10), 12, 0, 0);
   }
 
-  // Try DD/MM/YYYY or MM/DD/YYYY with smart disambiguation
+  // Case 4: DD/MM/YYYY or MM/DD/YYYY with smart disambiguation
   const dmy = s.match(/^(\d{1,2})[-\/\.](\d{1,2})[-\/\.](\d{4})/);
   if (dmy) {
     const p1 = parseInt(dmy[1], 10);
@@ -113,45 +113,38 @@ function parseDateValue(rawDate, tz) {
     let day = p1;
     let month = p2 - 1;
     if (p2 > 12 && p1 <= 12) {
-      // Must be MM/DD/YYYY (e.g. 8/31/2026)
+      // MM/DD/YYYY (e.g. 8/31/2026)
       month = p1 - 1;
       day = p2;
     } else if (p1 > 12 && p2 <= 12) {
-      // Must be DD/MM/YYYY (e.g. 31/8/2026)
+      // DD/MM/YYYY (e.g. 31/8/2026)
       day = p1;
       month = p2 - 1;
     }
-    const d = new Date(y, month, day, 12, 0, 0);
-    if (!isNaN(d.getTime())) return d;
+    return new Date(y, month, day, 12, 0, 0);
   }
 
-  // Try month names like "31 August 2026", "August 31, 2026", "31-Aug-2026"
+  // Case 5: Text month with optional weekday prefix (e.g. "Monday, August 31, 2026" or "31 August 2026")
   const monthMap = {
     jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
     may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7,
     sep: 8, sept: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11
   };
-  const named1 = s.match(/^(\d{1,2})(?:st|nd|rd|th)?[\s\-\/\.]+([a-zA-Z]+)[\s\-\/\.]+(\d{4})/i);
+  const named1 = s.match(/(?:[a-zA-Z]+,?\s+)?(\d{1,2})(?:st|nd|rd|th)?[\s\-\/\.]+([a-zA-Z]+)[\s\-\/\.]+(\d{4})/i);
   if (named1 && monthMap[named1[2].toLowerCase()] !== undefined) {
-    const d = new Date(parseInt(named1[3], 10), monthMap[named1[2].toLowerCase()], parseInt(named1[1], 10), 12, 0, 0);
-    if (!isNaN(d.getTime())) return d;
+    return new Date(parseInt(named1[3], 10), monthMap[named1[2].toLowerCase()], parseInt(named1[1], 10), 12, 0, 0);
   }
-  const named2 = s.match(/^([a-zA-Z]+)[\s\-\/\.]+(\d{1,2})(?:st|nd|rd|th)?,?[\s\-\/\.]+(\d{4})/i);
+  const named2 = s.match(/(?:[a-zA-Z]+,?\s+)?([a-zA-Z]+)[\s\-\/\.]+(\d{1,2})(?:st|nd|rd|th)?,?[\s\-\/\.]+(\d{4})/i);
   if (named2 && monthMap[named2[1].toLowerCase()] !== undefined) {
-    const d = new Date(parseInt(named2[3], 10), monthMap[named2[1].toLowerCase()], parseInt(named2[2], 10), 12, 0, 0);
-    if (!isNaN(d.getTime())) return d;
+    return new Date(parseInt(named2[3], 10), monthMap[named2[1].toLowerCase()], parseInt(named2[2], 10), 12, 0, 0);
   }
 
+  // Case 6: General date string fallback
   const d = new Date(s);
   if (!isNaN(d.getTime())) {
-    let y = d.getFullYear();
-    let m = d.getMonth();
-    let day = d.getDate();
-    if (d.getUTCDate() === 31 && day !== 31) {
-      day = 31;
-      m = d.getUTCMonth();
-      y = d.getUTCFullYear();
-    }
+    const y = parseInt(Utilities.formatDate(d, targetTz, "yyyy"), 10);
+    const m = parseInt(Utilities.formatDate(d, targetTz, "M"), 10) - 1;
+    const day = parseInt(Utilities.formatDate(d, targetTz, "d"), 10);
     return new Date(y, m, day, 12, 0, 0);
   }
   return null;
@@ -333,7 +326,28 @@ function menuGoToAuditDifferences() {
 function onEdit(e) {
   if (!e || !e.range) return;
   const sheet = e.range.getSheet();
-  if (sheet.getName() !== CONFIG.SHEETS.RECONCILIATION) return;
+  const sheetName = sheet.getName();
+
+  // Instant dynamic recalculation for Transactions, Installments, or Payment History
+  if (sheetName === CONFIG.SHEETS.TRANSACTIONS || 
+      sheetName === CONFIG.SHEETS.INSTALLMENTS || 
+      sheetName === CONFIG.SHEETS.PAYMENT_HISTORY) {
+    if (e.range.getRow() >= 2) {
+      try {
+        updateLiveDashboard({ skipRecon: true });
+        SpreadsheetApp.getActiveSpreadsheet().toast(
+          "Monthly Overview & Debt Breakdown updated automatically!",
+          "⚡ Live Updated",
+          2
+        );
+      } catch (err) {
+        Logger.log("[onEdit] Auto-update error: " + (err ? (err.message || String(err)) : ""));
+      }
+    }
+    return;
+  }
+
+  if (sheetName !== CONFIG.SHEETS.RECONCILIATION) return;
 
   const col = e.range.getColumn();
   const row = e.range.getRow();
@@ -2095,26 +2109,26 @@ function calculateCardBalance(ss, tz) {
   let minStmtTxDate = null;
   let maxStmtTxDate = null;
 
-  // Read latest statement closing balance if available
+  // Read latest statement closing balance if available (batch read B2:F4)
   const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
   if (stmtSheet && stmtSheet.getLastRow() >= 4) {
-    const closeVal = stmtSheet.getRange("D3").getValue();
-    if (!isNaN(parseFloat(closeVal))) {
-      billedBalance = parseFloat(closeVal);
-    }
-    const openVal = stmtSheet.getRange("B3").getValue();
+    const metaVals = stmtSheet.getRange(2, 1, 3, 6).getValues();
+    const stmtDateVal = metaVals[0][1]; // B2
+    statementDate = parseDateValue(stmtDateVal, tz);
+    const dueDateVal = metaVals[0][3]; // D2
+    statementDueDate = parseDateValue(dueDateVal, tz);
+
+    const openVal = metaVals[1][1]; // B3
     if (!isNaN(parseFloat(openVal))) openingBalance = parseFloat(openVal);
 
-    const totDebVal = stmtSheet.getRange("F3").getValue();
+    const closeVal = metaVals[1][3]; // D3
+    if (!isNaN(parseFloat(closeVal))) billedBalance = parseFloat(closeVal);
+
+    const totDebVal = metaVals[1][5]; // F3
     if (!isNaN(parseFloat(totDebVal))) totalDebit = parseFloat(totDebVal);
 
-    const totCredVal = stmtSheet.getRange("B4").getValue();
+    const totCredVal = metaVals[2][1]; // B4
     if (!isNaN(parseFloat(totCredVal))) totalCredit = parseFloat(totCredVal);
-
-    const stmtDateVal = stmtSheet.getRange("B2").getValue();
-    statementDate = parseDateValue(stmtDateVal, tz);
-    const dueDateVal = stmtSheet.getRange("D2").getValue();
-    statementDueDate = parseDateValue(dueDateVal, tz);
 
     if (stmtSheet.getLastRow() >= 7) {
       const lastRow = stmtSheet.getLastRow();
@@ -2243,11 +2257,15 @@ function updateLiveDashboard(options) {
   }
 
   if (!transactionsSheet || !installmentsSheet || !historySheet) {
-    SpreadsheetApp.getUi().alert(
-      "Missing Sheet",
-      "Please make sure 'Transactions', 'Installments', and 'Payment History' sheets exist.",
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
+    try {
+      SpreadsheetApp.getUi().alert(
+        "Missing Sheet",
+        "Please make sure 'Transactions', 'Installments', and 'Payment History' sheets exist.",
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    } catch (e) {
+      Logger.log("Missing required sheets: Transactions, Installments, or Payment History");
+    }
     return;
   }
 
@@ -2453,7 +2471,9 @@ function updateLiveDashboard(options) {
             dueDateLabel: cycleInfo.dueDateLabel
           });
           addForecastItem(fItem);
-          addDebtItem(fItem);
+          if (!stmtTarget || stmtTarget.cycleSortKey !== cycleInfo.cycleSortKey) {
+            addDebtItem(fItem);
+          }
         }
       });
     });
@@ -3223,10 +3243,16 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
       curRow++;
 
       const mPeople = sortedPeople.filter(p => (mData.peopleBreakdown[p] && mData.peopleBreakdown[p].total > 0));
-      const mRows = mPeople.map(p => {
+      const startDataRow = curRow;
+      const numPeople = mPeople.length;
+      const totalRowIndex = startDataRow + numPeople;
+
+      const mRows = mPeople.map((p, idx) => {
         const bk = mData.peopleBreakdown[p] || { purchases: 0, installments: 0, total: 0 };
-        const pct = mData.total > 0 ? (bk.total / mData.total) : 0;
-        return [p, bk.purchases, bk.installments, bk.total, pct, "🕒 Upcoming Forecast"];
+        const currentRow = startDataRow + idx;
+        const totalFormula = `=B${currentRow}+C${currentRow}`;
+        const pctFormula = `=IF($D$${totalRowIndex}>0, D${currentRow}/$D$${totalRowIndex}, 0)`;
+        return [p, bk.purchases, bk.installments, totalFormula, pctFormula, "🕒 Upcoming Forecast"];
       });
 
       if (mRows.length > 0) {
@@ -3238,8 +3264,11 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
         curRow += mRows.length;
       }
 
-      // Total Row for this month
-      const mTotalRow = ["TOTAL (" + mLabel + ")", mData.purchasesTotal, mData.installmentsTotal, mData.total, 1.00, "🕒 Upcoming Due"];
+      // Total Row for this month with live SUM formulas
+      const purchasesSumFormula = numPeople > 0 ? `=SUM(B${startDataRow}:B${curRow - 1})` : mData.purchasesTotal;
+      const installmentsSumFormula = numPeople > 0 ? `=SUM(C${startDataRow}:C${curRow - 1})` : mData.installmentsTotal;
+      const totalSumFormula = numPeople > 0 ? `=SUM(D${startDataRow}:D${curRow - 1})` : mData.total;
+      const mTotalRow = ["TOTAL (" + mLabel + ")", purchasesSumFormula, installmentsSumFormula, totalSumFormula, 1.00, "🕒 Upcoming Due"];
       sheet.getRange(curRow, 1, 1, mHeaders.length).setValues([mTotalRow])
         .setFontWeight("bold")
         .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
