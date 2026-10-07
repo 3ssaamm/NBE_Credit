@@ -2864,7 +2864,7 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
 
   const activeSortKey = activeCycleKey || Utilities.formatDate(activeStatementDueDate, tz, "yyyy-MM");
   const activeMonthLabel = activeCycleLabel || Utilities.formatDate(activeStatementDueDate, tz, "MMMM yyyy");
-  const activeDueDateFormatted = Utilities.formatDate(activeStatementDueDate, tz, "EEEE, MMMM d, yyyy");
+  const activeDueDateFormatted = Utilities.formatDate(activeStatementDueDate, tz, "MMMM d, yyyy");
   const activeData = allDebts[activeSortKey] || {
     label: activeMonthLabel,
     total: 0,
@@ -2880,14 +2880,14 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   const diff = activeData.total - bankBill;
 
   // Banner
-  sheet.getRange("A1:I1").merge()
+  sheet.getRange("A1:H1").merge()
     .setValue("💳 NBE Credit Card — Active Statement Debt Breakdown (" + activeMonthLabel + ")")
     .setFontWeight("bold")
     .setFontSize(14)
     .setBackground(CONFIG.COLORS.PRIMARY)
     .setFontColor("#ffffff");
 
-  sheet.getRange("A2:I2").merge()
+  sheet.getRange("A2:H2").merge()
     .setValue("Active billing cycle payment breakdown for the latest uploaded statement. All debt divided by family member.")
     .setFontStyle("italic")
     .setFontSize(9)
@@ -2898,7 +2898,8 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   // ==========================================
   // ACTIVE STATEMENT RECONCILIATION SUMMARY CARD
   // ==========================================
-  sheet.getRange(curRow, 1, 1, 6).merge()
+  const kpiBannerRow = curRow;
+  sheet.getRange(curRow, 1, 1, 8).merge()
     .setValue("📊 Active Statement Overview & Audit Reconciliation")
     .setFontWeight("bold")
     .setFontSize(11)
@@ -2919,9 +2920,9 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   }
 
   const kpiRows = [
-    ["Statement Date:", stmtDateStr, "Bank Closing Balance (Must Pay):", bankBill, "Reconciliation Status:", statusBadge],
-    ["Payment Due Date:", activeDueDateFormatted, "Sum of Family Shares Accounted For:", activeData.total, "Audit Difference (Diff):", diff],
-    ["Active Billing Cycle:", activeMonthLabel, "Total One-Time Purchases:", activeData.purchasesTotal, "Total Monthly Installments:", activeData.installmentsTotal]
+    ["Statement Date:", stmtDateStr, "Bank Statement Closing Bill:", bankBill, "Recon Status:", statusBadge],
+    ["Payment Due Date:", activeDueDateFormatted, "Family Shares Total:", activeData.total, "Audit Difference:", diff],
+    ["Active Billing Cycle:", activeMonthLabel, "One-Time Purchases Total:", activeData.purchasesTotal, "Monthly Installments Total:", activeData.installmentsTotal]
   ];
 
   sheet.getRange(curRow, 1, kpiRows.length, 6).setValues(kpiRows);
@@ -2931,12 +2932,14 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   sheet.getRange(curRow, 4, kpiRows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
   sheet.getRange(curRow + 1, 6).setNumberFormat("#,##0.00").setFontWeight("bold");
   sheet.getRange(curRow + 2, 6).setNumberFormat("#,##0.00").setFontWeight("bold");
-  sheet.getRange(curRow, 1, kpiRows.length, 6).setBackground(CONFIG.COLORS.PRIMARY_LIGHT).setBorder(true, true, true, true, true, true);
-  sheet.getRange(curRow, 6).setBackground(statusColor);
+  sheet.getRange(curRow, 1, kpiRows.length, 8).setBackground(CONFIG.COLORS.PRIMARY_LIGHT).setBorder(true, true, true, true, true, true);
+  
+  // Merge F5:H5 for statusBadge so the full status badge fits with zero truncation
+  sheet.getRange(curRow, 6, 1, 3).merge().setValue(statusBadge).setBackground(statusColor).setFontWeight("bold").setFontSize(9);
   curRow += kpiRows.length + 1;
 
   if (assignedMissingCount > 0) {
-    sheet.getRange(curRow, 1, 1, 7).merge()
+    sheet.getRange(curRow, 1, 1, 8).merge()
       .setValue("⚠️ NOTICE: " + assignedMissingCount + " charge(s) totaling " + Utilities.formatString("%.2f", assignedMissingTotal) + " EGP are assigned from Bank Statement but MISSING from Transactions sheet!")
       .setFontWeight("bold")
       .setFontColor("#b71c1c")
@@ -2955,7 +2958,7 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     } else {
       diffNote = `🔍 Difference Detective (-${Math.abs(diff).toFixed(2)} EGP Shortfall): Bank bill is higher by ${Math.abs(diff).toFixed(2)} EGP. Check Reconciliation Table 2 for unassigned statement charges.`;
     }
-    sheet.getRange(curRow, 1, 1, 7).merge()
+    sheet.getRange(curRow, 1, 1, 8).merge()
       .setValue(diffNote)
       .setFontWeight("bold")
       .setFontSize(9)
@@ -2968,7 +2971,8 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   // ==========================================
   // TABLE 1: 👥 ACTIVE STATEMENT BILL (Divided by Person in One Table)
   // ==========================================
-  sheet.getRange(curRow, 1, 1, 7).merge()
+  const table1BannerRow = curRow;
+  sheet.getRange(curRow, 1, 1, 8).merge()
     .setValue("👥 Active Statement Bill (" + activeMonthLabel + ") — Family Shares Divided in One Table")
     .setFontWeight("bold")
     .setFontSize(12)
@@ -2977,15 +2981,16 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   curRow++;
 
   const summaryHeaders = [
-    "Person",
+    "Family Member",
     "🛒 Purchases (EGP)",
     "📦 Installments (EGP)",
-    "⚠️ Missing from Sheet (EGP)",
+    "⚠️ Missing Items (EGP)",
     "Total Share Due (EGP)",
     "% of Bank Bill",
     "Payment Status"
   ];
 
+  const table1HeaderRow = curRow;
   sheet.getRange(curRow, 1, 1, summaryHeaders.length).setValues([summaryHeaders])
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.HEADER)
@@ -3035,7 +3040,7 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
 
   // Total Row for Active Bill (Pure Native Reactive Formulas)
   const activeTotalRow = [
-    "TOTAL ACTIVE STATEMENT BILL",
+    "TOTAL ACTIVE BILL",
     sumRows.length > 0 ? `=SUM(B${table1StartRow}:B${activeTotalRowIndex - 1})` : activeData.purchasesTotal,
     sumRows.length > 0 ? `=SUM(C${table1StartRow}:C${activeTotalRowIndex - 1})` : activeData.installmentsTotal,
     sumRows.length > 0 ? `=SUM(D${table1StartRow}:D${activeTotalRowIndex - 1})` : activeData.missingFromSheetTotal,
@@ -3067,7 +3072,8 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   // ==========================================
   // TABLE 2: 📋 ACTIVE STATEMENT ITEMIZED CHARGES (Every Single Charge)
   // ==========================================
-  sheet.getRange(curRow, 1, 1, 9).merge()
+  const table2BannerRow = curRow;
+  sheet.getRange(curRow, 1, 1, 8).merge()
     .setValue("📋 Itemized Charges for " + activeMonthLabel + " Statement (Every Charge Making Up This Bill)")
     .setFontWeight("bold")
     .setFontSize(11)
@@ -3075,8 +3081,7 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   curRow++;
 
   const itemHeaders = [
-    "#",
-    "Person",
+    "Family Member",
     "Category",
     "Merchant / Description",
     "Installment Progress",
@@ -3086,13 +3091,12 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     "Source / Audit Note"
   ];
 
+  const headerRowForFilter = curRow;
   sheet.getRange(curRow, 1, 1, itemHeaders.length).setValues([itemHeaders])
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.HEADER)
     .setBorder(true, true, true, true, true, true);
   curRow++;
-
-  const headerRowForFilter = curRow - 1;
 
   // Filter items strictly for the active statement
   const activeItems = debtLineItems.filter(it => it.sortKey === activeSortKey);
@@ -3107,7 +3111,7 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
   const regRows = [];
   const regColors = [];
 
-  activeItems.forEach((it, idx) => {
+  activeItems.forEach(it => {
     let catLabel = "🛒 One-Time Purchase";
     let sourceNote = "Transactions Sheet";
     let rowColor = null;
@@ -3123,7 +3127,6 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     }
 
     regRows.push([
-      idx + 1,
       it.person,
       catLabel,
       it.desc,
@@ -3140,16 +3143,17 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     const regRange = sheet.getRange(curRow, 1, regRows.length, itemHeaders.length);
     regRange.setValues(regRows);
 
-    sheet.getRange(curRow, 6, regRows.length, 1).setNumberFormat("yyyy-MM-dd");
-    sheet.getRange(curRow, 7, regRows.length, 2).setNumberFormat("#,##0.00");
-    sheet.getRange(curRow, 1, regRows.length, 1).setFontStyle("italic").setFontColor(CONFIG.COLORS.TEXT_MUTED);
+    sheet.getRange(curRow, 5, regRows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(curRow, 6, regRows.length, 2).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 1, regRows.length, 1).setFontWeight("bold");
+    sheet.getRange(curRow, 8, regRows.length, 1).setWrap(true);
 
     for (let r = 0; r < regRows.length; r++) {
       if (regColors[r]) {
         sheet.getRange(curRow + r, 1, 1, itemHeaders.length).setBackground(regColors[r]);
       }
-      if (regRows[r][8].includes("MISSING")) {
-        sheet.getRange(curRow + r, 9).setFontWeight("bold").setFontColor("#b71c1c");
+      if (regRows[r][7].includes("MISSING")) {
+        sheet.getRange(curRow + r, 8).setFontWeight("bold").setFontColor("#b71c1c");
       }
     }
 
@@ -3161,12 +3165,12 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
 
     curRow += regRows.length + 3;
   } else {
-    sheet.getRange(curRow, 1, 1, 9).merge().setValue("No charges found for this statement cycle.");
+    sheet.getRange(curRow, 1, 1, 8).merge().setValue("No charges found for this statement cycle.");
     curRow += 3;
   }
 
   // Footer Link to Monthly Overview Sheet
-  sheet.getRange(curRow, 1, 1, 9).merge()
+  sheet.getRange(curRow, 1, 1, 8).merge()
     .setValue("👉 Note: For upcoming billing cycle forecasts and previous months (March – August 2026), please switch to the 'Monthly Overview' sheet.")
     .setFontStyle("italic")
     .setFontSize(9)
@@ -3178,17 +3182,31 @@ function renderDebtBreakdownSheet(ss, tz, allDebts, debtLineItems, sortedPeople,
     bannerHeight: 30,
     subtitleRow: 2,
     subtitleHeight: 20,
-    customRowHeights: { 4: 26 },
+    customRowHeights: {
+      4: 26,
+      5: 22,
+      6: 22,
+      7: 22,
+      [table1BannerRow]: 26,
+      [table1HeaderRow]: 26,
+      [activeTotalRowIndex]: 24,
+      [table2BannerRow]: 26,
+      [headerRowForFilter]: 26
+    },
     explicitColWidths: {
-      1: 145, // Family Member / #
-      2: 110, // Purchases / Person
-      3: 105, // Installments / Category
-      4: 230, // Missing Tx / Description
-      5: 120, // Total Share / Installment Details
-      6: 110, // % of Statement / Purchase Date
-      7: 125, // Payment Status / Amount
-      8: 125, // Original Tx Amount
-      9: 170  // Statement Match Status
+      1: 165 // Family Member (fits all names and "TOTAL ACTIVE BILL" cleanly)
+    },
+    autoResizeStartCol: 2,
+    autoResizeColCount: 7,
+    colWidthBounds: {
+      2: { min: 155, max: 175 }, // Purchases / Category
+      3: { min: 210, max: 260 }, // Installments / Merchant Description
+      4: { min: 145, max: 165 }, // Missing Items / Installment Progress
+      5: { min: 145, max: 165 }, // Total Share Due / Charge Date
+      6: { min: 130, max: 150 }, // % of Bill / Person's Share
+      7: { min: 140, max: 165 }, // Payment Status / Original Amount
+      8: { min: 260, max: 320 }, // Source / Audit Note
+      default: { min: 120, max: 220 }
     }
   });
 }
