@@ -395,14 +395,60 @@ function onEdit(e) {
   const sheet = e.range.getSheet();
   const sheetName = sheet.getName();
 
-  // If user edits Transactions: native equations in Monthly Overview update spontaneously in-browser (sub-50ms)!
-  // No need to wipe and rewrite Monthly Overview on every keystroke.
+  // If user edits Transactions: automatically clean any stray leading/trailing spaces in the Person column!
+  // Native equations in Monthly Overview update spontaneously in-browser (sub-50ms).
   if (sheetName === CONFIG.SHEETS.TRANSACTIONS) {
+    const startCol = e.range.getColumn();
+    const endCol = startCol + (e.range.getNumColumns ? e.range.getNumColumns() : 1) - 1;
+    if (startCol <= 4 && endCol >= 4 && e.range.getLastRow() >= 2) {
+      const startRow = Math.max(2, e.range.getRow());
+      const numRows = e.range.getLastRow() - startRow + 1;
+      const targetRange = sheet.getRange(startRow, 4, numRows, 1);
+      const values = targetRange.getValues();
+      let changed = false;
+      for (let r = 0; r < values.length; r++) {
+        const orig = String(values[r][0] || "");
+        if (orig) {
+          const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+          if (clean !== orig) {
+            values[r][0] = clean;
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        targetRange.setValues(values);
+      }
+    }
     return;
   }
 
   // If user edits Installments or Payment History: re-sync static installment schedules in the background
   if (sheetName === CONFIG.SHEETS.INSTALLMENTS || sheetName === CONFIG.SHEETS.PAYMENT_HISTORY) {
+    if (sheetName === CONFIG.SHEETS.INSTALLMENTS) {
+      const startCol = e.range.getColumn();
+      const endCol = startCol + (e.range.getNumColumns ? e.range.getNumColumns() : 1) - 1;
+      if (startCol <= 9 && endCol >= 9 && e.range.getLastRow() >= 2) {
+        const startRow = Math.max(2, e.range.getRow());
+        const numRows = e.range.getLastRow() - startRow + 1;
+        const targetRange = sheet.getRange(startRow, 9, numRows, 1);
+        const values = targetRange.getValues();
+        let changed = false;
+        for (let r = 0; r < values.length; r++) {
+          const orig = String(values[r][0] || "");
+          if (orig) {
+            const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+            if (clean !== orig) {
+              values[r][0] = clean;
+              changed = true;
+            }
+          }
+        }
+        if (changed) {
+          targetRange.setValues(values);
+        }
+      }
+    }
     if (e.range.getRow() >= 2) {
       try {
         updateLiveDashboard({ skipRecon: true });
@@ -1435,7 +1481,7 @@ function syncInstallmentsFromStatement(ss, transactions) {
     const desc = String(row[2] || "").trim();
     const duration = parseInt(row[4], 10);
     const emi = parseFloat(row[7]);
-    const payer = String(row[8] || "").trim();
+    const payer = String(row[8] || "").replace(/[\u00A0\s]+/g, " ").trim();
     if (!isNaN(emi) && emi > 0) {
       sheetInstallmentRows.push({
         index: idx,
@@ -1515,7 +1561,7 @@ function isNeglectedPayer(name) {
 
 function normalizePersonName(name) {
   if (!name) return "";
-  let cleaned = String(name).trim().replace(/\s+/g, " ");
+  let cleaned = String(name).replace(/[\u00A0\s]+/g, " ").trim();
   if (!cleaned) return "";
 
   if (isNeglectedPayer(cleaned)) return "";
@@ -1537,7 +1583,7 @@ function normalizePersonName(name) {
 
 function splitPayerNames(payerStr) {
   if (!payerStr) return [];
-  const s = String(payerStr).trim();
+  const s = String(payerStr).replace(/[\u00A0\s]+/g, " ").trim();
   if (isNeglectedPayer(s)) return [];
 
   // Support splitting by +, &, /, and " and " (e.g. "Me and Abdo")
@@ -1546,6 +1592,65 @@ function splitPayerNames(payerStr) {
     .split(/[\+\,\/\&]/)
     .map(p => normalizePersonName(p))
     .filter(p => p && p.toLowerCase() !== "shared" && !isNeglectedPayer(p));
+}
+
+/**
+ * Automatically cleans and sanitizes payer/person names in user sheets (Transactions and Installments).
+ * Strips leading/trailing spaces, non-breaking spaces (\u00A0), and collapses multiple spaces.
+ * 
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ */
+function sanitizeAllPayerNames(ss) {
+  if (!ss) return;
+  try {
+    // 1. Sanitize Transactions Sheet (Column D: Person)
+    const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+    if (txSheet && txSheet.getLastRow() >= 2) {
+      const numRows = txSheet.getLastRow() - 1;
+      const range = txSheet.getRange(2, 4, numRows, 1);
+      const values = range.getValues();
+      let changed = false;
+      for (let i = 0; i < values.length; i++) {
+        const orig = String(values[i][0] || "");
+        if (orig) {
+          const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+          if (clean !== orig) {
+            values[i][0] = clean;
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        range.setValues(values);
+        Logger.log("[sanitizeAllPayerNames] Cleaned whitespace in Transactions sheet payer names.");
+      }
+    }
+
+    // 2. Sanitize Installments Sheet (Column I: Payer)
+    const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+    if (instSheet && instSheet.getLastRow() >= 2) {
+      const numRows = instSheet.getLastRow() - 1;
+      const range = instSheet.getRange(2, 9, numRows, 1);
+      const values = range.getValues();
+      let changed = false;
+      for (let i = 0; i < values.length; i++) {
+        const orig = String(values[i][0] || "");
+        if (orig) {
+          const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+          if (clean !== orig) {
+            values[i][0] = clean;
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        range.setValues(values);
+        Logger.log("[sanitizeAllPayerNames] Cleaned whitespace in Installments sheet payer names.");
+      }
+    }
+  } catch (err) {
+    Logger.log("[sanitizeAllPayerNames] Error: " + (err ? (err.message || String(err)) : ""));
+  }
 }
 
 function getAllUniquePayers(ss) {
@@ -1760,7 +1865,7 @@ function runReconciliation(ss, tz) {
     const instData = instSheet.getRange(2, 1, instSheet.getLastRow() - 1, 11).getValues();
     instData.forEach((iRow, idx) => {
       const emi = parseFloat(iRow[7]);
-      const payer = String(iRow[8] || "").trim();
+      const payer = String(iRow[8] || "").replace(/[\u00A0\s]+/g, " ").trim();
       const desc = String(iRow[2] || "").trim();
       const duration = parseInt(iRow[4], 10);
       if (!isNaN(emi) && emi > 0 && payer) {
@@ -1810,7 +1915,7 @@ function runReconciliation(ss, tz) {
     const txData = txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues();
     txData.forEach((row, idx) => {
       const rawDate = row[1];
-      const rawPerson = row[3];
+      const rawPerson = String(row[3] || "").replace(/[\u00A0\s]+/g, " ").trim();
       const rawAmount = row[4];
       if (!rawDate || !rawAmount) return;
 
@@ -1833,8 +1938,8 @@ function runReconciliation(ss, tz) {
         txDebits.push({
           rowNum: idx + 2,
           date: pDate,
-          desc: String(row[2] || ""),
-          person: String(rawPerson || ""),
+          desc: String(row[2] || "").trim(),
+          person: rawPerson,
           amount: amt,
           matched: false
         });
@@ -2464,8 +2569,8 @@ function updateLiveDashboard(options) {
     return;
   }
 
-  // NOTE: 'Transactions' and 'Installments' sheets are user-managed inputs.
-  // The script NEVER modifies, writes to, or cleans them.
+  // Automatically sanitize any stray leading/trailing spaces in Transactions and Installments payer columns
+  sanitizeAllPayerNames(ss);
 
   // Run reconciliation ONLY when not skipped (e.g. avoid erasing/rewriting Reconciliation sheet during onEdit)
   if (!opts.skipRecon) {
@@ -2595,7 +2700,7 @@ function updateLiveDashboard(options) {
     txData.forEach(row => {
       const rawDate = row[1];
       const desc = String(row[2] || "").trim();
-      const rawPerson = row[3];
+      const rawPerson = String(row[3] || "").replace(/[\u00A0\s]+/g, " ").trim();
       const rawAmount = row[4];
       if (!rawDate || !rawPerson) return;
 
@@ -2695,7 +2800,7 @@ function updateLiveDashboard(options) {
       const desc = String(row[2] || "").trim();
       const durationMonths = parseInt(row[4], 10);
       const emi = parseFloat(row[7]);
-      const rawPayer = row[8];
+      const rawPayer = String(row[8] || "").replace(/[\u00A0\s]+/g, " ").trim();
 
       if (!rawDate || isNaN(durationMonths) || durationMonths <= 0 || isNaN(emi) || emi <= 0 || !rawPayer) {
         return;
@@ -3466,7 +3571,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
         const pInstallment = (mD && mD.peopleBreakdown && mD.peopleBreakdown[person]) ? (mD.peopleBreakdown[person].installments || 0) : 0;
         const [uY, uM] = col.key.split("-").map(Number);
         const win = getPurchaseDateWindow(uY, uM);
-        const sumifsPart = `SUMIFS('Transactions'!$E:$E, 'Transactions'!$D:$D, $A${curPersonRow}, 'Transactions'!$B:$B, ">="&DATE(${win.startYear},${win.startMonth},${win.startDay}), 'Transactions'!$B:$B, "<="&DATE(${win.endYear},${win.endMonth},${win.endDay}))`;
+        const sumifsPart = `SUMIFS('Transactions'!$E:$E, 'Transactions'!$D:$D, "*" & TRIM($A${curPersonRow}) & "*", 'Transactions'!$B:$B, ">="&DATE(${win.startYear},${win.startMonth},${win.startDay}), 'Transactions'!$B:$B, "<="&DATE(${win.endYear},${win.endMonth},${win.endDay}))`;
         if (pInstallment > 0) {
           val = `=${sumifsPart} + ${pInstallment.toFixed(2)}`;
         } else {
@@ -3564,7 +3669,7 @@ function renderMonthlyOverviewSheet(ss, tz, allDebts, debtLineItems, sortedPeopl
         const dYear = parseInt(mMatch[1], 10);
         const dMonth = parseInt(mMatch[2], 10);
         const w = getPurchaseDateWindow(dYear, dMonth);
-        pFormulaFunc = (personName, rIdx) => `=SUMIFS('Transactions'!$E:$E, 'Transactions'!$D:$D, $A${rIdx}, 'Transactions'!$B:$B, ">="&DATE(${w.startYear},${w.startMonth},${w.startDay}), 'Transactions'!$B:$B, "<="&DATE(${w.endYear},${w.endMonth},${w.endDay}))`;
+        pFormulaFunc = (personName, rIdx) => `=SUMIFS('Transactions'!$E:$E, 'Transactions'!$D:$D, "*" & TRIM($A${rIdx}) & "*", 'Transactions'!$B:$B, ">="&DATE(${w.startYear},${w.startMonth},${w.startDay}), 'Transactions'!$B:$B, "<="&DATE(${w.endYear},${w.endMonth},${w.endDay}))`;
       }
 
       const mRows = mPeople.map((p, idx) => {
@@ -4027,7 +4132,7 @@ function renderAuditDifferencesSheet(ss, tz, cardBal, allDebts, debtLineItems, a
       const desc = String(iRow[2] || "").trim();
       const duration = parseInt(iRow[4], 10);
       const emi = parseFloat(iRow[7]);
-      const payer = String(iRow[8] || "").trim();
+      const payer = String(iRow[8] || "").replace(/[\u00A0\s]+/g, " ").trim();
       const paymentsMade = parseInt(iRow[9], 10) || 0;
       const status = String(iRow[10] || "").toLowerCase();
       const pDate = parseDateValue(rawDate, tz);

@@ -232,3 +232,81 @@ In Google Sheets, calling `sheet.autoResizeColumns(1, N)` on any sheet containin
    }
    ```
 
+---
+
+## 8. User Input Sanitization & Whitespace Resilience Patterns
+
+### The Accidental Whitespace Bug
+When users enter data in raw sheets (such as payer names, categories, or transaction IDs), leading/trailing spaces (`"Muhanad "`) and non-breaking spaces (`\u00A0` often introduced by copy-pasting from web portals or banking apps) cause downstream lookups and formula evaluations (`SUMIFS`, `VLOOKUP`, `MATCH`) to fail silently.
+
+### Production Pattern: 3-Tier Defense
+
+```mermaid
+graph TD
+    A[User Enters / Pastes Text in Input Sheet] --> B[Tier 1: onEdit Real-Time In-Place Sanitize]
+    B --> C[Cleans \u00A0 & Trailing Spaces in Sheet Cell]
+    C --> D[Tier 2: Formula-Level Wildcards]
+    D --> E[SUMIFS / MATCH with * & TRIM Match Instantly]
+    E --> F[Tier 3: Defensive Procedural Reads]
+    F --> G[All Scripts Run .replace /[\u00A0\s]+/g, ' ' .trim()]
+```
+
+1. **Tier 1: In-Place Real-Time `onEdit` Range Interceptor**:
+   Automatically clean any stray spaces as soon as user types or pastes into the column:
+   ```javascript
+   if (sheetName === CONFIG.SHEETS.TRANSACTIONS) {
+     const startCol = e.range.getColumn();
+     const endCol = startCol + (e.range.getNumColumns ? e.range.getNumColumns() : 1) - 1;
+     if (startCol <= 4 && endCol >= 4 && e.range.getLastRow() >= 2) {
+       const startRow = Math.max(2, e.range.getRow());
+       const numRows = e.range.getLastRow() - startRow + 1;
+       const targetRange = sheet.getRange(startRow, 4, numRows, 1);
+       const values = targetRange.getValues();
+       let changed = false;
+       for (let r = 0; r < values.length; r++) {
+         const orig = String(values[r][0] || "");
+         if (orig) {
+           const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+           if (clean !== orig) {
+             values[r][0] = clean;
+             changed = true;
+           }
+         }
+       }
+       if (changed) targetRange.setValues(values);
+     }
+     return;
+   }
+   ```
+
+2. **Tier 2: Declarative Formula Wildcard Protection**:
+   In summary views (`Monthly Overview`), generate formulas using `*` wildcards:
+   ```excel
+   =SUMIFS(Transactions!$E:$E, Transactions!$D:$D, "*" & TRIM($A4) & "*", ...)
+   ```
+
+3. **Tier 3: Batch Self-Healing Sanitizer**:
+   Before updating dashboards or running reconciliation, execute a batch scrubber across all user sheets:
+   ```javascript
+   function sanitizeAllPayerNames(ss) {
+     [
+       { sheet: CONFIG.SHEETS.TRANSACTIONS, col: 4 },
+       { sheet: CONFIG.SHEETS.INSTALLMENTS, col: 9 }
+     ].forEach(cfg => {
+       const s = ss.getSheetByName(cfg.sheet);
+       if (!s || s.getLastRow() < 2) return;
+       const range = s.getRange(2, cfg.col, s.getLastRow() - 1, 1);
+       const vals = range.getValues();
+       let mod = false;
+       for (let i = 0; i < vals.length; i++) {
+         const orig = String(vals[i][0] || "");
+         if (orig) {
+           const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+           if (clean !== orig) { vals[i][0] = clean; mod = true; }
+         }
+       }
+       if (mod) range.setValues(vals);
+     });
+   }
+   ```
+

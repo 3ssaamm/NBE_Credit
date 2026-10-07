@@ -132,3 +132,73 @@ When generating dashboards and financial tables with title banners:
 3. **Table Width Budgeting**:
    Multi-month matrix views must fit on standard desktop viewports (1280–1920px) without horizontal scrolling. Column widths for monthly cycles must be clamped to 100–115px.
 
+---
+
+## 7. Data Hygiene & Whitespace-Resilient Formulas
+
+### The Trailing/Leading Whitespace Failure Mode
+In Google Sheets declarative formulas (`SUMIFS`, `COUNTIF`, `MATCH`, `VLOOKUP`), string matching is exact unless explicit wildcards are configured:
+- If a user enters `"Muhanad "` (with an accidental trailing space or non-breaking space `\u00A0`) in a raw transaction sheet, a standard formula:
+  ```excel
+  =SUMIFS(Transactions!$E:$E, Transactions!$D:$D, $A4, ...)
+  ```
+  evaluates `$A4 == "Muhanad"`, tests `"Muhanad " = "Muhanad"`, evaluates to `FALSE`, and silently drops the transactions from the calculation.
+- The user sees an erroneous total in dashboards (e.g. `Monthly Overview` or `Debt Breakdown`) with zero formula errors reported by the spreadsheet engine.
+
+### The 3-Layer Defense-in-Depth Pattern
+
+To make financial spreadsheets completely impervious to stray spaces, enforce a 3-layer architecture:
+
+#### Layer 1: Declarative Formula Resilience (Wildcard & TRIM Criteria)
+Never use raw exact cell references in criteria arguments of `SUMIFS`, `COUNTIF`, or `MATCH` when matching user-typed names or categories:
+- **Wrap criteria with wildcards (`*`) and `TRIM()`**:
+  ```excel
+  =SUMIFS(Transactions!$E:$E, Transactions!$D:$D, "*" & TRIM($A4) & "*", Transactions!$B:$B, ">="&DATE(2026,8,31), Transactions!$B:$B, "<="&DATE(2026,9,30))
+  ```
+  - In Google Sheets, `*` matches 0 or more characters, so `*Muhanad*` matches `"Muhanad"`, `"Muhanad "`, `" Muhanad"`, and `"  Muhanad  "` with sub-50ms instant recalculation.
+  - As long as distinct entities do not share substring substrings (e.g. "Dad", "Mai", "Muhanad", "Abdo"), wildcard matching provides 100% collision-free resilience.
+
+#### Layer 2: In-Place Real-Time Input Sanitization via `onEdit`
+Catch and correct whitespace directly at the source when the user enters or pastes data into input sheets:
+- Intercept the column in `onEdit(e)`:
+  ```javascript
+  if (sheetName === CONFIG.SHEETS.TRANSACTIONS) {
+    const startCol = e.range.getColumn();
+    const endCol = startCol + (e.range.getNumColumns ? e.range.getNumColumns() : 1) - 1;
+    if (startCol <= 4 && endCol >= 4 && e.range.getLastRow() >= 2) {
+      const startRow = Math.max(2, e.range.getRow());
+      const numRows = e.range.getLastRow() - startRow + 1;
+      const targetRange = sheet.getRange(startRow, 4, numRows, 1);
+      const values = targetRange.getValues();
+      let changed = false;
+      for (let r = 0; r < values.length; r++) {
+        const orig = String(values[r][0] || "");
+        if (orig) {
+          const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+          if (clean !== orig) {
+            values[r][0] = clean;
+            changed = true;
+          }
+        }
+      }
+      if (changed) targetRange.setValues(values);
+    }
+    return;
+  }
+  ```
+  - Replaces all unicode whitespace (`\u00A0` non-breaking spaces and regular spaces) and trims in-place without triggering full sheet redraws.
+
+#### Layer 3: Procedural Ingestion & Batch Self-Healing Sanitizer
+1. **Batch Auto-Cleaner**: On every background sync or dashboard update, execute a batch cleaner:
+   ```javascript
+   function sanitizeAllPayerNames(ss) {
+     // Scans Transactions Col D and Installments Col I, cleans any dirty cells in-place
+   }
+   ```
+2. **Defensive Procedural Reads**:
+   Whenever scripts read user columns, immediately normalize whitespace:
+   ```javascript
+   const cleanName = String(rawName || "").replace(/[\u00A0\s]+/g, " ").trim();
+   ```
+
+
