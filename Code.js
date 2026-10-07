@@ -1748,6 +1748,9 @@ function runReconciliation(ss, tz) {
   // Calculate Statement Period (Billing Cycle)
   const stmtDateVal = stmtSheet.getRange("B2").getValue();
   const stmtDate = parseDateValue(stmtDateVal, tz);
+  const stmtDueDateVal = stmtSheet.getRange("D2").getValue();
+  const stmtDueDate = parseDateValue(stmtDueDateVal, tz) || (stmtDate ? new Date(stmtDate.getFullYear(), stmtDate.getMonth() + 1, 25) : null);
+  const stmtCycleKey = stmtDueDate ? Utilities.formatDate(stmtDueDate, tz, "yyyy-MM") : null;
   const stmtPeriod = getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate);
 
   // Read Installments for payer lookup on Bank Statement
@@ -1818,6 +1821,14 @@ function runReconciliation(ss, tz) {
         // Only include sheet transactions that fall within the statement's billing period!
         if (stmtPeriod.start && pDate < stmtPeriod.start) return;
         if (stmtPeriod.end && pDate > stmtPeriod.end) return;
+
+        const cycleInfo = getBillingCycleForPurchase(pDate, tz);
+        // Day 31 Rollover Rule: purchases rolling over to upcoming cycles belong to future statements.
+        // Do NOT include them in active statement reconciliation unless an explicit candidate debit exists on the statement!
+        if (stmtCycleKey && cycleInfo && cycleInfo.cycleSortKey > stmtCycleKey) {
+          const hasCandidate = stmtDebits.some(st => !st.matched && Math.abs(st.amount - amt) <= 0.05);
+          if (!hasCandidate) return;
+        }
 
         txDebits.push({
           rowNum: idx + 2,
@@ -2618,7 +2629,7 @@ function updateLiveDashboard(options) {
 
       // A) DEBT BREAKDOWN (statement-based): follows the dates in the uploaded PDF statement
       const beforeStmt = !!(stmtPeriod.start && purchaseDate < stmtPeriod.start);
-      const inStmtWindow = hasStatement && !beforeStmt && (!stmtPeriod.end || purchaseDate <= stmtPeriod.end);
+      const inStmtWindow = hasStatement && !beforeStmt && (!stmtPeriod.end || purchaseDate <= stmtPeriod.end) && !isForecast;
       let stmtTarget = null;
       if (inStmtWindow && !isNeglectedFromActiveStmt) {
         stmtTarget = {
