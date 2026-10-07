@@ -138,7 +138,26 @@ When designing multi-month comparison matrixes (such as timeline dashboards):
 
 ---
 
-## 5. Checklist for Every Sheet Creation / Update
+## 5. Multi-Table Column Alignment & Text Fitting Ergonomics
+
+When a single sheet contains vertically stacked tables (e.g. Summary KPI card, Table 1 Family Totals, and Table 2 Itemized Charges):
+
+1. **Strict Column Semantic Alignment**:
+   - Never insert an index `#` column in Table 2 if Table 1 starts with `Family Member`. This shifts all columns by one, creates conflicting column widths, and forces Column 1 to serve both a 45px `#` and a 200px Total string.
+   - Column A must consistently represent `Family Member` across all stacked tables.
+2. **Label Budgeting in KPI Cards**:
+   - Keep metric labels under 25 characters (e.g. `Bank Statement Closing Bill:`, `Family Shares Total:`, `Recon Status:`, `One-Time Purchases Total:`). Long labels like `Sum of Family Shares Accounted For:` (36 chars) clip into `Sum of Family Sha`.
+   - Keep dates formatted without weekday redundancy (`September 25, 2026` instead of `Sunday, September 25, 2026`).
+3. **Merge Multi-Word Status Badges**:
+   - Always merge status badges across available right-side columns (e.g. `F5:H5`) so status badges like `✅ Perfect Match (0.00 EGP difference)` have 400px+ of room with zero truncation.
+4. **Wrap Long Notes**:
+   - Always apply `.setWrap(true)` on description and source/audit note columns (Column H) to prevent text bleeding across empty columns.
+5. **Always Set `autoResizeStartCol` and `colWidthBounds`**:
+   - Never hardcode arbitrary static widths without safe bounds and auto-resizing. Always specify bounds (e.g. `colWidthBounds: { 2: { min: 155, max: 175 }, 3: { min: 210, max: 260 }, ... }`).
+
+---
+
+## 6. Checklist for Every Sheet Creation / Update
 
 - [ ] Row 1 banner height is explicitly set to `30px`.
 - [ ] Row 2 subtitle height is explicitly set to `20px`.
