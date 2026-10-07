@@ -395,7 +395,7 @@ function onEdit(e) {
   const sheet = e.range.getSheet();
   const sheetName = sheet.getName();
 
-  // If user edits Transactions: automatically clean any stray leading/trailing spaces in the Person column!
+  // If user edits Transactions: automatically clean whitespace and standardize casing in Person column!
   // Native equations in Monthly Overview update spontaneously in-browser (sub-50ms).
   if (sheetName === CONFIG.SHEETS.TRANSACTIONS) {
     const startCol = e.range.getColumn();
@@ -409,7 +409,7 @@ function onEdit(e) {
       for (let r = 0; r < values.length; r++) {
         const orig = String(values[r][0] || "");
         if (orig) {
-          const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+          const clean = formatPayerCell(orig);
           if (clean !== orig) {
             values[r][0] = clean;
             changed = true;
@@ -437,7 +437,7 @@ function onEdit(e) {
         for (let r = 0; r < values.length; r++) {
           const orig = String(values[r][0] || "");
           if (orig) {
-            const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+            const clean = formatPayerCell(orig);
             if (clean !== orig) {
               values[r][0] = clean;
               changed = true;
@@ -1568,12 +1568,18 @@ function normalizePersonName(name) {
   const lower = cleaned.toLowerCase();
   if (lower === "shared") return "";
 
-  // Common aliases & typo unification
-  if (lower === "me" || lower === "myself") return "Mido";
-  if (lower === "abd") return "Abdo";
-  if (lower === "zozza") return "Zoza";
-  if (lower === "mohanad") return "Muhanad";
+  // Common aliases & typo unification (case-insensitive)
+  if (lower === "me" || lower === "myself" || lower === "ahmed" || lower === "mido") return "Mido";
+  if (lower === "abd" || lower === "abdelrahman" || lower === "abdo") return "Abdo";
+  if (lower === "zozza" || lower === "zoza") return "Zoza";
+  if (lower === "mohanad" || lower === "muhanad") return "Muhanad";
+  if (lower === "mom" || lower === "mum") return "Mum";
+  if (lower === "father" || lower === "dad") return "Dad";
+  if (lower === "nour" || lower === "nourween") return "Nourween";
+  if (lower === "mai") return "Mai";
+  if (lower === "hager") return "Hager";
 
+  // Generic fallback: Title Case capitalization (e.g. "john" -> "John")
   return cleaned
     .toLowerCase()
     .split(" ")
@@ -1595,8 +1601,30 @@ function splitPayerNames(payerStr) {
 }
 
 /**
+ * Formats a payer string for storage in spreadsheet cells.
+ * Strips whitespace, normalizes casing to canonical Title Case,
+ * resolves aliases (e.g. "me" -> "Mido"), and standardizes split payers (e.g. "mido + mai").
+ * 
+ * @param {string} val
+ * @return {string}
+ */
+function formatPayerCell(val) {
+  if (!val) return "";
+  const s = String(val).replace(/[\u00A0\s]+/g, " ").trim();
+  if (!s || isNeglectedPayer(s) || s.toLowerCase() === "shared") return s;
+
+  if (/[\+\,\/\&]|\band\b/i.test(s)) {
+    const parts = splitPayerNames(s);
+    return parts.length > 0 ? parts.join(" + ") : s;
+  }
+
+  return normalizePersonName(s) || s;
+}
+
+/**
  * Automatically cleans and sanitizes payer/person names in user sheets (Transactions and Installments).
- * Strips leading/trailing spaces, non-breaking spaces (\u00A0), and collapses multiple spaces.
+ * Strips leading/trailing spaces, non-breaking spaces (\u00A0), collapses spaces,
+ * and formats names into canonical Title Case (e.g. "muhanad" -> "Muhanad").
  * 
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
  */
@@ -1613,7 +1641,7 @@ function sanitizeAllPayerNames(ss) {
       for (let i = 0; i < values.length; i++) {
         const orig = String(values[i][0] || "");
         if (orig) {
-          const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+          const clean = formatPayerCell(orig);
           if (clean !== orig) {
             values[i][0] = clean;
             changed = true;
@@ -1622,7 +1650,7 @@ function sanitizeAllPayerNames(ss) {
       }
       if (changed) {
         range.setValues(values);
-        Logger.log("[sanitizeAllPayerNames] Cleaned whitespace in Transactions sheet payer names.");
+        Logger.log("[sanitizeAllPayerNames] Standardized casing and whitespace in Transactions sheet payer names.");
       }
     }
 
@@ -1636,7 +1664,7 @@ function sanitizeAllPayerNames(ss) {
       for (let i = 0; i < values.length; i++) {
         const orig = String(values[i][0] || "");
         if (orig) {
-          const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+          const clean = formatPayerCell(orig);
           if (clean !== orig) {
             values[i][0] = clean;
             changed = true;
@@ -1645,7 +1673,7 @@ function sanitizeAllPayerNames(ss) {
       }
       if (changed) {
         range.setValues(values);
-        Logger.log("[sanitizeAllPayerNames] Cleaned whitespace in Installments sheet payer names.");
+        Logger.log("[sanitizeAllPayerNames] Standardized casing and whitespace in Installments sheet payer names.");
       }
     }
   } catch (err) {

@@ -174,7 +174,7 @@ Catch and correct whitespace directly at the source when the user enters or past
       for (let r = 0; r < values.length; r++) {
         const orig = String(values[r][0] || "");
         if (orig) {
-          const clean = orig.replace(/[\u00A0\s]+/g, " ").trim();
+          const clean = formatPayerCell(orig);
           if (clean !== orig) {
             values[r][0] = clean;
             changed = true;
@@ -186,19 +186,31 @@ Catch and correct whitespace directly at the source when the user enters or past
     return;
   }
   ```
-  - Replaces all unicode whitespace (`\u00A0` non-breaking spaces and regular spaces) and trims in-place without triggering full sheet redraws.
+  - Replaces all unicode whitespace (`\u00A0` non-breaking spaces and regular spaces) and normalizes names to Title Case directly in the sheet cell without full sheet redraws.
 
 #### Layer 3: Procedural Ingestion & Batch Self-Healing Sanitizer
 1. **Batch Auto-Cleaner**: On every background sync or dashboard update, execute a batch cleaner:
    ```javascript
    function sanitizeAllPayerNames(ss) {
-     // Scans Transactions Col D and Installments Col I, cleans any dirty cells in-place
+     // Scans Transactions Col D and Installments Col I, cleans whitespace and Title Cases dirty cells in-place
    }
    ```
 2. **Defensive Procedural Reads**:
-   Whenever scripts read user columns, immediately normalize whitespace:
+   Whenever scripts read user columns, immediately normalize whitespace and letter casing:
    ```javascript
-   const cleanName = String(rawName || "").replace(/[\u00A0\s]+/g, " ").trim();
+   const cleanName = normalizePersonName(rawName);
    ```
+
+---
+
+### Case Sensitivity Rules: Declarative Engine vs Procedural Engine
+
+| Aspect | Declarative Engine (Formulas) | Procedural Engine (Apps Script) |
+| :--- | :--- | :--- |
+| **Case Behavior** | **100% Case-Insensitive**: `SUMIFS`, `COUNTIF`, `MATCH`, `VLOOKUP`, `XLOOKUP` treat `"muhanad"`, `"Muhanad"`, and `"MUHANAD"` identically. | **Case-Sensitive by Default**: JavaScript `===` considers `"muhanad" !== "Muhanad"`. |
+| **Impact on Calculations** | **None**: Lowercase or uppercase letters in input sheets match summary tables automatically. | **Requires Normalization**: Un-normalized keys would split dictionary buckets (`obj["muhanad"]` vs `obj["Muhanad"]`). |
+| **Architectural Standard** | Use wildcard wrapping (`"*" & TRIM($A4) & "*"`) for whitespace resilience; case-insensitivity is built-in. | Always pipe through `normalizePersonName(val)` (lowercases input, maps aliases like `me` -> `Mido`, outputs canonical Title Case). |
+| **In-Sheet Visual Cleanliness** | Automatic formatting via `onEdit` (`formatPayerCell`) auto-capitalizes cells into clean Title Case as the user types. | Batch self-healing (`sanitizeAllPayerNames`) ensures sheets maintain uniform casing. |
+
 
 
