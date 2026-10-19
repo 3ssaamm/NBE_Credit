@@ -486,12 +486,13 @@ function getReconStoreSheet(ss) {
   return sheet;
 }
 
-function makeReconKey(dateVal, amountVal, descVal, tz) {
+function makeReconKey(dateVal, amountVal, descVal, tz, occurrenceIndex) {
   const dStr = makeNormDateStr(dateVal, tz);
   const amtNum = parseFloat(amountVal);
   const aStr = isNaN(amtNum) ? "0.00" : amtNum.toFixed(2);
   const dClean = makeNormDesc(descVal).substring(0, 30);
-  return `${dStr}_${aStr}_${dClean}`;
+  const occStr = (occurrenceIndex !== undefined && occurrenceIndex !== null) ? `_#${occurrenceIndex}` : "";
+  return `${dStr}_${aStr}_${dClean}${occStr}`;
 }
 
 function loadAllReconStore(ss, tz) {
@@ -1552,18 +1553,34 @@ function reconcileActiveStatement(ss, tz) {
   });
 
   // 6. Fees Default to Mai (or restored from store)
-  stmtFees.forEach(fee => {
-    const pKey = makeReconKey(fee.date || fee.dateStr, fee.amount, fee.desc, tz);
-    const saved = reconStore.table2Map[pKey];
+  const feeOccTracker = {};
+  stmtFees.forEach((fee, idx) => {
+    const baseKey = makeReconKey(fee.date || fee.dateStr, fee.amount, fee.desc, tz);
+    feeOccTracker[baseKey] = (feeOccTracker[baseKey] || 0) + 1;
+    const occ = feeOccTracker[baseKey];
+    const pKeyWithOcc = `${baseKey}_#${occ}`;
+    const exId = `F-${idx + 1}`;
+
+    const saved = reconStore.table2Map[exId] ||
+                  reconStore.table2Map[pKeyWithOcc] ||
+                  (occ === 1 ? reconStore.table2Map[baseKey] : null);
     fee.assignedPayer = (saved && saved.payer) ? saved.payer : CONFIG.DEFAULT_FEE_PAYER;
     fee.note = (saved && saved.note) ? saved.note : "Bank Fee / Tax";
   });
 
-  // 7. Restore missing in sheet assignments
-  missingInSheet.forEach(m => {
-    const pKey = makeReconKey(m.date || m.dateStr, m.amount, m.desc, tz);
-    const amtDescKey = `${m.amount.toFixed(2)}_${makeNormDesc(m.desc).substring(0, 30)}`;
-    const saved = reconStore.table2Map[pKey] || reconStore.table2Map[amtDescKey];
+  // 7. Restore missing in sheet assignments with unique occurrence tracking
+  const missingOccTracker = {};
+  missingInSheet.forEach((m, idx) => {
+    const baseKey = makeReconKey(m.date || m.dateStr, m.amount, m.desc, tz);
+    missingOccTracker[baseKey] = (missingOccTracker[baseKey] || 0) + 1;
+    const occ = missingOccTracker[baseKey];
+    m.occurrenceIndex = occ;
+    const pKeyWithOcc = `${baseKey}_#${occ}`;
+    const exId = `M-${idx + 1}`;
+
+    const saved = reconStore.table2Map[exId] ||
+                  reconStore.table2Map[pKeyWithOcc] ||
+                  (occ === 1 ? reconStore.table2Map[baseKey] : null);
     if (saved && saved.payer) {
       m.assignedPayer = (saved.payer === "NEGLECT" || saved.isNeglected) ? "🚫 Neglect / Ignore" : saved.payer;
       m.note = saved.note || cleanMerchantName(m.desc);
@@ -1571,10 +1588,17 @@ function reconcileActiveStatement(ss, tz) {
   });
 
   // 8. Restore refunds / credits assignments
-  stmtCredits.forEach(cr => {
-    const pKey = makeReconKey(cr.date || cr.dateStr, cr.amount, cr.desc, tz);
-    const amtDescKey = `${cr.amount.toFixed(2)}_${makeNormDesc(cr.desc).substring(0, 30)}`;
-    const saved = reconStore.table2Map[pKey] || reconStore.table2Map[amtDescKey];
+  const creditOccTracker = {};
+  stmtCredits.forEach((cr, idx) => {
+    const baseKey = makeReconKey(cr.date || cr.dateStr, cr.amount, cr.desc, tz);
+    creditOccTracker[baseKey] = (creditOccTracker[baseKey] || 0) + 1;
+    const occ = creditOccTracker[baseKey];
+    const pKeyWithOcc = `${baseKey}_#${occ}`;
+    const exId = `C-${idx + 1}`;
+
+    const saved = reconStore.table2Map[exId] ||
+                  reconStore.table2Map[pKeyWithOcc] ||
+                  (occ === 1 ? reconStore.table2Map[baseKey] : null);
     if (saved && saved.payer) {
       cr.assignedPayer = (saved.payer === "NEGLECT" || saved.isNeglected) ? "🚫 Neglect / Ignore" : saved.payer;
       cr.note = saved.note || cr.desc;
@@ -1582,6 +1606,8 @@ function reconcileActiveStatement(ss, tz) {
   });
 
   saveAllReconStore(ss, reconStore);
+
+  const unmatchedTx = txDebits.filter(tx => !tx.matched);
 
   return {
     stmtDebits,
@@ -1591,6 +1617,7 @@ function reconcileActiveStatement(ss, tz) {
     suggestedMatches,
     missingInSheet,
     txDebits,
+    unmatchedTx,
     cardBal,
     reconStore,
     tz
@@ -1639,10 +1666,10 @@ function buildDebtLedger(ss, tz, recon) {
     });
   }
 
-  // 1. Attributed Purchases (Sourced directly from Transactions sheet for this billing cycle)
-  (recon.txDebits || []).forEach(tx => {
-    if (tx.person && !isNeglectedPayer(tx.person)) {
-      addShare(tx.person, tx.amount, "Purchase");
+  // 1. Attributed Purchases (Matched Statement Debits)
+  recon.stmtDebits.forEach(st => {
+    if (st.matched && st.assignedPayer && !isNeglectedPayer(st.assignedPayer)) {
+      addShare(st.assignedPayer, st.amount, "Purchase");
     }
   });
 
@@ -1939,6 +1966,42 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
         sheet.getRange(curRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
       }
     }
+    curRow += exceptionItems.length;
+  }
+
+  // 5. Sheet Transactions Not on Current Bank Statement (Unbilled / Pending)
+  if (recon.unmatchedTx && recon.unmatchedTx.length > 0) {
+    curRow += 2;
+    sheet.getRange(curRow, 1, 1, 8).merge()
+      .setValue(`⏳ Transactions in Sheet Not on Current Bank Statement (${recon.unmatchedTx.length} Items Unbilled / Pending Next Statement)`)
+      .setFontWeight("bold")
+      .setFontSize(10)
+      .setBackground("#e8eaed");
+    curRow++;
+
+    const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Category", "Person", "Notes", "Status"];
+    sheet.getRange(curRow, 1, 1, unHeaders.length).setValues([unHeaders])
+      .setFontWeight("bold")
+      .setFontSize(9)
+      .setBackground(CONFIG.COLORS.HEADER);
+    curRow++;
+
+    const unRows = recon.unmatchedTx.map((tx, idx) => [
+      `TX-${idx + 1}`,
+      tx.date,
+      tx.desc,
+      tx.amount,
+      "Sheet Purchase",
+      tx.person,
+      "Recorded in Transactions",
+      "⏳ Pending Next Statement"
+    ]);
+
+    sheet.getRange(curRow, 1, unRows.length, unHeaders.length).setValues(unRows).setFontSize(9);
+    sheet.getRange(curRow, 2, unRows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(curRow, 4, unRows.length, 1).setNumberFormat("#,##0.00");
+    sheet.getRange(curRow, 1, unRows.length, unHeaders.length).setBackground("#f8f9fa");
+    curRow += unRows.length;
   }
 
   applySheetLayoutFitting(sheet, {
@@ -2090,6 +2153,7 @@ function handleActiveReconEdit(e) {
   if (row > lastR) return;
 
   const rowVals = sheet.getRange(row, 1, 1, 8).getValues()[0];
+  const exId = String(rowVals[0] || "").trim();
   const rawDate = rowVals[1];
   const origDesc = String(rowVals[2] || "").trim();
   const amt = parseFloat(rowVals[3]);
@@ -2102,12 +2166,28 @@ function handleActiveReconEdit(e) {
   const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
   const reconStore = loadAllReconStore(ss, tz);
 
-  const pKey = makeReconKey(rawDate, amt, origDesc, tz);
-  const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`;
+  // Calculate occurrence number within Table 2 for identical (amt, desc)
+  let occ = 1;
+  const startExRow = 14;
+  if (row > startExRow) {
+    const prevRange = sheet.getRange(startExRow, 1, row - startExRow, 4).getValues();
+    prevRange.forEach(pr => {
+      const pDesc = String(pr[2] || "").trim();
+      const pAmt = parseFloat(pr[3]) || 0;
+      if (Math.abs(pAmt - amt) < 0.01 && makeNormDesc(pDesc) === makeNormDesc(origDesc)) {
+        occ++;
+      }
+    });
+  }
+
+  const baseKey = makeReconKey(rawDate, amt, origDesc, tz);
+  const pKeyWithOcc = `${baseKey}_#${occ}`;
+  const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}_#${occ}`;
 
   if (payer && !isNeglectedPayer(payer)) {
     const rec = {
-      primaryKey: pKey,
+      primaryKey: pKeyWithOcc,
+      exId: exId,
       dateStr: makeNormDateStr(rawDate, tz),
       desc: origDesc,
       amount: amt,
@@ -2115,13 +2195,19 @@ function handleActiveReconEdit(e) {
       note: note,
       isNeglected: false
     };
-    reconStore.table2Map[pKey] = rec;
+    reconStore.table2Map[pKeyWithOcc] = rec;
     reconStore.table2Map[amtDescKey] = rec;
+    if (exId) reconStore.table2Map[exId] = rec;
+    if (occ === 1) {
+      reconStore.table2Map[baseKey] = rec;
+      reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
+    }
     sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
     sheet.getRange(row, 8).setValue("✅ Assigned");
   } else if (isNeglectedPayer(payer)) {
     const rec = {
-      primaryKey: pKey,
+      primaryKey: pKeyWithOcc,
+      exId: exId,
       dateStr: makeNormDateStr(rawDate, tz),
       desc: origDesc,
       amount: amt,
@@ -2129,13 +2215,23 @@ function handleActiveReconEdit(e) {
       note: note,
       isNeglected: true
     };
-    reconStore.table2Map[pKey] = rec;
+    reconStore.table2Map[pKeyWithOcc] = rec;
     reconStore.table2Map[amtDescKey] = rec;
+    if (exId) reconStore.table2Map[exId] = rec;
+    if (occ === 1) {
+      reconStore.table2Map[baseKey] = rec;
+      reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
+    }
     sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
     sheet.getRange(row, 8).setValue("🚫 Neglected");
   } else {
-    delete reconStore.table2Map[pKey];
+    delete reconStore.table2Map[pKeyWithOcc];
     delete reconStore.table2Map[amtDescKey];
+    if (exId) delete reconStore.table2Map[exId];
+    if (occ === 1) {
+      delete reconStore.table2Map[baseKey];
+      delete reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`];
+    }
     sheet.getRange(row, 1, 1, 8).setBackground("#ffffff");
     sheet.getRange(row, 8).setValue("⚠️ Needs Payer");
   }
