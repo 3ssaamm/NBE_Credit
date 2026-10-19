@@ -186,35 +186,7 @@ function loadAllReconStore(ss, tz) {
     Logger.log("[loadAllReconStore] Error reading store: " + (err ? (err.message || String(err)) : ""));
   }
 
-  // Fallback to ScriptProperties for legacy compatibility
-  if (store.table2List.length === 0) {
-    try {
-      const sp = PropertiesService.getScriptProperties();
-      const raw = sp.getProperty("ASSIGNED_STATEMENT_CHARGES");
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        Object.keys(parsed).forEach(k => {
-          const item = parsed[k];
-          if (item && item.amount > 0 && item.desc && item.payer) {
-            const pKey = makeReconKey(item.dateStr, item.amount, item.desc, tz);
-            if (!store.table2Map[pKey]) {
-              const rec = {
-                primaryKey: pKey,
-                dateStr: item.dateStr || "",
-                desc: item.desc,
-                amount: item.amount,
-                payer: item.payer,
-                note: item.note || "",
-                isNeglected: (item.payer === "NEGLECT")
-              };
-              store.table2Map[pKey] = rec;
-              store.table2List.push(rec);
-            }
-          }
-        });
-      }
-    } catch (e) { }
-  }
+
 
   if (store.confirmedMatches.size === 0) {
     try {
@@ -2406,6 +2378,19 @@ function runReconciliation(ss, tz) {
   const suggestedStmtIds = new Set(suggestedMatches.map(s => s.stmt.id));
   const missingInSheet = stmtDebits.filter(st => !st.matched && !suggestedStmtIds.has(st.id));
 
+  // Prune any matched or confirmed debits from reconStore.table2Map so they don't linger
+  stmtDebits.forEach(st => {
+    if (st.matched) {
+      const pKey = makeReconKey(st.date || st.dateStr, st.amount, st.desc, tz);
+      const amtDescKey = `${st.amount.toFixed(2)}_${makeNormDesc(st.desc).substring(0, 30)}`;
+      const cKey = `${String(st.dateStr)}_${st.amount.toFixed(2)}_${st.desc.substring(0, 30)}`;
+      delete reconStore.table2Map[pKey];
+      delete reconStore.table2Map[amtDescKey];
+      delete reconStore.table2Map[cKey];
+      reconStore.table2List = reconStore.table2List.filter(it => it.primaryKey !== pKey);
+    }
+  });
+
   // Identify unmatched sheet transactions
   const suggestedTxRowNums = new Set();
   suggestedMatches.forEach(sm => {
@@ -2740,6 +2725,8 @@ function runReconciliation(ss, tz) {
       default: { min: 100, max: 220 }
     }
   });
+
+  saveAllReconStore(ss, reconStore);
 }
 
 function addAssignedChargesToTransactions() {
@@ -3202,26 +3189,10 @@ function updateLiveDashboard(options) {
     });
   }
 
-  // 3. Process Assigned Statement Charges (From Recon Store & Reconciliation Table 2)
-  const assignedChargesMap = {};
+  // 3. Process Assigned Statement Charges (From Reconciliation Table 2)
+  // Read all assigned rows directly from visible Reconciliation sheet Table 2 as an ARRAY (NO Map collapsing, NO phantom duplicates!)
+  const assignedChargesList = [];
 
-  // First, read from persistent reconStore
-  const reconStore = loadAllReconStore(ss, tz);
-  reconStore.table2List.forEach(item => {
-    if (item && item.amount > 0 && item.desc && item.payer) {
-      const pKey = item.primaryKey || makeReconKey(item.dateStr || item.rawDate, item.amount, item.desc, tz);
-      assignedChargesMap[pKey] = {
-        itemNum: item.itemNum || "",
-        rawDate: item.rawDate || item.dateStr,
-        desc: item.desc,
-        amount: item.amount,
-        payer: item.payer,
-        note: item.note || ""
-      };
-    }
-  });
-
-  // Second, overlay any assignments currently visible on Reconciliation sheet Table 2
   const reconSheet = ss.getSheetByName(CONFIG.SHEETS.RECONCILIATION);
   if (reconSheet && reconSheet.getLastRow() >= 5) {
     const lastRow = reconSheet.getLastRow();
@@ -3246,22 +3217,19 @@ function updateLiveDashboard(options) {
           const payer = String(r[4] || "").trim();
           const note = String(r[5] || "").trim();
           if (!isNaN(amt) && amt > 0 && desc && payer) {
-            const pKey = makeReconKey(rawDate, amt, desc, tz);
-            assignedChargesMap[pKey] = {
+            assignedChargesList.push({
               itemNum: itemNum,
               rawDate: rawDate,
               desc: desc,
               amount: amt,
               payer: payer,
               note: note
-            };
+            });
           }
         });
       }
     }
   }
-
-  const assignedChargesList = Object.values(assignedChargesMap);
 
   let assignedMissingCount = 0;
   let assignedMissingTotal = 0;
