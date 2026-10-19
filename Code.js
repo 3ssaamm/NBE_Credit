@@ -1030,6 +1030,8 @@ function parseNBEStatementText(text) {
     let amount = 0;
     const maxAmountCap = Math.max(meta.creditLimit * 1.5, 200000);
 
+    const creditPattern = /\b(?:PAYMENT|DIRECT\s*DEBIT|REFUND|CREDIT|DEPOSIT|SETTLEMENT|CASHBACK|CASH\s*BACK|REVERSAL|REVERSED|REV\b|RETURN|RTN\b|CHARGEBACK|ADJUSTMENT|INSTAPAY|IPN\b|ACH\b|TRSF\b|TRANSFER|FAWRY\s*PAY|سداد|استرداد|إيداع|مرتجع|تسوية)\b|\bCR\b|[\d,]+\.?\d*\s*CR\b|[\d,]+\.?\d*-\b|-\s*[\d,]+\.?\d*\b|\([\d,]+\.?\d*\)/i;
+
     const mInst = rest.match(/(\d+)\s+(?:OF|\/)\s+(\d+)/i);
     if (mInst) {
       txType = "INSTALLMENT";
@@ -1037,7 +1039,7 @@ function parseNBEStatementText(text) {
       instTotal = parseInt(mInst[2], 10);
     } else if (feePattern.test(rawLine) || feePattern.test(rest)) {
       txType = "FEE";
-    } else if (/\b(?:PAYMENT|DIRECT DEBIT|REFUND|CREDIT|DEPOSIT|SETTLEMENT)\b|\bCR\b|[\d,]+\.?\d*\s*CR\b/i.test(rest)) {
+    } else if (creditPattern.test(rawLine) || creditPattern.test(rest)) {
       txType = "CREDIT";
     }
 
@@ -1299,6 +1301,8 @@ function reconcileActiveStatement(ss, tz) {
   let minStmtTxDate = null;
   let maxStmtTxDate = null;
 
+  const creditPattern = /\b(?:PAYMENT|DIRECT\s*DEBIT|REFUND|CREDIT|DEPOSIT|SETTLEMENT|CASHBACK|CASH\s*BACK|REVERSAL|REVERSED|REV\b|RETURN|RTN\b|CHARGEBACK|ADJUSTMENT|INSTAPAY|IPN\b|ACH\b|TRSF\b|TRANSFER|FAWRY\s*PAY|سداد|استرداد|إيداع|مرتجع|تسوية)\b|\bCR\b|[\d,]+\.?\d*\s*CR\b/i;
+
   stmtData.forEach((row, idx) => {
     const pDate = parseDateValue(row[1], tz);
     if (pDate) {
@@ -1306,14 +1310,29 @@ function reconcileActiveStatement(ss, tz) {
       if (!maxStmtTxDate || pDate > maxStmtTxDate) maxStmtTxDate = pDate;
     }
 
-    const type = String(row[4] || "").trim().toUpperCase();
+    let type = String(row[4] || "").trim().toUpperCase();
+    const desc = String(row[3] || "").trim();
+    const amt = parseFloat(row[5]) || 0;
+
+    if (type !== "INSTALLMENT" && type !== "FEE") {
+      if (type === "CREDIT" || creditPattern.test(desc) || amt < 0 || /\bCR\b/i.test(desc)) {
+        type = "CREDIT";
+        if (row[4] !== "CREDIT") {
+          try {
+            stmtSheet.getRange(idx + 7, 5).setValue("CREDIT");
+            stmtSheet.getRange(idx + 7, 1, 1, 7).setBackground(CONFIG.COLORS.PAID);
+          } catch (e) { }
+        }
+      }
+    }
+
     const item = {
       id: idx + 1,
       stmtRowIndex: idx,
       dateStr: String(row[1]),
       date: pDate,
-      desc: String(row[3] || "").trim(),
-      amount: parseFloat(row[5]) || 0,
+      desc: desc,
+      amount: Math.abs(amt),
       type: type,
       matched: false,
       assignedPayer: "",
@@ -1349,8 +1368,10 @@ function reconcileActiveStatement(ss, tz) {
       const person = String(row[3] || "").trim();
       const desc = String(row[2] || "").trim();
       if (pDate && !isNaN(amt) && amt > 0 && person) {
-        if (stmtPeriod.start && pDate < stmtPeriod.start) return;
-        if (stmtPeriod.end && pDate > stmtPeriod.end) return;
+        const cycle = getBillingCycleForPurchase(pDate, tz);
+        const belongsToCycle = (cycle && cycle.cycleSortKey === cardBal.activeCycleKey) ||
+                               (!cycle && stmtPeriod.start && stmtPeriod.end && pDate >= stmtPeriod.start && pDate <= stmtPeriod.end);
+        if (!belongsToCycle) return;
 
         txDebits.push({
           rowNum: idx + 2,
@@ -1502,6 +1523,7 @@ function reconcileActiveStatement(ss, tz) {
     stmtCredits,
     suggestedMatches,
     missingInSheet,
+    txDebits,
     cardBal,
     reconStore,
     tz
@@ -1550,10 +1572,10 @@ function buildDebtLedger(ss, tz, recon) {
     });
   }
 
-  // 1. Attributed Purchases (Matched Statement Debits)
-  recon.stmtDebits.forEach(st => {
-    if (st.matched && st.assignedPayer) {
-      addShare(st.assignedPayer, st.amount, "Purchase");
+  // 1. Attributed Purchases (Sourced directly from Transactions sheet for this billing cycle)
+  (recon.txDebits || []).forEach(tx => {
+    if (tx.person && !isNeglectedPayer(tx.person)) {
+      addShare(tx.person, tx.amount, "Purchase");
     }
   });
 
@@ -1592,12 +1614,12 @@ function buildDebtLedger(ss, tz, recon) {
   // 5. Attributed Refunds / Credits
   let billPaymentsTotal = 0;
   recon.stmtCredits.forEach(cr => {
-    const isPayment = /\b(?:PAYMENT|DIRECT DEBIT|SETTLEMENT|DEPOSIT)\b/i.test(cr.desc);
+    const isPayment = /\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(cr.desc);
     if (isPayment) {
       billPaymentsTotal += cr.amount;
     } else {
       // Refund / Cashback
-      addShare(cr.assignedPayer || "Mai", cr.amount, "Refund");
+      addShare(cr.assignedPayer || CONFIG.DEFAULT_FEE_PAYER, cr.amount, "Refund");
     }
   });
 
@@ -1622,10 +1644,7 @@ function buildDebtLedger(ss, tz, recon) {
   const openingBalance = cardBal.openingBalance || 0;
   const carriedOver = openingBalance - billPaymentsTotal;
   const auditDifference = (familySharesTotal + carriedOver) - closingBill;
-  
-  // Actionable difference is the remaining unassigned statement charges (the ~900 EGP)
-  const actionableDifference = unassignedTotal > 0 ? -unassignedTotal : 0;
-  const isExactMatch = Math.abs(actionableDifference) < 0.05 && unassignedCount === 0;
+  const isExactMatch = Math.abs(auditDifference) < 0.50;
 
   return {
     activeCycleKey,
@@ -1646,7 +1665,6 @@ function buildDebtLedger(ss, tz, recon) {
     refundsTotal,
     familySharesTotal,
     auditDifference,
-    actionableDifference,
     isExactMatch,
     personShares: Object.values(personShares).filter(ps => ps.netTotal > 0 || ps.purchases > 0 || ps.installments > 0)
   };
@@ -1683,19 +1701,19 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setBackground(CONFIG.COLORS.HEADER);
 
   const statusBadge = ledger.isExactMatch
-    ? `✅ Perfect Balance (All shares assigned | ${ledger.neglectedCount} neglected [${ledger.neglectedTotal.toFixed(2)} EGP])`
-    : (ledger.unassignedCount > 0
-        ? `⚠️ Actionable Gap: -${ledger.unassignedTotal.toFixed(2)} EGP (${ledger.unassignedCount} unassigned charges waiting below)`
-        : `ℹ️ Difference: ${ledger.auditDifference > 0 ? "+" : ""}${ledger.auditDifference.toFixed(2)} EGP`);
-  const statusColor = ledger.isExactMatch ? CONFIG.COLORS.PAID : (ledger.unassignedCount > 0 ? CONFIG.COLORS.OVERDUE : CONFIG.COLORS.DUE_SOON);
+    ? "✅ Perfect Match (0.00 EGP difference)"
+    : (ledger.auditDifference > 0
+        ? `ℹ️ Shares exceed bank bill by +${ledger.auditDifference.toFixed(2)} EGP`
+        : `⚠️ Bank bill exceeds shares by -${Math.abs(ledger.auditDifference).toFixed(2)} EGP (${ledger.unassignedCount} unassigned charges waiting below)`);
+  const statusColor = ledger.isExactMatch ? CONFIG.COLORS.PAID : (ledger.auditDifference > 0 ? CONFIG.COLORS.DUE_SOON : CONFIG.COLORS.OVERDUE);
 
   const stmtDateStr = recon.cardBal.statementDate ? Utilities.formatDate(recon.cardBal.statementDate, tz, "yyyy-MM-dd") : "N/A";
   const dueDateStr = Utilities.formatDate(ledger.activeDueDate, tz, "MMMM d, yyyy");
 
   const kpiRows = [
     ["Statement Date:", stmtDateStr, "Bank Closing Bill:", ledger.closingBill, "Recon Status:", statusBadge],
-    ["Payment Due Date:", dueDateStr, "Family Shares Total:", ledger.familySharesTotal, "Actionable Difference:", ledger.actionableDifference],
-    ["Active Billing Cycle:", ledger.activeCycleLabel, "Neglected (Excluded):", ledger.neglectedTotal, "Available Limit Now:", recon.cardBal.availableBalanceNow]
+    ["Payment Due Date:", dueDateStr, "Family Shares Total:", ledger.familySharesTotal, "Audit Difference:", ledger.auditDifference],
+    ["Active Billing Cycle:", ledger.activeCycleLabel, "Total Card Utilized:", recon.cardBal.totalUtilized, "Available Limit Now:", recon.cardBal.availableBalanceNow]
   ];
 
   sheet.getRange(5, 1, 3, 6).setValues(kpiRows).setFontSize(9);
@@ -1708,7 +1726,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange("F5:H5").merge().setValue(statusBadge).setBackground(statusColor).setFontWeight("bold").setFontSize(9);
 
   // Waterfall Explanation Bar
-  const waterfallText = `Waterfall: Purchases (${ledger.purchasesTotal.toFixed(2)}) + Installments (${ledger.installmentsTotal.toFixed(2)}) + Fees (${ledger.feesTotal.toFixed(2)}) + Unrecorded Assigned (${ledger.unrecordedTotal.toFixed(2)}) = Family Shares (${ledger.familySharesTotal.toFixed(2)}) | + Neglected Excluded (${ledger.neglectedTotal.toFixed(2)}) + Actionable Gap (${ledger.unassignedTotal.toFixed(2)}) = Bank Bill (${ledger.closingBill.toFixed(2)})`;
+  const waterfallText = `Waterfall: Purchases (${ledger.purchasesTotal.toFixed(2)}) + Installments (${ledger.installmentsTotal.toFixed(2)}) + Fees (${ledger.feesTotal.toFixed(2)}) + Unrecorded Assigned (${ledger.unrecordedTotal.toFixed(2)}) - Refunds (${ledger.refundsTotal.toFixed(2)}) = Family Shares (${ledger.familySharesTotal.toFixed(2)}) | Bank Closing Bill: ${ledger.closingBill.toFixed(2)} EGP`;
   sheet.getRange("A8:H8").merge()
     .setValue(waterfallText)
     .setFontSize(8)
@@ -1798,9 +1816,25 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     ]);
   });
 
+  recon.stmtCredits.forEach((c, idx) => {
+    const isPayment = /\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(c.desc);
+    if (!isPayment) {
+      exceptionItems.push([
+        `C-${idx + 1}`,
+        c.date || c.dateStr,
+        c.desc,
+        c.amount,
+        "Refund / Credit",
+        c.assignedPayer || CONFIG.DEFAULT_FEE_PAYER,
+        c.note || "Merchant Refund (Reduces Debt)",
+        "💳 Refund Credit"
+      ]);
+    }
+  });
+
   recon.missingInSheet.forEach((m, idx) => {
     const isNeg = isNeglectedPayer(m.assignedPayer);
-    const statusText = isNeg ? "🚫 Neglected" : (m.assignedPayer ? "✅ Assigned" : "⚠️ Needs Payer");
+    const statusText = isNeg ? "🚫 Reconciled in Transactions" : (m.assignedPayer ? "✅ Assigned" : "⚠️ Needs Payer");
     exceptionItems.push([
       `M-${idx + 1}`,
       m.date || m.dateStr,
@@ -1828,8 +1862,11 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     sheet.getRange(curRow, 6, exceptionItems.length, 1).setDataValidation(payerValidation);
 
     for (let i = 0; i < exceptionItems.length; i++) {
+      const cat = exceptionItems[i][4];
       const payer = exceptionItems[i][5];
-      if (isNeglectedPayer(payer)) {
+      if (cat === "Refund / Credit") {
+        sheet.getRange(curRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
+      } else if (isNeglectedPayer(payer)) {
         sheet.getRange(curRow + i, 1, 1, 8).setBackground("#eeeeee");
       } else if (payer) {
         sheet.getRange(curRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
