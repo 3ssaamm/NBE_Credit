@@ -21,7 +21,8 @@ const CONFIG = {
     PAYMENT_HISTORY: "Payment History",
     BANK_STATEMENT: "Bank Statement",
     RECONCILIATION: "Reconciliation",
-    AUDIT_DIFFERENCES: "Audit & Differences"
+    AUDIT_DIFFERENCES: "Audit & Differences",
+    RECON_STORE: "_Recon_Store"
   },
   COLORS: {
     PAID: "#d9ead3",       // Soft green
@@ -45,29 +46,280 @@ const CONFIG = {
 function safeSetScriptProperty(key, val) {
   try {
     let strVal = typeof val === "string" ? val : JSON.stringify(val);
-    if (strVal.length > 8500 && key === "ASSIGNED_STATEMENT_CHARGES") {
-      try {
-        const parsed = JSON.parse(strVal);
-        const compacted = {};
-        const keys = Object.keys(parsed);
-        const recentKeys = keys.slice(-40);
-        recentKeys.forEach(k => {
-          const item = parsed[k];
-          if (item) {
-            compacted[k] = {
-              payer: item.payer,
-              note: (item.note || "").substring(0, 40),
-              amount: item.amount,
-              desc: (item.desc || "").substring(0, 30)
-            };
+    if (strVal.length > 8500) {
+      if (key === "ASSIGNED_STATEMENT_CHARGES") {
+        try {
+          const parsed = JSON.parse(strVal);
+          const compacted = {};
+          const keys = Object.keys(parsed);
+          const recentKeys = keys.slice(-20);
+          recentKeys.forEach(k => {
+            const item = parsed[k];
+            if (item) {
+              compacted[k] = {
+                payer: item.payer,
+                note: (item.note || "").substring(0, 30),
+                amount: item.amount,
+                desc: (item.desc || "").substring(0, 25)
+              };
+            }
+          });
+          strVal = JSON.stringify(compacted);
+        } catch (compactErr) { }
+      } else {
+        try {
+          const parsed = JSON.parse(strVal);
+          if (Array.isArray(parsed)) {
+            strVal = JSON.stringify(parsed.slice(-30));
           }
-        });
-        strVal = JSON.stringify(compacted);
-      } catch (compactErr) { }
+        } catch (e) { }
+      }
     }
-    PropertiesService.getScriptProperties().setProperty(key, strVal);
+    if (strVal.length <= 8500) {
+      PropertiesService.getScriptProperties().setProperty(key, strVal);
+    }
   } catch (err) {
     Logger.log(`[SafeProperties] Could not set '${key}': ` + (err ? (err.message || String(err)) : "Quota limit"));
+  }
+}
+
+// ==========================================
+// PERSISTENT RECONCILIATION STORE (_Recon_Store)
+// ==========================================
+
+function getReconStoreSheet(ss) {
+  const name = (CONFIG && CONFIG.SHEETS && CONFIG.SHEETS.RECON_STORE) || "_Recon_Store";
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    try { sheet.hideSheet(); } catch (e) { }
+    const headers = ["Type", "Primary_Key", "Date_Str", "Desc", "Amount", "Payer", "Note", "Confirmed", "Neglected", "Updated_At"];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function makeNormDateStr(rawDate, tz) {
+  if (!rawDate) return "";
+  const targetTz = tz || "Africa/Cairo";
+  if (rawDate instanceof Date && !isNaN(rawDate.getTime())) {
+    return Utilities.formatDate(rawDate, targetTz, "yyyy-MM-dd");
+  }
+  const parsed = parseDateValue(rawDate, targetTz);
+  if (parsed && !isNaN(parsed.getTime())) {
+    return Utilities.formatDate(parsed, targetTz, "yyyy-MM-dd");
+  }
+  return String(rawDate).trim().substring(0, 10);
+}
+
+function makeNormDesc(desc) {
+  return String(desc || "")
+    .toLowerCase()
+    .replace(/[\u00A0\s]+/g, " ")
+    .trim();
+}
+
+function makeReconKey(dateVal, amountVal, descVal, tz) {
+  const dStr = makeNormDateStr(dateVal, tz);
+  const amtNum = parseFloat(amountVal);
+  const aStr = isNaN(amtNum) ? "0.00" : amtNum.toFixed(2);
+  const dClean = makeNormDesc(descVal).substring(0, 30);
+  return `${dStr}_${aStr}_${dClean}`;
+}
+
+function loadAllReconStore(ss, tz) {
+  const store = {
+    table2Map: {},
+    table2List: [],
+    confirmedMatches: new Set(),
+    neglectedTx: new Set()
+  };
+
+  try {
+    const sheet = getReconStoreSheet(ss);
+    const lastRow = sheet.getLastRow();
+    if (lastRow >= 2) {
+      const data = sheet.getRange(2, 1, lastRow - 1, 10).getValues();
+      data.forEach(r => {
+        const type = String(r[0] || "").trim();
+        const pKey = String(r[1] || "").trim();
+        const dStr = String(r[2] || "").trim();
+        const desc = String(r[3] || "").trim();
+        const amt = parseFloat(r[4]) || 0;
+        const payer = String(r[5] || "").trim();
+        const note = String(r[6] || "").trim();
+        const isConfirmed = r[7] === true || String(r[7]).toUpperCase() === "TRUE";
+        const isNeglected = r[8] === true || String(r[8]).toUpperCase() === "TRUE";
+
+        if (!pKey && !desc && amt === 0) return;
+
+        if (type === "TABLE2_ASSIGNMENT" || (!type && payer)) {
+          if (payer) {
+            const isNeg = (payer === "NEGLECT" || payer === "🚫 Neglect / Ignore" || payer.toLowerCase().includes("neglect"));
+            const rec = {
+              primaryKey: pKey,
+              dateStr: dStr,
+              desc: desc,
+              amount: amt,
+              payer: isNeg ? "NEGLECT" : payer,
+              note: note,
+              isNeglected: isNeg
+            };
+            store.table2Map[pKey] = rec;
+            // Also alias by amount & desc for resilience
+            const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(desc).substring(0, 30)}`;
+            if (!store.table2Map[amtDescKey]) {
+              store.table2Map[amtDescKey] = rec;
+            }
+            store.table2List.push(rec);
+          }
+        } else if (type === "TABLE1_CONFIRMED" || isConfirmed) {
+          if (pKey) store.confirmedMatches.add(pKey);
+        } else if (type === "TABLE3_NEGLECTED" || isNeglected) {
+          if (pKey) store.neglectedTx.add(pKey);
+        }
+      });
+    }
+  } catch (err) {
+    Logger.log("[loadAllReconStore] Error reading store: " + (err ? (err.message || String(err)) : ""));
+  }
+
+  // Fallback to ScriptProperties for legacy compatibility
+  if (store.table2List.length === 0) {
+    try {
+      const sp = PropertiesService.getScriptProperties();
+      const raw = sp.getProperty("ASSIGNED_STATEMENT_CHARGES");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        Object.keys(parsed).forEach(k => {
+          const item = parsed[k];
+          if (item && item.amount > 0 && item.desc && item.payer) {
+            const pKey = makeReconKey(item.dateStr, item.amount, item.desc, tz);
+            if (!store.table2Map[pKey]) {
+              const rec = {
+                primaryKey: pKey,
+                dateStr: item.dateStr || "",
+                desc: item.desc,
+                amount: item.amount,
+                payer: item.payer,
+                note: item.note || "",
+                isNeglected: (item.payer === "NEGLECT")
+              };
+              store.table2Map[pKey] = rec;
+              store.table2List.push(rec);
+            }
+          }
+        });
+      }
+    } catch (e) { }
+  }
+
+  if (store.confirmedMatches.size === 0) {
+    try {
+      const sp = PropertiesService.getScriptProperties();
+      const rawC = sp.getProperty("CONFIRMED_MATCHES");
+      if (rawC) {
+        const parsedC = JSON.parse(rawC);
+        if (Array.isArray(parsedC)) parsedC.forEach(k => store.confirmedMatches.add(k));
+      }
+    } catch (e) { }
+  }
+
+  if (store.neglectedTx.size === 0) {
+    try {
+      const sp = PropertiesService.getScriptProperties();
+      const rawN = sp.getProperty("NEGLECTED_TRANSACTIONS");
+      if (rawN) {
+        const parsedN = JSON.parse(rawN);
+        if (Array.isArray(parsedN)) parsedN.forEach(k => store.neglectedTx.add(k));
+      }
+    } catch (e) { }
+  }
+
+  return store;
+}
+
+function saveAllReconStore(ss, store) {
+  try {
+    const sheet = getReconStoreSheet(ss);
+    const rows = [];
+    const nowStr = Utilities.formatDate(new Date(), "Africa/Cairo", "yyyy-MM-dd HH:mm:ss");
+
+    // 1. Table 2 Assignments
+    const seenPKeys = new Set();
+    if (store.table2Map) {
+      Object.keys(store.table2Map).forEach(k => {
+        const item = store.table2Map[k];
+        if (item && item.payer && item.primaryKey && !seenPKeys.has(item.primaryKey)) {
+          seenPKeys.add(item.primaryKey);
+          rows.push([
+            "TABLE2_ASSIGNMENT",
+            item.primaryKey,
+            item.dateStr || "",
+            item.desc || "",
+            item.amount || 0,
+            item.payer,
+            item.note || "",
+            false,
+            (item.payer === "NEGLECT" || item.isNeglected === true),
+            nowStr
+          ]);
+        }
+      });
+    }
+
+    // 2. Table 1 Confirmed Matches
+    if (store.confirmedMatches) {
+      store.confirmedMatches.forEach(k => {
+        if (k) {
+          rows.push([
+            "TABLE1_CONFIRMED",
+            k,
+            "",
+            "",
+            0,
+            "",
+            "",
+            true,
+            false,
+            nowStr
+          ]);
+        }
+      });
+    }
+
+    // 3. Table 3 Neglected Transactions
+    if (store.neglectedTx) {
+      store.neglectedTx.forEach(k => {
+        if (k) {
+          rows.push([
+            "TABLE3_NEGLECTED",
+            k,
+            "",
+            "",
+            0,
+            "",
+            "",
+            false,
+            true,
+            nowStr
+          ]);
+        }
+      });
+    }
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow > 1) {
+      sheet.getRange(2, 1, lastRow - 1, 10).clearContent();
+    }
+
+    if (rows.length > 0) {
+      sheet.getRange(2, 1, rows.length, 10).setValues(rows);
+    }
+  } catch (err) {
+    Logger.log("[saveAllReconStore] Error writing store: " + (err ? (err.message || String(err)) : ""));
   }
 }
 
@@ -479,67 +731,86 @@ function onEdit(e) {
   }
 
   // Case 1: Table 2 edit (Col 5 = Assign Payer, Col 6 = Custom Note)
-  if ((col === 5 || col === 6) && table2Start > 0 && row > table2Start + 1 && (table3Start === -1 || row < table3Start)) {
-    const rowValues = sheet.getRange(row, 1, 1, 6).getValues()[0];
-    const itemNum = String(rowValues[0] || (row - table2Start - 1));
-    const rawDate = rowValues[1];
-    const origDesc = String(rowValues[2] || "").trim();
-    const amt = parseFloat(rowValues[3]);
-    const payer = String(rowValues[4] || "").trim();
-    const note = String(rowValues[5] || "").trim();
+  const startCol = e.range.getColumn();
+  const numCols = e.range.getNumColumns ? e.range.getNumColumns() : 1;
+  const endCol = startCol + numCols - 1;
+  const startRow = e.range.getRow();
+  const numRows = e.range.getNumRows ? e.range.getNumRows() : 1;
+  const endRow = startRow + numRows - 1;
 
-    if (isNaN(amt) || amt <= 0) return;
+  if (startCol <= 6 && endCol >= 5 && table2Start > 0 && startRow > table2Start + 1 && (table3Start === -1 || startRow < table3Start)) {
+    const editStartRow = Math.max(table2Start + 2, startRow);
+    const editEndRow = (table3Start > 0) ? Math.min(table3Start - 1, endRow) : endRow;
+    const count = editEndRow - editStartRow + 1;
+    if (count <= 0) return;
 
-    const dateStr = String(rawDate);
-    const chargeKey = `debit_${itemNum}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}`;
-    const legacyKey = `${dateStr}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}`;
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+    const reconStore = loadAllReconStore(ss, tz);
+    const rowsValues = sheet.getRange(editStartRow, 1, count, 6).getValues();
 
-    const scriptProps = PropertiesService.getScriptProperties();
-    let assignedMap = {};
-    try {
-      assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
-    } catch (err) { }
+    for (let i = 0; i < count; i++) {
+      const rRow = editStartRow + i;
+      const rowValues = rowsValues[i];
+      const itemNum = String(rowValues[0] || (rRow - table2Start - 1));
+      const rawDate = rowValues[1];
+      const origDesc = String(rowValues[2] || "").trim();
+      const amt = parseFloat(rowValues[3]);
+      const payer = String(rowValues[4] || "").trim();
+      const note = String(rowValues[5] || "").trim();
 
-    if (payer) {
-      const isNeglected = (payer === "🚫 Neglect / Ignore" || payer.toLowerCase().includes("neglect"));
-      const record = {
-        itemNum: itemNum,
-        dateStr: dateStr,
-        desc: origDesc,
-        amount: amt,
-        payer: isNeglected ? "NEGLECT" : payer,
-        note: note
-      };
-      assignedMap[chargeKey] = record;
-      assignedMap[legacyKey] = record;
-      safeSetScriptProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
+      if (isNaN(amt) || amt <= 0 || !origDesc) continue;
 
-      if (isNeglected) {
-        sheet.getRange(row, 1, 1, 6).setBackground("#eeeeee");
-        SpreadsheetApp.getActiveSpreadsheet().toast(
-          `Marked "${origDesc}" (${amt.toFixed(2)} EGP) as Neglected/Ignored!`,
-          "🚫 Charge Neglected",
-          4
-        );
+      const pKey = makeReconKey(rawDate, amt, origDesc, tz);
+      const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`;
+      const chargeKey = `debit_${itemNum}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}`;
+      const legacyKey = `${String(rawDate)}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}`;
+
+      if (payer) {
+        const isNeglected = (payer === "🚫 Neglect / Ignore" || payer.toLowerCase().includes("neglect"));
+        const record = {
+          primaryKey: pKey,
+          itemNum: itemNum,
+          dateStr: makeNormDateStr(rawDate, tz),
+          desc: origDesc,
+          amount: amt,
+          payer: isNeglected ? "NEGLECT" : payer,
+          note: note,
+          isNeglected: isNeglected
+        };
+        reconStore.table2Map[pKey] = record;
+        reconStore.table2Map[amtDescKey] = record;
+        reconStore.table2Map[chargeKey] = record;
+        reconStore.table2Map[legacyKey] = record;
+
+        const existingIdx = reconStore.table2List.findIndex(it => it.primaryKey === pKey || it.primaryKey === chargeKey);
+        if (existingIdx >= 0) {
+          reconStore.table2List[existingIdx] = record;
+        } else {
+          reconStore.table2List.push(record);
+        }
+
+        if (isNeglected) {
+          sheet.getRange(rRow, 1, 1, 6).setBackground("#eeeeee");
+        } else {
+          sheet.getRange(rRow, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
+        }
+        updateBankStatementStatusRow(origDesc, amt, isNeglected ? "🚫 Neglected / Ignored" : `⚠️ Unrecorded (Assigned to ${payer})`, isNeglected ? "#eeeeee" : CONFIG.COLORS.DUE_SOON);
       } else {
-        sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.PAID);
-        SpreadsheetApp.getActiveSpreadsheet().toast(
-          `Assigned "${origDesc}" (${amt.toFixed(2)} EGP) to ${payer} directly in Debt Breakdown (⚠️ Missing from Transactions)!`,
-          "💳 Assigned to Debt Breakdown",
-          4
-        );
-      }
+        delete reconStore.table2Map[pKey];
+        delete reconStore.table2Map[amtDescKey];
+        delete reconStore.table2Map[chargeKey];
+        delete reconStore.table2Map[legacyKey];
+        reconStore.table2List = reconStore.table2List.filter(it => it.primaryKey !== pKey && it.primaryKey !== chargeKey);
 
-      updateBankStatementStatusRow(origDesc, amt, isNeglected ? "🚫 Neglected / Ignored" : `⚠️ Unrecorded (Assigned to ${payer})`, isNeglected ? "#eeeeee" : CONFIG.COLORS.DUE_SOON);
-      updateLiveDashboard({ skipRecon: true });
-    } else {
-      delete assignedMap[chargeKey];
-      delete assignedMap[legacyKey];
-      safeSetScriptProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
-      sheet.getRange(row, 1, 1, 6).setBackground(CONFIG.COLORS.OVERDUE);
-      updateBankStatementStatusRow(origDesc, amt, "⚠️ Unassigned (Not in Sheet)", CONFIG.COLORS.OVERDUE);
-      updateLiveDashboard({ skipRecon: true });
+        sheet.getRange(rRow, 1, 1, 6).setBackground(CONFIG.COLORS.OVERDUE);
+        updateBankStatementStatusRow(origDesc, amt, "⚠️ Unassigned (Not in Sheet)", CONFIG.COLORS.OVERDUE);
+      }
     }
+
+    saveAllReconStore(ss, reconStore);
+    safeSetScriptProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(reconStore.table2Map));
+    updateLiveDashboard({ skipRecon: true });
     return;
   }
 
@@ -552,22 +823,24 @@ function onEdit(e) {
       const amt = parseFloat(rowValues[3]);
 
       if (!isNaN(amt) && amt > 0) {
-        const dateStr = String(rawDate);
-        const stKey = `${dateStr}_${amt.toFixed(2)}_${stmtDesc.substring(0, 20)}`;
+        const ss = SpreadsheetApp.getActiveSpreadsheet();
+        const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+        const reconStore = loadAllReconStore(ss, tz);
 
-        const scriptProps = PropertiesService.getScriptProperties();
-        const rawJson = scriptProps.getProperty("CONFIRMED_MATCHES") || "[]";
-        let setKeys = [];
-        try { setKeys = JSON.parse(rawJson); } catch (err) { }
-        if (!setKeys.includes(stKey)) {
-          setKeys.push(stKey);
-          safeSetScriptProperty("CONFIRMED_MATCHES", JSON.stringify(setKeys));
-        }
+        const pKey = makeReconKey(rawDate, amt, stmtDesc, tz);
+        const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(stmtDesc).substring(0, 20)}`;
+        const stKey = `${String(rawDate)}_${amt.toFixed(2)}_${stmtDesc.substring(0, 20)}`;
+
+        reconStore.confirmedMatches.add(pKey);
+        reconStore.confirmedMatches.add(amtDescKey);
+        reconStore.confirmedMatches.add(stKey);
+
+        saveAllReconStore(ss, reconStore);
+        safeSetScriptProperty("CONFIRMED_MATCHES", JSON.stringify(Array.from(reconStore.confirmedMatches)));
 
         sheet.getRange(row, 1, 1, 7).setBackground(CONFIG.COLORS.PAID);
         sheet.getRange(row, 7).clearDataValidations().setValue("✅ Confirmed");
 
-        const ss = SpreadsheetApp.getActiveSpreadsheet();
         ss.toast(`Match confirmed for ${stmtDesc}!`, "💳 Match Confirmed", 3);
         updateBankStatementStatusRow(stmtDesc, amt, "✅ Confirmed Match", CONFIG.COLORS.PAID);
         updateLiveDashboard({ skipRecon: true });
@@ -587,41 +860,35 @@ function onEdit(e) {
 
     if (isNaN(amt) || amt <= 0) return;
 
-    const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone() || "Africa/Cairo";
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+    const reconStore = loadAllReconStore(ss, tz);
+
     const pDate = parseDateValue(rawDate, tz);
     const dStr = pDate ? Utilities.formatDate(pDate, tz, "yyyy-MM-dd") : String(rawDate);
     const txKeyNorm = `${dStr}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}_${person}`;
     const txKeyLegacy = `${String(rawDate)}_${amt.toFixed(2)}_${origDesc.substring(0, 30)}_${person}`;
 
-    const scriptProps = PropertiesService.getScriptProperties();
-    let neglectedKeys = [];
-    try {
-      neglectedKeys = JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]");
-    } catch (err) { }
-
     if (isChecked) {
-      if (!neglectedKeys.includes(txKeyNorm)) neglectedKeys.push(txKeyNorm);
-      if (!neglectedKeys.includes(txKeyLegacy)) neglectedKeys.push(txKeyLegacy);
-      safeSetScriptProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
+      reconStore.neglectedTx.add(txKeyNorm);
+      reconStore.neglectedTx.add(txKeyLegacy);
+      saveAllReconStore(ss, reconStore);
+      safeSetScriptProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(Array.from(reconStore.neglectedTx)));
+
       sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
       sheet.getRange(row, 8).setValue("🚫 Neglected (Excluded)");
       updateLiveDashboard({ skipRecon: true });
-      SpreadsheetApp.getActiveSpreadsheet().toast(
-        `Neglected "${origDesc}" (${amt.toFixed(2)} EGP) from active calculations!`,
-        "🚫 Transaction Neglected",
-        4
-      );
+      ss.toast(`Neglected "${origDesc}" (${amt.toFixed(2)} EGP) from active calculations!`, "🚫 Transaction Neglected", 4);
     } else {
-      neglectedKeys = neglectedKeys.filter(k => k !== txKeyNorm && k !== txKeyLegacy);
-      safeSetScriptProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(neglectedKeys));
+      reconStore.neglectedTx.delete(txKeyNorm);
+      reconStore.neglectedTx.delete(txKeyLegacy);
+      saveAllReconStore(ss, reconStore);
+      safeSetScriptProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(Array.from(reconStore.neglectedTx)));
+
       sheet.getRange(row, 1, 1, 8).setBackground(null);
       sheet.getRange(row, 8).setValue("Active in Bill");
       updateLiveDashboard({ skipRecon: true });
-      SpreadsheetApp.getActiveSpreadsheet().toast(
-        `Restored "${origDesc}" (${amt.toFixed(2)} EGP) to active calculations!`,
-        "✅ Transaction Restored",
-        4
-      );
+      ss.toast(`Restored "${origDesc}" (${amt.toFixed(2)} EGP) to active calculations!`, "✅ Transaction Restored", 4);
     }
   }
 }
@@ -1708,10 +1975,8 @@ function getAllUniquePayers(ss) {
 
   // Also include payers from stored statement assignments
   try {
-    const scriptProps = PropertiesService.getScriptProperties();
-    const assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
-    Object.keys(assignedMap).forEach(k => {
-      const item = assignedMap[k];
+    const reconStore = loadAllReconStore(ss);
+    reconStore.table2List.forEach(item => {
       if (item && item.payer) {
         splitPayerNames(item.payer).forEach(name => {
           if (name && !isNeglectedPayer(name) && name.toLowerCase() !== "shared") peopleSet.add(name);
@@ -1788,54 +2053,123 @@ function getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate) {
 function runReconciliation(ss, tz) {
   const reconSheet = getOrCreateSheet(ss, CONFIG.SHEETS.RECONCILIATION);
 
-  // CRITICAL: Preserve any existing user assignments currently on the Reconciliation sheet BEFORE clearing!
-  const scriptProps = PropertiesService.getScriptProperties();
-  let assignedMap = {};
-  try {
-    assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
-  } catch (err) { }
+  // CRITICAL: Load persistent store and preserve any existing user assignments currently on the Reconciliation sheet BEFORE clearing!
+  const reconStore = loadAllReconStore(ss, tz);
 
   if (reconSheet.getLastRow() >= 5) {
     const lastR = reconSheet.getLastRow();
     const colA = reconSheet.getRange(1, 1, lastR, 1).getValues();
+    let t1Start = -1;
     let t2Start = -1;
     let t3Start = -1;
     for (let i = 0; i < colA.length; i++) {
       const txt = String(colA[i][0] || "");
+      if (txt.includes("Suggested Matches")) t1Start = i + 1;
       if (txt.includes("MISSING from Sheet")) t2Start = i + 1;
       if (txt.includes("NOT Found on Bank Statement") || txt.includes("Transactions in Sheet NOT")) t3Start = i + 1;
     }
+
+    // 1. Harvest Table 1 Confirmed Matches
+    if (t1Start > 0) {
+      const endR1 = (t2Start > t1Start) ? t2Start - 1 : ((t3Start > t1Start) ? t3Start - 1 : lastR);
+      const numR1 = endR1 - (t1Start + 1);
+      if (numR1 > 0) {
+        const t1Rows = reconSheet.getRange(t1Start + 2, 1, numR1, 7).getValues();
+        t1Rows.forEach(r => {
+          const rawD = r[1];
+          const dText = String(r[2] || "").trim();
+          const aNum = parseFloat(r[3]);
+          const isConf = (r[6] === true || String(r[6]).toUpperCase() === "TRUE" || String(r[6]).includes("Confirmed"));
+          if (isConf && !isNaN(aNum) && aNum > 0 && dText) {
+            const pKey = makeReconKey(rawD, aNum, dText, tz);
+            const amtDescKey = `${aNum.toFixed(2)}_${makeNormDesc(dText).substring(0, 20)}`;
+            const stKey = `${String(rawD)}_${aNum.toFixed(2)}_${dText.substring(0, 20)}`;
+            reconStore.confirmedMatches.add(pKey);
+            reconStore.confirmedMatches.add(amtDescKey);
+            reconStore.confirmedMatches.add(stKey);
+          }
+        });
+      }
+    }
+
+    // 2. Harvest Table 2 Missing Statement Charges Assignments
     if (t2Start > 0) {
       const endR = (t3Start > t2Start) ? t3Start - 1 : lastR;
       const numR = endR - (t2Start + 1);
       if (numR > 0) {
         const existingRows = reconSheet.getRange(t2Start + 2, 1, numR, 6).getValues();
-        existingRows.forEach(r => {
-          const itemNum = String(r[0] || "");
+        existingRows.forEach((r, idx) => {
+          const itemNum = String(r[0] || (idx + 1));
           const rawD = r[1];
           const dText = String(r[2] || "").trim();
           const aNum = parseFloat(r[3]);
           const pText = String(r[4] || "").trim();
           const nText = String(r[5] || "").trim();
           if (!isNaN(aNum) && aNum > 0 && dText && pText) {
+            const pKey = makeReconKey(rawD, aNum, dText, tz);
+            const amtDescKey = `${aNum.toFixed(2)}_${makeNormDesc(dText).substring(0, 30)}`;
             const k1 = `debit_${itemNum}_${aNum.toFixed(2)}_${dText.substring(0, 30)}`;
             const k2 = `${String(rawD)}_${aNum.toFixed(2)}_${dText.substring(0, 30)}`;
             const isNeg = (pText === "🚫 Neglect / Ignore" || pText.toLowerCase().includes("neglect"));
             const rec = {
+              primaryKey: pKey,
               itemNum: itemNum,
-              dateStr: String(rawD),
+              dateStr: makeNormDateStr(rawD, tz),
+              rawDate: rawD,
               desc: dText,
               amount: aNum,
               payer: isNeg ? "NEGLECT" : pText,
-              note: nText
+              note: nText,
+              isNeglected: isNeg
             };
-            assignedMap[k1] = rec;
-            assignedMap[k2] = rec;
+            reconStore.table2Map[pKey] = rec;
+            reconStore.table2Map[amtDescKey] = rec;
+            reconStore.table2Map[k1] = rec;
+            reconStore.table2Map[k2] = rec;
+
+            const existingIdx = reconStore.table2List.findIndex(it => it.primaryKey === pKey || it.primaryKey === k1);
+            if (existingIdx >= 0) {
+              reconStore.table2List[existingIdx] = rec;
+            } else {
+              reconStore.table2List.push(rec);
+            }
           }
         });
-        safeSetScriptProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(assignedMap));
       }
     }
+
+    // 3. Harvest Table 3 Neglected Transactions
+    if (t3Start > 0 && lastR > t3Start + 1) {
+      const numR3 = lastR - (t3Start + 1);
+      if (numR3 > 0) {
+        const t3Rows = reconSheet.getRange(t3Start + 2, 1, numR3, 8).getValues();
+        t3Rows.forEach(r => {
+          const rawD = r[1];
+          const person = String(r[2] || "").trim();
+          const dText = String(r[3] || "").trim();
+          const aNum = parseFloat(r[4]);
+          const isNeg = (r[6] === true || String(r[6]).toUpperCase() === "TRUE");
+          if (!isNaN(aNum) && aNum > 0 && dText) {
+            const pDate = parseDateValue(rawD, tz);
+            const dStr = pDate ? Utilities.formatDate(pDate, tz, "yyyy-MM-dd") : String(rawD);
+            const txKeyNorm = `${dStr}_${aNum.toFixed(2)}_${dText.substring(0, 30)}_${person}`;
+            const txKeyLegacy = `${String(rawD)}_${aNum.toFixed(2)}_${dText.substring(0, 30)}_${person}`;
+            if (isNeg) {
+              reconStore.neglectedTx.add(txKeyNorm);
+              reconStore.neglectedTx.add(txKeyLegacy);
+            } else {
+              reconStore.neglectedTx.delete(txKeyNorm);
+              reconStore.neglectedTx.delete(txKeyLegacy);
+            }
+          }
+        });
+      }
+    }
+
+    saveAllReconStore(ss, reconStore);
+    safeSetScriptProperty("ASSIGNED_STATEMENT_CHARGES", JSON.stringify(reconStore.table2Map));
+    safeSetScriptProperty("CONFIRMED_MATCHES", JSON.stringify(Array.from(reconStore.confirmedMatches)));
+    safeSetScriptProperty("NEGLECTED_TRANSACTIONS", JSON.stringify(Array.from(reconStore.neglectedTx)));
   }
 
   reconSheet.clear();
@@ -1976,16 +2310,12 @@ function runReconciliation(ss, tz) {
   }
 
   // 3. Multi-Pass Matching
-  // Pass 0: Pre-confirmed Matches from ScriptProperties
-  const confirmedMatchesJson = scriptProps.getProperty("CONFIRMED_MATCHES") || "[]";
-  let confirmedMatchKeys = new Set();
-  try {
-    confirmedMatchKeys = new Set(JSON.parse(confirmedMatchesJson));
-  } catch (e) { }
-
+  // Pass 0: Pre-confirmed Matches from Recon Store
   stmtDebits.forEach(st => {
+    const pKey = makeReconKey(st.date || st.dateStr, st.amount, st.desc, tz);
+    const amtDescKey = `${st.amount.toFixed(2)}_${makeNormDesc(st.desc).substring(0, 20)}`;
     const stKey = `${st.dateStr}_${st.amount.toFixed(2)}_${st.desc.substring(0, 20)}`;
-    if (confirmedMatchKeys.has(stKey)) {
+    if (reconStore.confirmedMatches.has(pKey) || reconStore.confirmedMatches.has(amtDescKey) || reconStore.confirmedMatches.has(stKey)) {
       st.matched = true;
       st.matchType = "CONFIRMED";
       // Find matching items in txDebits and mark them matched so they don't appear in Table 3!
@@ -2177,20 +2507,26 @@ function runReconciliation(ss, tz) {
       .setAllowInvalid(true)
       .build();
 
-    const scriptProps = PropertiesService.getScriptProperties();
-    let assignedMap = {};
-    try {
-      assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
-    } catch (err) { }
-
     const missRows = missingInSheet.map((m, idx) => {
       const itemNum = String(idx + 1);
+      const pKey = makeReconKey(m.date || m.dateStr, m.amount, m.desc, tz);
+      const amtDescKey = `${m.amount.toFixed(2)}_${makeNormDesc(m.desc).substring(0, 30)}`;
       const chargeKey = `debit_${itemNum}_${m.amount.toFixed(2)}_${m.desc.substring(0, 30)}`;
       const legacyKey = `${String(m.date || m.dateStr)}_${m.amount.toFixed(2)}_${m.desc.substring(0, 30)}`;
-      const saved = assignedMap[chargeKey] || assignedMap[legacyKey];
-      let assignedPayer = (saved && saved.payer) ? saved.payer : "";
-      if (assignedPayer === "NEGLECT") assignedPayer = "🚫 Neglect / Ignore";
-      const note = (saved && saved.note) ? saved.note : cleanMerchantName(m.desc);
+
+      const saved = reconStore.table2Map[pKey] ||
+                    reconStore.table2Map[amtDescKey] ||
+                    reconStore.table2Map[chargeKey] ||
+                    reconStore.table2Map[legacyKey];
+
+      let assignedPayer = "";
+      let note = cleanMerchantName(m.desc);
+
+      if (saved && saved.payer) {
+        assignedPayer = (saved.payer === "NEGLECT" || saved.isNeglected) ? "🚫 Neglect / Ignore" : saved.payer;
+        note = saved.note || cleanMerchantName(m.desc);
+      }
+
       return [
         idx + 1,
         m.date || m.dateStr,
@@ -2254,12 +2590,6 @@ function runReconciliation(ss, tz) {
       .setFontColor(CONFIG.COLORS.PRIMARY);
     curRow += 2;
   } else {
-    const scriptProps = PropertiesService.getScriptProperties();
-    let neglectedKeys = [];
-    try {
-      neglectedKeys = JSON.parse(scriptProps.getProperty("NEGLECTED_TRANSACTIONS") || "[]");
-    } catch (e) { }
-
     const unmatRows = unmatchedTxDebits.map((tx, idx) => {
       const isNearCutoff = (stmtPeriod.end && Math.abs((stmtPeriod.end.getTime() - tx.date.getTime()) / (1000 * 60 * 60 * 24)) <= 2);
       const cycleClass = isNearCutoff ? "⚠️ Near Cutoff (May roll to next statement)" : "⚠️ In-Period (Not on Bank Statement)";
@@ -2267,7 +2597,7 @@ function runReconciliation(ss, tz) {
       const dStr = Utilities.formatDate(tx.date, tz, "yyyy-MM-dd");
       const txKeyNorm = `${dStr}_${tx.amount.toFixed(2)}_${tx.desc.substring(0, 30)}_${tx.person}`;
       const txKeyLegacy = `${String(tx.date)}_${tx.amount.toFixed(2)}_${tx.desc.substring(0, 30)}_${tx.person}`;
-      const isNeglected = neglectedKeys.includes(txKeyNorm) || neglectedKeys.includes(txKeyLegacy);
+      const isNeglected = reconStore.neglectedTx.has(txKeyNorm) || reconStore.neglectedTx.has(txKeyLegacy);
 
       let statusNote = "Active in Bill";
       if (isNeglected) {
@@ -2346,15 +2676,15 @@ function runReconciliation(ss, tz) {
       } else if (suggestedStmtIds.has(st.id)) {
         stmtRowStatus[idx] = { text: "❓ Needs Confirmation", color: CONFIG.COLORS.DUE_SOON };
       } else {
+        const pKey = makeReconKey(st.date || st.dateStr, st.amount, st.desc, tz);
+        const amtDescKey = `${st.amount.toFixed(2)}_${makeNormDesc(st.desc).substring(0, 30)}`;
         const cKey = `${String(st.dateStr)}_${st.amount.toFixed(2)}_${st.desc.substring(0, 30)}`;
-        const scriptProps = PropertiesService.getScriptProperties();
-        let assignedMap = {};
-        try { assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}"); } catch (e) { }
-        if (assignedMap[cKey] && assignedMap[cKey].payer) {
-          if (assignedMap[cKey].payer === "NEGLECT") {
+        const saved = reconStore.table2Map[pKey] || reconStore.table2Map[amtDescKey] || reconStore.table2Map[cKey];
+        if (saved && saved.payer) {
+          if (saved.payer === "NEGLECT" || saved.isNeglected) {
             stmtRowStatus[idx] = { text: "🚫 Neglected / Ignored", color: "#eeeeee" };
           } else {
-            stmtRowStatus[idx] = { text: "⚠️ Unrecorded (Assigned to " + assignedMap[cKey].payer + ")", color: CONFIG.COLORS.DUE_SOON };
+            stmtRowStatus[idx] = { text: "⚠️ Unrecorded (Assigned to " + saved.payer + ")", color: CONFIG.COLORS.DUE_SOON };
           }
         } else {
           stmtRowStatus[idx] = { text: "⚠️ Unassigned (Not in Sheet)", color: CONFIG.COLORS.OVERDUE };
@@ -2872,9 +3202,26 @@ function updateLiveDashboard(options) {
     });
   }
 
-  // 3. Process Assigned Statement Charges (From Reconciliation Table 2)
-  // Read all assigned rows directly from visible Reconciliation sheet Table 2 as an ARRAY (NO Map collapsing!)
-  const assignedChargesList = [];
+  // 3. Process Assigned Statement Charges (From Recon Store & Reconciliation Table 2)
+  const assignedChargesMap = {};
+
+  // First, read from persistent reconStore
+  const reconStore = loadAllReconStore(ss, tz);
+  reconStore.table2List.forEach(item => {
+    if (item && item.amount > 0 && item.desc && item.payer) {
+      const pKey = item.primaryKey || makeReconKey(item.dateStr || item.rawDate, item.amount, item.desc, tz);
+      assignedChargesMap[pKey] = {
+        itemNum: item.itemNum || "",
+        rawDate: item.rawDate || item.dateStr,
+        desc: item.desc,
+        amount: item.amount,
+        payer: item.payer,
+        note: item.note || ""
+      };
+    }
+  });
+
+  // Second, overlay any assignments currently visible on Reconciliation sheet Table 2
   const reconSheet = ss.getSheetByName(CONFIG.SHEETS.RECONCILIATION);
   if (reconSheet && reconSheet.getLastRow() >= 5) {
     const lastRow = reconSheet.getLastRow();
@@ -2891,41 +3238,30 @@ function updateLiveDashboard(options) {
       const numRows = endRow - (table2Start + 1);
       if (numRows > 0) {
         const rows = reconSheet.getRange(table2Start + 2, 1, numRows, 6).getValues();
-        rows.forEach(r => {
-          const itemNum = String(r[0] || "");
+        rows.forEach((r, idx) => {
+          const itemNum = String(r[0] || (idx + 1));
           const rawDate = r[1];
           const desc = String(r[2] || "").trim();
           const amt = parseFloat(r[3]);
           const payer = String(r[4] || "").trim();
           const note = String(r[5] || "").trim();
           if (!isNaN(amt) && amt > 0 && desc && payer) {
-            assignedChargesList.push({
+            const pKey = makeReconKey(rawDate, amt, desc, tz);
+            assignedChargesMap[pKey] = {
               itemNum: itemNum,
               rawDate: rawDate,
               desc: desc,
               amount: amt,
               payer: payer,
               note: note
-            });
+            };
           }
         });
       }
     }
   }
 
-  // Fallback: If Reconciliation sheet had no rows, read from ScriptProperties
-  if (assignedChargesList.length === 0) {
-    let assignedMap = {};
-    try {
-      assignedMap = JSON.parse(scriptProps.getProperty("ASSIGNED_STATEMENT_CHARGES") || "{}");
-    } catch (err) { }
-    Object.keys(assignedMap).forEach(k => {
-      const item = assignedMap[k];
-      if (item && item.amount > 0 && item.desc && item.payer) {
-        assignedChargesList.push(item);
-      }
-    });
-  }
+  const assignedChargesList = Object.values(assignedChargesMap);
 
   let assignedMissingCount = 0;
   let assignedMissingTotal = 0;
