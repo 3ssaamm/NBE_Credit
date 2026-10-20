@@ -1609,6 +1609,43 @@ function reconcileActiveStatement(ss, tz) {
 
   const unmatchedTx = txDebits.filter(tx => !tx.matched);
 
+  // Expand unmatched sheet transactions (including split items) for transparent attribution
+  const expandedUnmatched = [];
+  unmatchedTx.forEach((tx, idx) => {
+    const payers = splitPayerNames(tx.person);
+    const baseKey = makeReconKey(tx.date, tx.amount, tx.desc, tz);
+    if (payers.length <= 1) {
+      const p = payers[0] || tx.person;
+      const exId = `TX-${idx + 1}`;
+      const isNeg = reconStore.neglectedTx && (reconStore.neglectedTx.has(exId) || reconStore.neglectedTx.has(baseKey));
+      expandedUnmatched.push({
+        id: exId,
+        primaryKey: baseKey,
+        date: tx.date,
+        desc: tx.desc,
+        amount: tx.amount,
+        person: p,
+        isNeglected: isNeg
+      });
+    } else {
+      const splitAmt = tx.amount / payers.length;
+      payers.forEach((p, pIdx) => {
+        const exId = `TX-${idx + 1}.${pIdx + 1}`;
+        const pKey = `${baseKey}_#${pIdx + 1}`;
+        const isNeg = reconStore.neglectedTx && (reconStore.neglectedTx.has(exId) || reconStore.neglectedTx.has(pKey) || reconStore.neglectedTx.has(baseKey));
+        expandedUnmatched.push({
+          id: exId,
+          primaryKey: pKey,
+          date: tx.date,
+          desc: `${tx.desc} (Split ${pIdx + 1}/${payers.length})`,
+          amount: splitAmt,
+          person: p,
+          isNeglected: isNeg
+        });
+      });
+    }
+  });
+
   return {
     stmtDebits,
     stmtInstallments,
@@ -1618,6 +1655,7 @@ function reconcileActiveStatement(ss, tz) {
     missingInSheet,
     txDebits,
     unmatchedTx,
+    expandedUnmatched,
     cardBal,
     reconStore,
     tz
@@ -1639,6 +1677,8 @@ function buildDebtLedger(ss, tz, recon) {
   allPayers.forEach(p => {
     personShares[p] = {
       person: p,
+      matchedPurchases: 0,
+      unmatchedPurchases: 0,
       purchases: 0,
       installments: 0,
       fees: 0,
@@ -1656,20 +1696,47 @@ function buildDebtLedger(ss, tz, recon) {
 
     people.forEach(p => {
       if (!personShares[p]) {
-        personShares[p] = { person: p, purchases: 0, installments: 0, fees: 0, unrecorded: 0, refunds: 0, netTotal: 0 };
+        personShares[p] = {
+          person: p,
+          matchedPurchases: 0,
+          unmatchedPurchases: 0,
+          purchases: 0,
+          installments: 0,
+          fees: 0,
+          unrecorded: 0,
+          refunds: 0,
+          netTotal: 0
+        };
       }
-      if (category === "Purchase") personShares[p].purchases += splitAmt;
-      else if (category === "Installment") personShares[p].installments += splitAmt;
-      else if (category === "Fee") personShares[p].fees += splitAmt;
-      else if (category === "Unrecorded") personShares[p].unrecorded += splitAmt;
-      else if (category === "Refund") personShares[p].refunds += splitAmt;
+      if (category === "MatchedPurchase") {
+        personShares[p].matchedPurchases += splitAmt;
+        personShares[p].purchases += splitAmt;
+      } else if (category === "UnmatchedPurchase") {
+        personShares[p].unmatchedPurchases += splitAmt;
+        personShares[p].purchases += splitAmt;
+      } else if (category === "Installment") {
+        personShares[p].installments += splitAmt;
+      } else if (category === "Fee") {
+        personShares[p].fees += splitAmt;
+      } else if (category === "Unrecorded") {
+        personShares[p].unrecorded += splitAmt;
+      } else if (category === "Refund") {
+        personShares[p].refunds += splitAmt;
+      }
     });
   }
 
-  // 1. Attributed Purchases (Matched Statement Debits)
+  // 1a. Attributed Matched Purchases (Statement Debits matched to Sheet)
   recon.stmtDebits.forEach(st => {
     if (st.matched && st.assignedPayer && !isNeglectedPayer(st.assignedPayer)) {
-      addShare(st.assignedPayer, st.amount, "Purchase");
+      addShare(st.assignedPayer, st.amount, "MatchedPurchase");
+    }
+  });
+
+  // 1b. Attributed Unmatched Purchases (From Transactions sheet - billed to family members by default!)
+  (recon.expandedUnmatched || []).forEach(tx => {
+    if (!tx.isNeglected && tx.person && !isNeglectedPayer(tx.person)) {
+      addShare(tx.person, tx.amount, "UnmatchedPurchase");
     }
   });
 
@@ -1782,31 +1849,87 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setFontColor("#ffffff");
 
   sheet.getRange("A2:H2").merge()
-    .setValue("Live statement-first reconciliation. Every pound on the bank statement is attributed to a family member.")
+    .setValue("Live reactive statement reconciliation. Edits update instantly via native formulas without screen refresh.")
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
 
-  // 2. Overview Card & Balance Waterfall
+  // 2. Prepare Data & Dynamic Bounds for Declarative Equations
+  const sharePeople = ledger.personShares;
+  const numPayers = sharePeople.length;
+  const startShareRow = 12;
+  const endShareRow = startShareRow + numPayers - 1;
+  const totShareRow = endShareRow + 1;
+
+  // Build Table 2 Exceptions Items
+  const exceptionItems = [];
+  recon.stmtFees.forEach((f, idx) => {
+    exceptionItems.push({
+      id: `F-${idx + 1}`,
+      date: f.date || f.dateStr,
+      desc: f.desc,
+      amount: f.amount,
+      category: "Bank Fee / Tax",
+      assignedPayer: f.assignedPayer || CONFIG.DEFAULT_FEE_PAYER,
+      note: f.note || "Auto-assigned to Mai"
+    });
+  });
+
+  recon.stmtCredits.forEach((c, idx) => {
+    const isPayment = /\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(c.desc);
+    if (!isPayment) {
+      exceptionItems.push({
+        id: `C-${idx + 1}`,
+        date: c.date || c.dateStr,
+        desc: c.desc,
+        amount: c.amount,
+        category: "Refund / Credit",
+        assignedPayer: c.assignedPayer || CONFIG.DEFAULT_FEE_PAYER,
+        note: c.note || "Merchant Refund (Reduces Debt)"
+      });
+    }
+  });
+
+  recon.missingInSheet.forEach((m, idx) => {
+    exceptionItems.push({
+      id: `M-${idx + 1}`,
+      date: m.date || m.dateStr,
+      desc: m.desc,
+      amount: m.amount,
+      category: "Missing Purchase",
+      assignedPayer: m.assignedPayer || "",
+      note: m.note || cleanMerchantName(m.desc)
+    });
+  });
+
+  const numExceptions = exceptionItems.length;
+  const startExHeaderRow = totShareRow + 3;
+  const startExRow = startExHeaderRow + 2;
+  const endExRow = startExRow + Math.max(1, numExceptions) - 1;
+
+  // Build Table 3 Unmatched Sheet Transactions (Billed by Default)
+  const unmatchedList = recon.expandedUnmatched || [];
+  const numUnmatched = unmatchedList.length;
+  const hasTable3 = numUnmatched > 0;
+  const startTxHeaderRow = endExRow + 3;
+  const startTxRow = startTxHeaderRow + 2;
+  const endTxRow = startTxRow + Math.max(1, numUnmatched) - 1;
+
+  // 3. Overview Card & Balance Waterfall (Declarative Formulas)
   sheet.getRange("A4:H4").merge()
     .setValue("📊 Active Statement Overview & Mathematical Balance Waterfall")
     .setFontWeight("bold")
     .setFontSize(10)
     .setBackground(CONFIG.COLORS.HEADER);
 
-  const statusBadge = ledger.isExactMatch
-    ? "✅ Perfect Match (0.00 EGP difference)"
-    : (ledger.auditDifference > 0
-        ? `ℹ️ Shares exceed bank bill by +${ledger.auditDifference.toFixed(2)} EGP`
-        : `⚠️ Bank bill exceeds shares by -${Math.abs(ledger.auditDifference).toFixed(2)} EGP (${ledger.unassignedCount} unassigned charges waiting below)`);
-  const statusColor = ledger.isExactMatch ? CONFIG.COLORS.PAID : (ledger.auditDifference > 0 ? CONFIG.COLORS.DUE_SOON : CONFIG.COLORS.OVERDUE);
-
   const stmtDateStr = recon.cardBal.statementDate ? Utilities.formatDate(recon.cardBal.statementDate, tz, "yyyy-MM-dd") : "N/A";
   const dueDateStr = Utilities.formatDate(ledger.activeDueDate, tz, "MMMM d, yyyy");
 
+  const badgeFormula = `=IF(ABS(F6)<0.5, "✅ Perfect Match (0.00 EGP difference)", IF(F6>0, "ℹ️ Shares exceed bank bill by +" & TEXT(F6, "#,##0.00") & " EGP", "⚠️ Bank bill exceeds shares by -" & TEXT(ABS(F6), "#,##0.00") & " EGP"))`;
+
   const kpiRows = [
-    ["Statement Date:", stmtDateStr, "Bank Closing Bill:", ledger.closingBill, "Recon Status:", statusBadge],
-    ["Payment Due Date:", dueDateStr, "Family Shares Total:", ledger.familySharesTotal, "Audit Difference:", ledger.auditDifference],
+    ["Statement Date:", stmtDateStr, "Bank Closing Bill:", ledger.closingBill, "Recon Status:", badgeFormula],
+    ["Payment Due Date:", dueDateStr, "Family Shares Total:", `=H${totShareRow}`, "Audit Difference:", `=D6-D5`],
     ["Active Billing Cycle:", ledger.activeCycleLabel, "Total Card Utilized:", recon.cardBal.totalUtilized, "Available Limit Now:", recon.cardBal.availableBalanceNow]
   ];
 
@@ -1817,18 +1940,18 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange("D5:D7").setNumberFormat("#,##0.00").setFontWeight("bold");
   sheet.getRange("F6:F7").setNumberFormat("#,##0.00").setFontWeight("bold");
   sheet.getRange("5:7").setBackground(CONFIG.COLORS.PRIMARY_LIGHT).setBorder(true, true, true, true, true, true);
-  sheet.getRange("F5:H5").merge().setValue(statusBadge).setBackground(statusColor).setFontWeight("bold").setFontSize(9);
+  sheet.getRange("F5:H5").merge().setValue(badgeFormula).setFontWeight("bold").setFontSize(9);
 
-  // Waterfall Explanation Bar
-  const waterfallText = `Waterfall: Purchases (${ledger.purchasesTotal.toFixed(2)}) + Installments (${ledger.installmentsTotal.toFixed(2)}) + Fees (${ledger.feesTotal.toFixed(2)}) + Unrecorded Assigned (${ledger.unrecordedTotal.toFixed(2)}) - Refunds (${ledger.refundsTotal.toFixed(2)}) = Family Shares (${ledger.familySharesTotal.toFixed(2)}) | Bank Closing Bill: ${ledger.closingBill.toFixed(2)} EGP`;
+  // Waterfall Explanation Bar (Formula)
+  const waterfallFormula = `="Waterfall: Purchases (" & TEXT(C${totShareRow}, "#,##0.00") & ") + Installments (" & TEXT(D${totShareRow}, "#,##0.00") & ") + Fees (" & TEXT(E${totShareRow}, "#,##0.00") & ") + Unrecorded (" & TEXT(F${totShareRow}, "#,##0.00") & ") - Refunds (" & TEXT(G${totShareRow}, "#,##0.00") & ") = Family Shares (" & TEXT(H${totShareRow}, "#,##0.00") & ") | Bank Closing Bill: " & TEXT(D5, "#,##0.00") & " EGP"`;
   sheet.getRange("A8:H8").merge()
-    .setValue(waterfallText)
+    .setValue(waterfallFormula)
     .setFontSize(8)
     .setFontStyle("italic")
     .setFontColor(CONFIG.COLORS.TEXT_MUTED)
     .setBackground("#f9fbe7");
 
-  // 3. Family Member Shares Table
+  // 4. Family Member Shares Table (Table 1 - Fully Formula-Driven)
   sheet.getRange("A10:H10").merge()
     .setValue("👥 Family Member Active Debt Shares (Billed on Current Statement)")
     .setFontWeight("bold")
@@ -1842,110 +1965,85 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
 
-  let curRow = 12;
-  const shareRows = ledger.personShares.map((ps, idx) => [
-    idx + 1,
-    ps.person,
-    ps.purchases,
-    ps.installments,
-    ps.fees,
-    ps.unrecorded,
-    ps.refunds,
-    ps.netTotal
-  ]);
+  if (numPayers > 0) {
+    const shareRows = sharePeople.map((ps, idx) => {
+      const r = startShareRow + idx;
+      const purchFormula = hasTable3
+        ? `=${ps.matchedPurchases.toFixed(2)} + SUMIFS($D$${startTxRow}:$D$${endTxRow}, $E$${startTxRow}:$E$${endTxRow}, $B${r}, $F$${startTxRow}:$F$${endTxRow}, "<>🚫*")`
+        : `=${ps.matchedPurchases.toFixed(2)}`;
+      const feesFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Bank Fee / Tax")`;
+      const unrecFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Missing Purchase")`;
+      const refFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Refund / Credit")`;
+      const netFormula = `=C${r}+D${r}+E${r}+F${r}-G${r}`;
 
-  if (shareRows.length > 0) {
-    sheet.getRange(curRow, 1, shareRows.length, sharesHeaders.length).setValues(shareRows).setFontSize(9);
-    sheet.getRange(curRow, 3, shareRows.length, 6).setNumberFormat("#,##0.00");
-    sheet.getRange(curRow, 8, shareRows.length, 1).setFontWeight("bold");
-    curRow += shareRows.length;
+      return [
+        idx + 1,
+        ps.person,
+        purchFormula,
+        ps.installments,
+        feesFormula,
+        unrecFormula,
+        refFormula,
+        netFormula
+      ];
+    });
+
+    sheet.getRange(startShareRow, 1, shareRows.length, sharesHeaders.length).setValues(shareRows).setFontSize(9);
+    sheet.getRange(startShareRow, 3, shareRows.length, 6).setNumberFormat("#,##0.00");
+    sheet.getRange(startShareRow, 8, shareRows.length, 1).setFontWeight("bold");
   }
 
-  // Summary Row
+  // Summary Row (Formula-Driven)
   const totalRow = [
     "TOTAL",
     "All Family Members",
-    ledger.purchasesTotal,
-    ledger.installmentsTotal,
-    ledger.feesTotal,
-    ledger.unrecordedTotal,
-    ledger.refundsTotal,
-    ledger.familySharesTotal
+    `=SUM(C${startShareRow}:C${endShareRow})`,
+    `=SUM(D${startShareRow}:D${endShareRow})`,
+    `=SUM(E${startShareRow}:E${endShareRow})`,
+    `=SUM(F${startShareRow}:F${endShareRow})`,
+    `=SUM(G${startShareRow}:G${endShareRow})`,
+    `=SUM(H${startShareRow}:H${endShareRow})`
   ];
-  sheet.getRange(curRow, 1, 1, sharesHeaders.length).setValues([totalRow])
+  sheet.getRange(totShareRow, 1, 1, sharesHeaders.length).setValues([totalRow])
     .setFontWeight("bold")
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.PRIMARY_LIGHT)
     .setBorder(true, true, true, true, true, true);
-  sheet.getRange(curRow, 3, 1, 6).setNumberFormat("#,##0.00");
-  curRow += 3;
+  sheet.getRange(totShareRow, 3, 1, 6).setNumberFormat("#,##0.00");
 
-  // 4. Actionable Exceptions & Unrecorded Statement Charges Table
-  const unrecordedCount = recon.missingInSheet.length + recon.stmtFees.length;
-  sheet.getRange(curRow, 1, 1, 8).merge()
-    .setValue(`⚠️ Actionable Statement Charges & Exceptions (${unrecordedCount} Items Requiring Review / Assignment)`)
+  // 5. Actionable Exceptions Table (Table 2 - Statement Review / Assignment)
+  sheet.getRange(startExHeaderRow, 1, 1, 8).merge()
+    .setValue(`⚠️ Actionable Statement Charges & Exceptions (${numExceptions} Items Requiring Review / Assignment)`)
     .setFontWeight("bold")
     .setFontSize(10)
     .setBackground(CONFIG.COLORS.DUE_SOON);
-  curRow++;
 
   const exHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Category", "Assign Payer", "Custom Note", "Status"];
-  sheet.getRange(curRow, 1, 1, exHeaders.length).setValues([exHeaders])
+  sheet.getRange(startExHeaderRow + 1, 1, 1, exHeaders.length).setValues([exHeaders])
     .setFontWeight("bold")
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
-  curRow++;
 
-  const exceptionItems = [];
-  recon.stmtFees.forEach((f, idx) => {
-    exceptionItems.push([
-      `F-${idx + 1}`,
-      f.date || f.dateStr,
-      f.desc,
-      f.amount,
-      "Bank Fee / Tax",
-      f.assignedPayer || CONFIG.DEFAULT_FEE_PAYER,
-      f.note || "Auto-assigned to Mai",
-      "🏛️ Bank Fee"
-    ]);
-  });
+  if (numExceptions > 0) {
+    const exRows = exceptionItems.map((ex, idx) => {
+      const r = startExRow + idx;
+      const statusFormula = `=IF(ISBLANK(F${r}), "⚠️ Needs Payer", IF(LEFT(F${r}, 1)="🚫", "🚫 Neglected / Bank Error", "✅ Assigned"))`;
+      return [
+        ex.id,
+        ex.date,
+        ex.desc,
+        ex.amount,
+        ex.category,
+        ex.assignedPayer,
+        ex.note,
+        statusFormula
+      ];
+    });
 
-  recon.stmtCredits.forEach((c, idx) => {
-    const isPayment = /\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(c.desc);
-    if (!isPayment) {
-      exceptionItems.push([
-        `C-${idx + 1}`,
-        c.date || c.dateStr,
-        c.desc,
-        c.amount,
-        "Refund / Credit",
-        c.assignedPayer || CONFIG.DEFAULT_FEE_PAYER,
-        c.note || "Merchant Refund (Reduces Debt)",
-        "💳 Refund Credit"
-      ]);
-    }
-  });
-
-  recon.missingInSheet.forEach((m, idx) => {
-    const isNeg = isNeglectedPayer(m.assignedPayer);
-    const statusText = isNeg ? "🚫 Reconciled in Transactions" : (m.assignedPayer ? "✅ Assigned" : "⚠️ Needs Payer");
-    exceptionItems.push([
-      `M-${idx + 1}`,
-      m.date || m.dateStr,
-      m.desc,
-      m.amount,
-      "Missing Purchase",
-      m.assignedPayer || "",
-      m.note || cleanMerchantName(m.desc),
-      statusText
-    ]);
-  });
-
-  if (exceptionItems.length > 0) {
-    const exRange = sheet.getRange(curRow, 1, exceptionItems.length, exHeaders.length);
-    exRange.setValues(exceptionItems).setFontSize(9);
-    sheet.getRange(curRow, 2, exceptionItems.length, 1).setNumberFormat("yyyy-MM-dd");
-    sheet.getRange(curRow, 4, exceptionItems.length, 1).setNumberFormat("#,##0.00");
+    const exRange = sheet.getRange(startExRow, 1, exRows.length, exHeaders.length);
+    exRange.setValues(exRows).setFontSize(9);
+    sheet.getRange(startExRow, 2, exRows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(startExRow, 4, exRows.length, 1).setNumberFormat("#,##0.00");
 
     const dynamicPayers = getAllUniquePayers(ss);
     const payerOptions = [...dynamicPayers, "🚫 Neglect / Ignore"];
@@ -1953,55 +2051,70 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       .requireValueInList(payerOptions, true)
       .setAllowInvalid(true)
       .build();
-    sheet.getRange(curRow, 6, exceptionItems.length, 1).setDataValidation(payerValidation);
+    sheet.getRange(startExRow, 6, exRows.length, 1).setDataValidation(payerValidation);
 
     for (let i = 0; i < exceptionItems.length; i++) {
-      const cat = exceptionItems[i][4];
-      const payer = exceptionItems[i][5];
+      const cat = exceptionItems[i].category;
+      const payer = exceptionItems[i].assignedPayer;
       if (cat === "Refund / Credit") {
-        sheet.getRange(curRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
+        sheet.getRange(startExRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
       } else if (isNeglectedPayer(payer)) {
-        sheet.getRange(curRow + i, 1, 1, 8).setBackground("#eeeeee");
+        sheet.getRange(startExRow + i, 1, 1, 8).setBackground("#eeeeee");
       } else if (payer) {
-        sheet.getRange(curRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
+        sheet.getRange(startExRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
       }
     }
-    curRow += exceptionItems.length;
   }
 
-  // 5. Sheet Transactions Not on Current Bank Statement (Unbilled / Pending)
-  if (recon.unmatchedTx && recon.unmatchedTx.length > 0) {
-    curRow += 2;
-    sheet.getRange(curRow, 1, 1, 8).merge()
-      .setValue(`⏳ Transactions in Sheet Not on Current Bank Statement (${recon.unmatchedTx.length} Items Unbilled / Pending Next Statement)`)
+  // 6. Sheet Transactions Not on Current Bank Statement (Table 3 - Billed by Default)
+  if (hasTable3) {
+    sheet.getRange(startTxHeaderRow, 1, 1, 8).merge()
+      .setValue(`⏳ Transactions in Sheet Not on Current Bank Statement (${numUnmatched} Items — Billed to Family Members by Default)`)
       .setFontWeight("bold")
       .setFontSize(10)
       .setBackground("#e8eaed");
-    curRow++;
 
-    const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Category", "Person", "Notes", "Status"];
-    sheet.getRange(curRow, 1, 1, unHeaders.length).setValues([unHeaders])
+    const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Person", "Billing Action", "Custom Note", "Status"];
+    sheet.getRange(startTxHeaderRow + 1, 1, 1, unHeaders.length).setValues([unHeaders])
       .setFontWeight("bold")
       .setFontSize(9)
       .setBackground(CONFIG.COLORS.HEADER);
-    curRow++;
 
-    const unRows = recon.unmatchedTx.map((tx, idx) => [
-      `TX-${idx + 1}`,
-      tx.date,
-      tx.desc,
-      tx.amount,
-      "Sheet Purchase",
-      tx.person,
-      "Recorded in Transactions",
-      "⏳ Pending Next Statement"
-    ]);
+    const txRows = unmatchedList.map((tx, idx) => {
+      const r = startTxRow + idx;
+      const statusFormula = `=IF(LEFT(F${r}, 1)="🚫", "🚫 Neglected", "✅ Billed to " & E${r})`;
+      const defaultAction = tx.isNeglected ? "🚫 Neglect / Ignore" : `✅ Billed to ${tx.person}`;
+      return [
+        tx.id,
+        tx.date,
+        tx.desc,
+        tx.amount,
+        tx.person,
+        defaultAction,
+        "Recorded in Transactions",
+        statusFormula
+      ];
+    });
 
-    sheet.getRange(curRow, 1, unRows.length, unHeaders.length).setValues(unRows).setFontSize(9);
-    sheet.getRange(curRow, 2, unRows.length, 1).setNumberFormat("yyyy-MM-dd");
-    sheet.getRange(curRow, 4, unRows.length, 1).setNumberFormat("#,##0.00");
-    sheet.getRange(curRow, 1, unRows.length, unHeaders.length).setBackground("#f8f9fa");
-    curRow += unRows.length;
+    sheet.getRange(startTxRow, 1, txRows.length, unHeaders.length).setValues(txRows).setFontSize(9);
+    sheet.getRange(startTxRow, 2, txRows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(startTxRow, 4, txRows.length, 1).setNumberFormat("#,##0.00");
+
+    for (let i = 0; i < unmatchedList.length; i++) {
+      const r = startTxRow + i;
+      const p = unmatchedList[i].person;
+      const txValidation = SpreadsheetApp.newDataValidation()
+        .requireValueInList([`✅ Billed to ${p}`, "🚫 Neglect / Ignore"], true)
+        .setAllowInvalid(true)
+        .build();
+      sheet.getRange(r, 6).setDataValidation(txValidation);
+
+      if (unmatchedList[i].isNeglected) {
+        sheet.getRange(r, 1, 1, 8).setBackground("#eeeeee");
+      } else {
+        sheet.getRange(r, 1, 1, 8).setBackground("#f8f9fa");
+      }
+    }
   }
 
   applySheetLayoutFitting(sheet, {
@@ -2009,14 +2122,14 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     bannerHeight: 30,
     customRowHeights: { 2: 20, 4: 24, 10: 26 },
     explicitColWidths: {
-      1: 45,  // #
-      2: 130, // Date / Member
-      3: 200, // Description / Category
+      1: 50,  // #
+      2: 125, // Date / Member
+      3: 210, // Description / Category
       4: 105, // Amount / Purchases
       5: 105, // Installments
-      6: 105, // Fees
-      7: 105, // Unrecorded / Total
-      8: 150  // Status / Dropdown
+      6: 125, // Fees / Payer / Action
+      7: 105, // Unrecorded / Total / Note
+      8: 155  // Status / Dropdown
     }
   });
 }
@@ -2142,104 +2255,123 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
 // ==========================================
 
 function handleActiveReconEdit(e) {
-  const range = e.range;
-  const sheet = range.getSheet();
-  const col = range.getColumn();
-  const row = range.getRow();
+  if (!e || !e.range) return;
+  const sheet = e.range.getSheet();
+  const col = e.range.getColumn();
+  const row = e.range.getRow();
 
-  if (row < 14) return; // Only process edits in the actionable exceptions area
-
+  if (row < 12) return;
   const lastR = sheet.getLastRow();
   if (row > lastR) return;
 
   const rowVals = sheet.getRange(row, 1, 1, 8).getValues()[0];
-  const exId = String(rowVals[0] || "").trim();
-  const rawDate = rowVals[1];
-  const origDesc = String(rowVals[2] || "").trim();
-  const amt = parseFloat(rowVals[3]);
-  const payer = String(rowVals[5] || "").trim();
-  const note = String(rowVals[6] || "").trim();
-
-  if (isNaN(amt) || amt <= 0 || !origDesc) return;
+  const firstCol = String(rowVals[0] || "").trim();
 
   const ss = sheet.getParent();
   const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
   const reconStore = loadAllReconStore(ss, tz);
 
-  // Calculate occurrence number within Table 2 for identical (amt, desc)
-  let occ = 1;
-  const startExRow = 14;
-  if (row > startExRow) {
-    const prevRange = sheet.getRange(startExRow, 1, row - startExRow, 4).getValues();
-    prevRange.forEach(pr => {
-      const pDesc = String(pr[2] || "").trim();
-      const pAmt = parseFloat(pr[3]) || 0;
-      if (Math.abs(pAmt - amt) < 0.01 && makeNormDesc(pDesc) === makeNormDesc(origDesc)) {
-        occ++;
+  // Case 1: Edit in Table 2 (F-*, C-*, M-*)
+  if (/^[FCM]-\d+/i.test(firstCol)) {
+    const exId = firstCol;
+    const rawDate = rowVals[1];
+    const origDesc = String(rowVals[2] || "").trim();
+    const amt = parseFloat(rowVals[3]);
+    const payer = String(rowVals[5] || "").trim();
+    const note = String(rowVals[6] || "").trim();
+
+    if (isNaN(amt) || amt <= 0 || !origDesc) return;
+
+    // Calculate occurrence number within Table 2
+    let occ = 1;
+    const startExRow = 14;
+    if (row > startExRow) {
+      const prevRange = sheet.getRange(startExRow, 1, row - startExRow, 4).getValues();
+      prevRange.forEach(pr => {
+        const pDesc = String(pr[2] || "").trim();
+        const pAmt = parseFloat(pr[3]) || 0;
+        if (Math.abs(pAmt - amt) < 0.01 && makeNormDesc(pDesc) === makeNormDesc(origDesc)) {
+          occ++;
+        }
+      });
+    }
+
+    const baseKey = makeReconKey(rawDate, amt, origDesc, tz);
+    const pKeyWithOcc = `${baseKey}_#${occ}`;
+    const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}_#${occ}`;
+
+    if (payer && !isNeglectedPayer(payer)) {
+      const rec = {
+        primaryKey: pKeyWithOcc,
+        exId: exId,
+        dateStr: makeNormDateStr(rawDate, tz),
+        desc: origDesc,
+        amount: amt,
+        payer: payer,
+        note: note,
+        isNeglected: false
+      };
+      reconStore.table2Map[pKeyWithOcc] = rec;
+      reconStore.table2Map[amtDescKey] = rec;
+      reconStore.table2Map[exId] = rec;
+      if (occ === 1) {
+        reconStore.table2Map[baseKey] = rec;
+        reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
       }
-    });
+      sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
+    } else if (isNeglectedPayer(payer)) {
+      const rec = {
+        primaryKey: pKeyWithOcc,
+        exId: exId,
+        dateStr: makeNormDateStr(rawDate, tz),
+        desc: origDesc,
+        amount: amt,
+        payer: "NEGLECT",
+        note: note,
+        isNeglected: true
+      };
+      reconStore.table2Map[pKeyWithOcc] = rec;
+      reconStore.table2Map[amtDescKey] = rec;
+      reconStore.table2Map[exId] = rec;
+      if (occ === 1) {
+        reconStore.table2Map[baseKey] = rec;
+        reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
+      }
+      sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
+    } else {
+      delete reconStore.table2Map[pKeyWithOcc];
+      delete reconStore.table2Map[amtDescKey];
+      delete reconStore.table2Map[exId];
+      if (occ === 1) {
+        delete reconStore.table2Map[baseKey];
+        delete reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`];
+      }
+      sheet.getRange(row, 1, 1, 8).setBackground("#ffffff");
+    }
+
+    saveAllReconStore(ss, reconStore);
+    // ZERO SCREEN WIPE: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
+    return;
   }
 
-  const baseKey = makeReconKey(rawDate, amt, origDesc, tz);
-  const pKeyWithOcc = `${baseKey}_#${occ}`;
-  const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}_#${occ}`;
+  // Case 2: Edit in Table 3 (TX-*)
+  if (/^TX-/i.test(firstCol)) {
+    const txId = firstCol;
+    const actionVal = String(rowVals[5] || "").trim();
+    const isNeg = isNeglectedPayer(actionVal);
 
-  if (payer && !isNeglectedPayer(payer)) {
-    const rec = {
-      primaryKey: pKeyWithOcc,
-      exId: exId,
-      dateStr: makeNormDateStr(rawDate, tz),
-      desc: origDesc,
-      amount: amt,
-      payer: payer,
-      note: note,
-      isNeglected: false
-    };
-    reconStore.table2Map[pKeyWithOcc] = rec;
-    reconStore.table2Map[amtDescKey] = rec;
-    if (exId) reconStore.table2Map[exId] = rec;
-    if (occ === 1) {
-      reconStore.table2Map[baseKey] = rec;
-      reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
+    if (isNeg) {
+      reconStore.neglectedTx.add(txId);
+      sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
+    } else {
+      reconStore.neglectedTx.delete(txId);
+      sheet.getRange(row, 1, 1, 8).setBackground("#f8f9fa");
     }
-    sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
-    sheet.getRange(row, 8).setValue("✅ Assigned");
-  } else if (isNeglectedPayer(payer)) {
-    const rec = {
-      primaryKey: pKeyWithOcc,
-      exId: exId,
-      dateStr: makeNormDateStr(rawDate, tz),
-      desc: origDesc,
-      amount: amt,
-      payer: "NEGLECT",
-      note: note,
-      isNeglected: true
-    };
-    reconStore.table2Map[pKeyWithOcc] = rec;
-    reconStore.table2Map[amtDescKey] = rec;
-    if (exId) reconStore.table2Map[exId] = rec;
-    if (occ === 1) {
-      reconStore.table2Map[baseKey] = rec;
-      reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
-    }
-    sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
-    sheet.getRange(row, 8).setValue("🚫 Neglected");
-  } else {
-    delete reconStore.table2Map[pKeyWithOcc];
-    delete reconStore.table2Map[amtDescKey];
-    if (exId) delete reconStore.table2Map[exId];
-    if (occ === 1) {
-      delete reconStore.table2Map[baseKey];
-      delete reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`];
-    }
-    sheet.getRange(row, 1, 1, 8).setBackground("#ffffff");
-    sheet.getRange(row, 8).setValue("⚠️ Needs Payer");
+
+    saveAllReconStore(ss, reconStore);
+    // ZERO SCREEN WIPE: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
+    return;
   }
-
-  saveAllReconStore(ss, reconStore);
-
-  // In-place refresh without screen wipe
-  updateLiveDashboard({ skipPDF: true });
 }
 
 function onEdit(e) {
