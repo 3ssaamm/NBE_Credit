@@ -1937,9 +1937,11 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange("A5:A7").setFontWeight("bold");
   sheet.getRange("C5:C7").setFontWeight("bold");
   sheet.getRange("E5:E7").setFontWeight("bold");
-  sheet.getRange("D5:D7").setNumberFormat("#,##0.00").setFontWeight("bold");
-  sheet.getRange("F6:F7").setNumberFormat("#,##0.00").setFontWeight("bold");
-  sheet.getRange("5:7").setBackground(CONFIG.COLORS.PRIMARY_LIGHT).setBorder(true, true, true, true, true, true);
+  sheet.getRange("A5:H7").setBackground(CONFIG.COLORS.PRIMARY_LIGHT).setBorder(true, true, true, true, true, true);
+  const maxCols = sheet.getMaxColumns();
+  if (maxCols > 8) {
+    sheet.getRange(1, 9, Math.min(sheet.getMaxRows(), 30), maxCols - 8).clearFormat();
+  }
   sheet.getRange("F5:H5").merge().setValue(badgeFormula).setFontWeight("bold").setFontSize(9);
 
   // Waterfall Explanation Bar (Formula)
