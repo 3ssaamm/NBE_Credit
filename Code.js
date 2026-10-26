@@ -448,6 +448,47 @@ function getBillingCycleForInstallment(purchaseDate, installmentIndex, tz) {
   };
 }
 
+function getCycleDateRange(cycleSortKey, tz) {
+  if (!cycleSortKey) return null;
+  const parts = cycleSortKey.split("-");
+  const y = parseInt(parts[0], 10);
+  const m = parseInt(parts[1], 10);
+  if (isNaN(y) || isNaN(m)) return null;
+
+  const anchor = new Date(y, m - 1, 1, 12, 0, 0);
+  let start = null;
+  let end = null;
+
+  for (let offset = -60; offset <= 5; offset++) {
+    const d = new Date(anchor.getTime() + offset * 86400000);
+    const info = getBillingCycleForPurchase(d, tz);
+    if (info && info.cycleSortKey === cycleSortKey) {
+      if (!start) start = new Date(d);
+      end = new Date(d);
+    }
+  }
+
+  return {
+    start: start,
+    end: end,
+    startYear: start ? start.getFullYear() : y,
+    startMonth: start ? start.getMonth() + 1 : m - 1,
+    startDay: start ? start.getDate() : 1,
+    endYear: end ? end.getFullYear() : y,
+    endMonth: end ? end.getMonth() + 1 : m,
+    endDay: end ? end.getDate() : 30
+  };
+}
+
+function makePurchaseSumFormula(personCellRef, dateRange) {
+  const { startYear, startMonth, startDay, endYear, endMonth, endDay } = dateRange;
+  const startExpr = `DATE(${startYear},${startMonth},${startDay})`;
+  const endExpr = `DATE(${endYear},${endMonth},${endDay})`;
+  const single = `SUMIFS(Transactions!$E:$E, Transactions!$D:$D, "*" & TRIM(${personCellRef}) & "*", Transactions!$D:$D, "<>*+*", Transactions!$B:$B, ">="&${startExpr}, Transactions!$B:$B, "<="&${endExpr})`;
+  const split = `0.5 * SUMIFS(Transactions!$E:$E, Transactions!$D:$D, "*+*", Transactions!$D:$D, "*" & TRIM(${personCellRef}) & "*", Transactions!$B:$B, ">="&${startExpr}, Transactions!$B:$B, "<="&${endExpr})`;
+  return `${single} + ${split}`;
+}
+
 function getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate) {
   if (!stmtDate && !minStmtTxDate) return { start: null, end: null };
   let pStart = null;
@@ -1827,7 +1868,17 @@ function buildDebtLedger(ss, tz, recon) {
     familySharesTotal,
     auditDifference,
     isExactMatch,
-    personShares: Object.values(personShares).filter(ps => ps.netTotal > 0 || ps.purchases > 0 || ps.installments > 0)
+    personShares: allPayers.map(p => personShares[p] || {
+      person: p,
+      matchedPurchases: 0,
+      unmatchedPurchases: 0,
+      purchases: 0,
+      installments: 0,
+      fees: 0,
+      unrecorded: 0,
+      refunds: 0,
+      netTotal: 0
+    })
   };
 }
 
@@ -1968,11 +2019,13 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setBackground(CONFIG.COLORS.HEADER);
 
   if (numPayers > 0) {
+    const activeRange = getCycleDateRange(cardBal.activeCycleKey, tz);
     const shareRows = sharePeople.map((ps, idx) => {
       const r = startShareRow + idx;
+      const activePurchSum = activeRange ? makePurchaseSumFormula(`$B${r}`, activeRange) : `0`;
       const purchFormula = hasTable3
-        ? `=${ps.matchedPurchases.toFixed(2)} + SUMIFS($D$${startTxRow}:$D$${endTxRow}, $E$${startTxRow}:$E$${endTxRow}, $B${r}, $F$${startTxRow}:$F$${endTxRow}, "<>🚫*")`
-        : `=${ps.matchedPurchases.toFixed(2)}`;
+        ? `=${activePurchSum} - SUMIFS($D$${startTxRow}:$D$${endTxRow}, $E$${startTxRow}:$E$${endTxRow}, $B${r}, $F$${startTxRow}:$F$${endTxRow}, "🚫*")`
+        : `=${activePurchSum}`;
       const feesFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Bank Fee / Tax")`;
       const unrecFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Missing Purchase")`;
       const refFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Refund / Credit")`;
@@ -2217,22 +2270,46 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
     .setBackground(CONFIG.COLORS.HEADER)
     .setWrap(true);
 
-  const rows = allPayers.map(p => {
+  const startDataRow = 5;
+  const lastDataRow = startDataRow + allPayers.length - 1;
+  const startShareRow = 12;
+  const endShareRow = startShareRow + allPayers.length - 1;
+
+  const rows = allPayers.map((p, idx) => {
+    const r = startDataRow + idx;
     const row = [p];
+
+    // 1. Past Historical Cycles (Audited & Paid)
     histKeys.forEach(k => row.push(history[k].people[p] || 0));
-    const activePerson = ledger.personShares.find(ps => ps.person === p);
-    row.push(activePerson ? activePerson.netTotal : 0);
-    futureKeys.forEach(k => row.push(futureForecasts[k].people[p] || 0));
+
+    // 2. Active Month (Formula linked to Active Bill & Reconciliation Table 1 Net Total)
+    row.push(`=SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$H$${startShareRow}:$H$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($A${r}) & "*")`);
+
+    // 3. Multi-Month Future Forecasts (Installment Base + Live SUMIFS from Transactions)
+    futureKeys.forEach(k => {
+      const instAmt = (futureForecasts[k] && futureForecasts[k].people[p]) || 0;
+      const dateRange = getCycleDateRange(k, tz);
+      if (dateRange) {
+        const purchSum = makePurchaseSumFormula(`$A${r}`, dateRange);
+        if (instAmt > 0) {
+          row.push(`=${instAmt.toFixed(2)} + ${purchSum}`);
+        } else {
+          row.push(`=${purchSum}`);
+        }
+      } else {
+        row.push(instAmt > 0 ? instAmt : 0);
+      }
+    });
+
     return row;
   });
 
+  // Equation-based Total Row
   const totalRow = ["TOTAL BILL (EGP)"];
-  histKeys.forEach(k => {
-    const t = Object.values(history[k].people).reduce((a, b) => a + b, 0);
-    totalRow.push(t);
-  });
-  totalRow.push(ledger.familySharesTotal);
-  futureKeys.forEach(k => totalRow.push(futureForecasts[k].total));
+  for (let c = 2; c <= headers.length; c++) {
+    const colLetter = getColumnLetter(c);
+    totalRow.push(`=SUM(${colLetter}${startDataRow}:${colLetter}${lastDataRow})`);
+  }
 
   sheet.getRange(5, 1, rows.length, headers.length).setValues(rows).setFontSize(9);
   sheet.getRange(5 + rows.length, 1, 1, headers.length).setValues([totalRow])
