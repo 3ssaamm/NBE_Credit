@@ -75,6 +75,17 @@ function parseDateValue(rawDate, tz) {
   }
 
   const monthNames = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const mdyWord = s.match(/(?:[a-zA-Z]+,\s*)?([a-zA-Z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?,\s*(\d{4})/i);
+  if (mdyWord) {
+    const mStr = mdyWord[1].toLowerCase().substring(0, 3);
+    const mIdx = monthNames.indexOf(mStr);
+    const day = parseInt(mdyWord[2], 10);
+    const year = parseInt(mdyWord[3], 10);
+    if (mIdx >= 0) {
+      return new Date(year, mIdx, day, 12, 0, 0);
+    }
+  }
+
   const wordMatch = s.match(/(\d{1,2})[-\/\.\s]+([a-zA-Z]{3,9})[-\/\.\s]+(\d{2,4})/);
   if (wordMatch) {
     const day = parseInt(wordMatch[1], 10);
@@ -261,6 +272,38 @@ function sanitizeAllPayerNames(ss) {
   }
 }
 
+function sanitizeTransactionDates(ss) {
+  if (!ss) return;
+  try {
+    const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+    if (!txSheet || txSheet.getLastRow() < 2) return;
+    const numRows = txSheet.getLastRow() - 1;
+    const range = txSheet.getRange(2, 2, numRows, 1);
+    const vals = range.getValues();
+    let changed = false;
+
+    for (let i = 0; i < vals.length; i++) {
+      const cellVal = vals[i][0];
+      if (!cellVal) continue;
+      if (cellVal instanceof Date && !isNaN(cellVal.getTime())) {
+        continue;
+      }
+      const parsed = parseDateValue(cellVal);
+      if (parsed && !isNaN(parsed.getTime())) {
+        vals[i][0] = parsed;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      range.setValues(vals);
+    }
+    range.setNumberFormat("dddd, MMMM d, yyyy");
+  } catch (err) {
+    Logger.log("[sanitizeTransactionDates] Error: " + err);
+  }
+}
+
 function getAllUniquePayers(ss) {
   const peopleSet = new Set(["Abdo", "Dad", "Mai", "Mido", "Muhanad", "Mum", "Zoza"]);
 
@@ -376,22 +419,16 @@ function getBillingCycleForPurchase(purchaseDate, tz) {
   let month = parseInt(Utilities.formatDate(purchaseDate, targetTz, "M"), 10) - 1;
   let year = parseInt(Utilities.formatDate(purchaseDate, targetTz, "yyyy"), 10);
 
-  if (purchaseDate.getDate() === 31 || purchaseDate.getUTCDate() === 31) {
-    day = 31;
-    if (purchaseDate.getDate() === 31) {
-      month = purchaseDate.getMonth();
-      year = purchaseDate.getFullYear();
-    } else {
-      month = purchaseDate.getUTCMonth();
-      year = purchaseDate.getUTCFullYear();
-    }
-  }
-
   let cycleYear = year;
   let cycleMonth = month;
 
-  // Day 31 Rollover Rule (e.g. Aug 31 -> September cycle, due Oct 25)
-  if (day === 31) {
+  // Statement cut-off rollover rule:
+  // Purchases on the last calendar day of month M (e.g. Aug 31, Sep 30, Oct 31, Feb 28) roll over
+  // into the billing cycle closed at the end of month M+1 and due on the 25th of month M+2.
+  const nextDay = new Date(year, month, day + 1, 12, 0, 0);
+  const isLastDay = (nextDay.getMonth() !== month);
+
+  if (isLastDay) {
     cycleMonth = month + 1;
     if (cycleMonth > 11) {
       cycleMonth = 0;
@@ -414,7 +451,7 @@ function getBillingCycleForPurchase(purchaseDate, tz) {
     cycleDate: cycleDate,
     dueDate: dueDate,
     dueDateLabel: Utilities.formatDate(dueDate, targetTz, "MMMM d, yyyy"),
-    isDay31Rollover: (day === 31)
+    isDay31Rollover: isLastDay
   };
 }
 
@@ -459,7 +496,7 @@ function getCycleDateRange(cycleSortKey, tz) {
   let start = null;
   let end = null;
 
-  for (let offset = -60; offset <= 5; offset++) {
+  for (let offset = -70; offset <= 5; offset++) {
     const d = new Date(anchor.getTime() + offset * 86400000);
     const info = getBillingCycleForPurchase(d, tz);
     if (info && info.cycleSortKey === cycleSortKey) {
@@ -484,9 +521,10 @@ function makePurchaseSumFormula(personCellRef, dateRange) {
   const { startYear, startMonth, startDay, endYear, endMonth, endDay } = dateRange;
   const startExpr = `DATE(${startYear},${startMonth},${startDay})`;
   const endExpr = `DATE(${endYear},${endMonth},${endDay})`;
-  const single = `SUMIFS(Transactions!$E:$E, Transactions!$D:$D, "*" & TRIM(${personCellRef}) & "*", Transactions!$D:$D, "<>*+*", Transactions!$B:$B, ">="&${startExpr}, Transactions!$B:$B, "<="&${endExpr})`;
-  const split = `0.5 * SUMIFS(Transactions!$E:$E, Transactions!$D:$D, "*+*", Transactions!$D:$D, "*" & TRIM(${personCellRef}) & "*", Transactions!$B:$B, ">="&${startExpr}, Transactions!$B:$B, "<="&${endExpr})`;
-  return `${single} + ${split}`;
+  const single = `SUMIFS(Transactions!$E:$E, Transactions!$D:$D, TRIM(${personCellRef}), Transactions!$B:$B, ">="&${startExpr}, Transactions!$B:$B, "<"&(${endExpr}+1))`;
+  const split1 = `0.5 * SUMIFS(Transactions!$E:$E, Transactions!$D:$D, "*" & TRIM(${personCellRef}) & "*+*", Transactions!$B:$B, ">="&${startExpr}, Transactions!$B:$B, "<"&(${endExpr}+1))`;
+  const split2 = `0.5 * SUMIFS(Transactions!$E:$E, Transactions!$D:$D, "*+*" & TRIM(${personCellRef}) & "*", Transactions!$B:$B, ">="&${startExpr}, Transactions!$B:$B, "<"&(${endExpr}+1))`;
+  return `${single} + ${split1} + ${split2}`;
 }
 
 function getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate) {
@@ -2019,13 +2057,11 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setBackground(CONFIG.COLORS.HEADER);
 
   if (numPayers > 0) {
-    const activeRange = getCycleDateRange(cardBal.activeCycleKey, tz);
     const shareRows = sharePeople.map((ps, idx) => {
       const r = startShareRow + idx;
-      const activePurchSum = activeRange ? makePurchaseSumFormula(`$B${r}`, activeRange) : `0`;
       const purchFormula = hasTable3
-        ? `=${activePurchSum} - SUMIFS($D$${startTxRow}:$D$${endTxRow}, $E$${startTxRow}:$E$${endTxRow}, $B${r}, $F$${startTxRow}:$F$${endTxRow}, "🚫*")`
-        : `=${activePurchSum}`;
+        ? `=${ps.matchedPurchases.toFixed(2)} + SUMIFS($D$${startTxRow}:$D$${endTxRow}, $E$${startTxRow}:$E$${endTxRow}, $B${r}, $F$${startTxRow}:$F$${endTxRow}, "<>🚫*")`
+        : `=${ps.matchedPurchases.toFixed(2)}`;
       const feesFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Bank Fee / Tax")`;
       const unrecFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Missing Purchase")`;
       const refFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Refund / Credit")`;
@@ -2460,6 +2496,18 @@ function onEdit(e) {
   const col = e.range.getColumn();
   const row = e.range.getRow();
 
+  if (sheetName === CONFIG.SHEETS.TRANSACTIONS && col === 2 && row >= 2) {
+    const val = e.range.getValue();
+    if (val && !(val instanceof Date)) {
+      const parsed = parseDateValue(val);
+      if (parsed && !isNaN(parsed.getTime())) {
+        e.range.setValue(parsed);
+      }
+    }
+    e.range.setNumberFormat("dddd, MMMM d, yyyy");
+    return;
+  }
+
   if (sheetName === CONFIG.SHEETS.TRANSACTIONS && col === 4 && row >= 2) {
     const val = e.range.getValue();
     const clean = formatPayerCell(val);
@@ -2496,6 +2544,7 @@ function updateLiveDashboard(options) {
 
   cleanupDeprecatedSheets(ss);
   sanitizeAllPayerNames(ss);
+  sanitizeTransactionDates(ss);
 
   const recon = reconcileActiveStatement(ss, tz);
   if (recon.error) {
