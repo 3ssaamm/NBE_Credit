@@ -579,7 +579,8 @@ function loadAllReconStore(ss, tz) {
     table2Map: {},
     table2List: [],
     confirmedMatches: new Set(),
-    neglectedTx: new Set()
+    neglectedTx: new Set(),
+    paymentRecords: {}
   };
 
   try {
@@ -600,7 +601,21 @@ function loadAllReconStore(ss, tz) {
 
         if (!pKey && !desc && amt === 0) return;
 
-        if (type === "TABLE2_ASSIGNMENT" || (!type && payer)) {
+        if (type === "CYCLE_PAYMENT") {
+          let audit = [];
+          try {
+            if (note) audit = JSON.parse(note);
+          } catch (e) { }
+          store.paymentRecords[pKey] = {
+            cycleKey: pKey,
+            dateStr: dStr,
+            cycleLabel: desc,
+            amount: amt,
+            status: payer,
+            audit: audit,
+            isApplied: isConfirmed
+          };
+        } else if (type === "TABLE2_ASSIGNMENT" || (!type && payer)) {
           if (payer) {
             const isNeg = (payer === "NEGLECT" || payer === "🚫 Neglect / Ignore" || payer.toLowerCase().includes("neglect"));
             const rec = {
@@ -668,6 +683,26 @@ function saveAllReconStore(ss, store) {
     if (store.neglectedTx) {
       store.neglectedTx.forEach(k => {
         if (k) rows.push(["TABLE3_NEGLECTED", k, "", "", 0, "", "", false, true, nowStr]);
+      });
+    }
+
+    if (store.paymentRecords) {
+      Object.keys(store.paymentRecords).forEach(cycleKey => {
+        const pr = store.paymentRecords[cycleKey];
+        if (pr && pr.dateStr) {
+          rows.push([
+            "CYCLE_PAYMENT",
+            cycleKey,
+            pr.dateStr || "",
+            pr.cycleLabel || "",
+            pr.amount || 0,
+            pr.status || "Settled",
+            pr.audit ? JSON.stringify(pr.audit) : (pr.auditJson || ""),
+            pr.isApplied === true,
+            false,
+            nowStr
+          ]);
+        }
       });
     }
 
@@ -2033,6 +2068,41 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   }
   sheet.getRange("F5:H5").merge().setValue(badgeFormula).setFontWeight("bold").setFontSize(9);
 
+  // Payment Verification & Status (Row 6 & Row 7, Cols G-H)
+  const cycleRecord = (reconStore.paymentRecords && reconStore.paymentRecords[ledger.activeCycleKey]) || null;
+  const paymentDateVal = (cycleRecord && cycleRecord.dateStr) ? cycleRecord.dateStr : "";
+  const isPaid = !!paymentDateVal;
+
+  sheet.getRange(6, 7).setValue("Payment Date:").setFontWeight("bold").setFontSize(9);
+  const dateCell = sheet.getRange(6, 8);
+  if (paymentDateVal) {
+    dateCell.setValue(paymentDateVal);
+  } else {
+    dateCell.clearContent();
+  }
+  dateCell.setNumberFormat("yyyy-MM-dd")
+    .setFontSize(9)
+    .setHorizontalAlignment("center")
+    .setFontWeight(isPaid ? "bold" : "normal")
+    .setFontColor(isPaid ? "#1b5e20" : "#333333")
+    .setBackground(isPaid ? CONFIG.COLORS.PAID : "#fffde7");
+
+  const dateValidation = SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(true).build();
+  dateCell.setDataValidation(dateValidation);
+
+  sheet.getRange(7, 7).setValue("Payment Status:").setFontWeight("bold").setFontSize(9);
+  const statusCell = sheet.getRange(7, 8);
+  const statusFormula = `=IF(ISBLANK(H6), "⏳ Pending Payment", "✅ Paid on " & TEXT(H6, "yyyy-MM-dd"))`;
+  statusCell.setFormula(statusFormula)
+    .setFontSize(9)
+    .setFontWeight("bold")
+    .setHorizontalAlignment("center")
+    .setBackground(isPaid ? CONFIG.COLORS.PAID : CONFIG.COLORS.DUE_SOON)
+    .setFontColor(isPaid ? "#1b5e20" : "#7f6000");
+
+  sheet.getRange("D5:D7").setNumberFormat("#,##0.00");
+  sheet.getRange("F6:F7").setNumberFormat("#,##0.00");
+
   // Waterfall Explanation Bar (Formula)
   const waterfallFormula = `="Waterfall: Purchases (" & TEXT(C${totShareRow}, "#,##0.00") & ") + Installments (" & TEXT(D${totShareRow}, "#,##0.00") & ") + Fees (" & TEXT(E${totShareRow}, "#,##0.00") & ") + Unrecorded (" & TEXT(F${totShareRow}, "#,##0.00") & ") - Refunds (" & TEXT(G${totShareRow}, "#,##0.00") & ") = Family Shares (" & TEXT(H${totShareRow}, "#,##0.00") & ") | Bank Closing Bill: " & TEXT(D5, "#,##0.00") & " EGP"`;
   sheet.getRange("A8:H8").merge()
@@ -2369,11 +2439,210 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
 // 11. FAST onEdit & WORKFLOW TRIGGERS
 // ==========================================
 
+function handlePaymentDateEdit(sheet, range, tz) {
+  const ss = sheet.getParent();
+  const rawVal = range.getValue();
+  const reconStore = loadAllReconStore(ss, tz);
+
+  const cardBal = calculateCardBalance(ss, tz);
+  const activeCycleKey = cardBal.activeCycleKey;
+  const cycleLabel = cardBal.activeCycleLabel;
+  const closingBill = cardBal.billedBalance;
+
+  const existingRec = (reconStore.paymentRecords && reconStore.paymentRecords[activeCycleKey]) || null;
+
+  // Case 1: User cleared the cell (Unpaid / Undo)
+  if (rawVal === "" || rawVal === null || rawVal === undefined) {
+    if (existingRec && existingRec.isApplied && existingRec.audit && existingRec.audit.length > 0) {
+      const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+      if (instSheet && instSheet.getLastRow() >= 2) {
+        const numRows = instSheet.getLastRow() - 1;
+        const paymentsCol = instSheet.getRange(2, 10, numRows, 1).getValues();
+        const statusCol = instSheet.getRange(2, 11, numRows, 1).getValues();
+
+        existingRec.audit.forEach(item => {
+          const r = item.rowIndex;
+          if (r >= 0 && r < numRows) {
+            paymentsCol[r][0] = item.prevPayments;
+            statusCol[r][0] = item.prevStatus;
+            if (item.prevStatus !== "Completed") {
+              instSheet.getRange(item.rowNum, 1, 1, 11).setBackground(null);
+            }
+          }
+        });
+
+        // Batch update Installments: ONLY touch Columns J and K
+        instSheet.getRange(2, 10, numRows, 1).setValues(paymentsCol);
+        instSheet.getRange(2, 11, numRows, 1).setValues(statusCol);
+      }
+    }
+
+    if (reconStore.paymentRecords) {
+      delete reconStore.paymentRecords[activeCycleKey];
+    }
+    saveAllReconStore(ss, reconStore);
+
+    // Reset cell styling in Active Bill & Reconciliation
+    range.setBackground("#fffde7").setFontColor("#333333").setFontWeight("normal");
+    sheet.getRange(7, 8).setBackground(CONFIG.COLORS.DUE_SOON).setFontColor("#7f6000");
+
+    ss.toast("Payment date cleared. Reverted installment payment counts.", "💳 NBE Tracker", 4);
+    return;
+  }
+
+  // Case 2: User entered a date
+  const parsedDate = parseDateValue(rawVal, tz);
+  if (!parsedDate || isNaN(parsedDate.getTime())) {
+    ss.toast("Please enter a valid date (e.g. YYYY-MM-DD).", "⚠️ Invalid Date", 4);
+    return;
+  }
+
+  const dateStr = Utilities.formatDate(parsedDate, tz, "yyyy-MM-dd");
+  range.setValue(dateStr);
+  range.setNumberFormat("yyyy-MM-dd");
+  range.setBackground(CONFIG.COLORS.PAID).setFontColor("#1b5e20").setFontWeight("bold");
+  sheet.getRange(7, 8).setBackground(CONFIG.COLORS.PAID).setFontColor("#1b5e20");
+
+  // If already applied for this cycle, just update date in store
+  if (existingRec && existingRec.isApplied) {
+    existingRec.dateStr = dateStr;
+    saveAllReconStore(ss, reconStore);
+    ss.toast("Payment date updated to " + dateStr + ".", "💳 NBE Tracker", 3);
+    return;
+  }
+
+  // Apply increment to Installments sheet
+  const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  if (!instSheet || instSheet.getLastRow() < 2) {
+    if (!reconStore.paymentRecords) reconStore.paymentRecords = {};
+    reconStore.paymentRecords[activeCycleKey] = {
+      cycleKey: activeCycleKey,
+      dateStr: dateStr,
+      cycleLabel: cycleLabel,
+      amount: closingBill,
+      status: "Settled",
+      isApplied: true,
+      audit: []
+    };
+    saveAllReconStore(ss, reconStore);
+    ss.toast("Payment recorded (" + dateStr + ").", "💳 NBE Tracker", 4);
+    return;
+  }
+
+  const numRows = instSheet.getLastRow() - 1;
+  const instData = instSheet.getRange(2, 1, numRows, 11).getValues();
+  const paymentsCol = instSheet.getRange(2, 10, numRows, 1).getValues();
+  const statusCol = instSheet.getRange(2, 11, numRows, 1).getValues();
+
+  // Find matched statement installments if bank statement exists
+  const recon = reconcileActiveStatement(ss, tz);
+  const matchedIndices = new Set();
+  if (recon && recon.stmtInstallments) {
+    const sheetInstRows = [];
+    instData.forEach((row, idx) => {
+      const emi = parseFloat(row[7]);
+      const payer = String(row[8] || "").replace(/[\u00A0\s]+/g, " ").trim();
+      const desc = String(row[2] || "").trim();
+      const duration = parseInt(row[4], 10);
+      if (!isNaN(emi) && emi > 0 && payer) {
+        sheetInstRows.push({ index: idx, emi, payer, desc, duration });
+      }
+    });
+    const matches = matchStatementInstallments(recon.stmtInstallments, sheetInstRows);
+    matches.forEach(m => {
+      if (m.sheetRows) {
+        m.sheetRows.forEach(sr => {
+          if (sr.index !== undefined) matchedIndices.add(sr.index);
+        });
+      }
+    });
+  }
+
+  const audit = [];
+
+  for (let r = 0; r < numRows; r++) {
+    const row = instData[r];
+    const pDate = parseDateValue(row[1], tz);
+    const desc = String(row[2] || "").trim();
+    const months = parseInt(row[4], 10);
+    const emi = parseFloat(row[7]) || 0;
+    const payer = String(row[8] || "").trim();
+    const paymentsMade = parseInt(row[9], 10) || 0;
+    const currentStatus = String(row[10] || "").trim();
+
+    if (months <= 0 || emi <= 0 || !payer) continue;
+    if (paymentsMade >= months || currentStatus.toLowerCase() === "completed") continue;
+
+    // Check if this installment was billed in or before this cycle
+    let isDue = matchedIndices.has(r);
+    if (!isDue && pDate) {
+      const cyc = getBillingCycleForInstallment(pDate, paymentsMade, tz);
+      if (cyc && cyc.cycleSortKey <= activeCycleKey) {
+        isDue = true;
+      }
+    }
+
+    if (isDue) {
+      const newPayments = paymentsMade + 1;
+      const newStatus = (newPayments >= months) ? "Completed" : (currentStatus || "Ongoing");
+
+      audit.push({
+        rowIndex: r,
+        rowNum: r + 2,
+        desc: desc,
+        payer: payer,
+        prevPayments: paymentsMade,
+        newPayments: newPayments,
+        prevStatus: currentStatus,
+        newStatus: newStatus
+      });
+
+      paymentsCol[r][0] = newPayments;
+      statusCol[r][0] = newStatus;
+    }
+  }
+
+  // Batch update Installments sheet ONLY on Columns J and K
+  if (audit.length > 0) {
+    instSheet.getRange(2, 10, numRows, 1).setValues(paymentsCol);
+    instSheet.getRange(2, 11, numRows, 1).setValues(statusCol);
+
+    // Apply green highlight to completed rows
+    audit.forEach(item => {
+      if (item.newStatus === "Completed") {
+        instSheet.getRange(item.rowNum, 1, 1, 11).setBackground(CONFIG.COLORS.PAID);
+      }
+    });
+  }
+
+  // Save record in ReconStore
+  if (!reconStore.paymentRecords) reconStore.paymentRecords = {};
+  reconStore.paymentRecords[activeCycleKey] = {
+    cycleKey: activeCycleKey,
+    dateStr: dateStr,
+    cycleLabel: cycleLabel,
+    amount: closingBill,
+    status: "Settled",
+    isApplied: true,
+    audit: audit
+  };
+  saveAllReconStore(ss, reconStore);
+
+  ss.toast("Verified payment for " + (cycleLabel || activeCycleKey) + "! Updated " + audit.length + " active installments.", "💳 NBE Tracker", 5);
+}
+
 function handleActiveReconEdit(e) {
   if (!e || !e.range) return;
   const sheet = e.range.getSheet();
   const col = e.range.getColumn();
   const row = e.range.getRow();
+
+  if (row === 6 && col === 8) {
+    const ss = sheet.getParent();
+    const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+    handlePaymentDateEdit(sheet, e.range, tz);
+    return;
+  }
 
   if (row < 12) return;
   const lastR = sheet.getLastRow();
@@ -2558,11 +2827,41 @@ function updateLiveDashboard(options) {
   renderMonthlyHistoryForecastSheet(ss, tz, ledger);
 }
 
+function recordActiveBillPaymentPrompt() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+  const reconSheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+  if (!reconSheet) {
+    SpreadsheetApp.getUi().alert("Active Bill & Reconciliation sheet not found.");
+    return;
+  }
+
+  const todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+  const currentVal = reconSheet.getRange(6, 8).getValue();
+  const defaultVal = currentVal ? (currentVal instanceof Date ? Utilities.formatDate(currentVal, tz, "yyyy-MM-dd") : String(currentVal)) : todayStr;
+
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt(
+    "Verify & Record Bill Payment",
+    `Enter the payment date for this cycle (${defaultVal}):\n(Leave blank to clear/un-pay)`,
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (resp.getSelectedButton() === ui.Button.OK) {
+    const text = resp.getResponseText().trim();
+    const cellRange = reconSheet.getRange(6, 8);
+    cellRange.setValue(text);
+    handlePaymentDateEdit(reconSheet, cellRange, tz);
+  }
+}
+
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("💳 NBE Tracker")
-    .addItem("💳 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
+    .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
     .addItem("📥 Process New Bank Statements from Drive", "manualProcessStatements")
+    .addSeparator()
+    .addItem("✅ Verify & Record Bill Payment...", "recordActiveBillPaymentPrompt")
     .addToUi();
 }
 
