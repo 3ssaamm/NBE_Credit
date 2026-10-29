@@ -2069,6 +2069,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange("F5:H5").merge().setValue(badgeFormula).setFontWeight("bold").setFontSize(9);
 
   // Payment Verification & Status (Row 6 & Row 7, Cols G-H)
+  const reconStore = (recon && recon.reconStore) ? recon.reconStore : loadAllReconStore(ss, tz);
   const cycleRecord = (reconStore.paymentRecords && reconStore.paymentRecords[ledger.activeCycleKey]) || null;
   const paymentDateVal = (cycleRecord && cycleRecord.dateStr) ? cycleRecord.dateStr : "";
   const isPaid = !!paymentDateVal;
