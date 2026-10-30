@@ -153,3 +153,4 @@ console.assert(syncedPending.find(r => r.rowNum === 2).paymentsMade === 9, "Kett
 console.assert(syncedPending.find(r => r.rowNum === 19).paymentsMade === 8, "Dad's Phone should be 8 when pending!");
 console.assert(syncedPending.find(r => r.rowNum === 33).paymentsMade === 0, "Fan should be 0 when pending!");
 console.log("Pending state assertions passed!");
+
