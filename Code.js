@@ -2518,18 +2518,13 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
   const endShareRow = startShareRow + numPayers - 1;
   const totShareRow = endShareRow + 1;
 
-  const numExceptions = (recon.stmtFees ? recon.stmtFees.length : 0) +
-                        (recon.stmtCredits ? recon.stmtCredits.length : 0) +
-                        (recon.missingInSheet ? recon.missingInSheet.length : 0);
-  const startExRow = totShareRow + 5;
-  const endExRow = startExRow + Math.max(1, numExceptions) - 1;
-
   // 5. KPI Summary Ribbon (Rows 5 & 6)
+  // Cards directly sum the tables below them to ensure 100% mathematical consistency!
   const kpiCards = [
-    { title: "Net Total Owed", headerRange: "A5:C5", valRange: "A6:C6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$H$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$H$${startShareRow}:$H$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
-    { title: "Direct Purchases", headerRange: "D5:F5", valRange: "D6:F6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$C$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$C$${startShareRow}:$C$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
-    { title: "Monthly Installments", headerRange: "H5:J5", valRange: "H6:J6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$D$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$D$${startShareRow}:$D$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
-    { title: "Bank Fees & Taxes", headerRange: "K5:M5", valRange: "K6:M6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${totShareRow} + '${CONFIG.SHEETS.ACTIVE_RECON}'!$F$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${startShareRow}:$E$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*") + SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$F$${startShareRow}:$F$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Net Total Owed", headerRange: "A5:C5", valRange: "A6:C6", formula: `=D6 + H6 + K6 - N6` },
+    { title: "Direct Purchases", headerRange: "D5:F5", valRange: "D6:F6", formula: `=IFERROR(SUM(D10:D), 0)` },
+    { title: "Monthly Installments", headerRange: "H5:J5", valRange: "H6:J6", formula: `=IFERROR(SUM(M10:M), 0)` },
+    { title: "Bank Fees & Taxes", headerRange: "K5:M5", valRange: "K6:M6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${startShareRow}:$E$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
     { title: "Credits & Refunds", headerRange: "N5:P5", valRange: "N6:P6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${startShareRow}:$G$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` }
   ];
 
@@ -2554,48 +2549,34 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
       .setNumberFormat("#,##0.00 \"EGP\"");
   });
 
-  // 6. Section 1 (Left Top): Bank Fees, Adjustments & Credits (Rows 8-12)
+  // 6. Informative Note Strip (Row 7)
+  const noteFormula = `="ℹ️ " & IF(K6>0, "Bank Fee (" & TEXT(K6, "#,##0.00") & " EGP) assigned to primary cardholder. ", "No bank fees or taxes on this member. ") & IF(N6>0, "Refund credit (" & TEXT(N6, "#,##0.00") & " EGP) applied.", "")`;
+  sheet.getRange("A7:P7").merge()
+    .setFormula(noteFormula)
+    .setFontSize(8)
+    .setFontStyle("italic")
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED)
+    .setBackground("#f9fbe7");
+
+  // 7. Parallel Table 1 (Left, Cols A-F): Direct Purchases & Card Expenses (Starts Row 8, Spills Row 10+)
   sheet.getRange("A8:F8").merge()
-    .setValue("🏦 Bank Fees, Taxes & Adjustments (Active Cycle)")
-    .setFontWeight("bold")
-    .setFontSize(10)
-    .setBackground(CONFIG.COLORS.HEADER);
-
-  const feeHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Category", "Custom Note"];
-  sheet.getRange(9, 1, 1, feeHeaders.length).setValues([feeHeaders])
-    .setFontWeight("bold")
-    .setFontSize(9)
-    .setBackground(CONFIG.COLORS.HEADER);
-
-  let feeSpillFormula;
-  if (numExceptions > 0) {
-    feeSpillFormula = `=IFERROR(FILTER({'${CONFIG.SHEETS.ACTIVE_RECON}'!$A$${startExRow}:$E$${endExRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${startExRow}:$G$${endExRow}}, (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), '${CONFIG.SHEETS.ACTIVE_RECON}'!$F$${startExRow}:$F$${endExRow})))) * ('${CONFIG.SHEETS.ACTIVE_RECON}'!$A$${startExRow}:$A$${endExRow}<>"")), {"—", "—", "No extra bank fees or adjustments assigned", 0, "—", "—"})`;
-  } else {
-    feeSpillFormula = `={"—", "—", "No bank fees or adjustments for this cycle", 0, "—", "—"}`;
-  }
-  sheet.getRange("A10").setFormula(feeSpillFormula).setFontSize(9);
-  sheet.getRange("D10:D12").setNumberFormat("#,##0.00");
-  sheet.getRange("B10:B12").setNumberFormat("yyyy-MM-dd");
-
-  // 7. Section 2 (Left Bottom): Direct Purchases & Card Expenses (Row 14+)
-  sheet.getRange("A14:F14").merge()
     .setValue("🛍️ Direct Purchases & Card Expenses (Active Cycle)")
     .setFontWeight("bold")
     .setFontSize(10)
     .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
 
   const purchHeaders = ["#", "Tx Date", "Merchant / Description", "Amount (EGP)", "Assigned Payer", "Status"];
-  sheet.getRange(15, 1, 1, purchHeaders.length).setValues([purchHeaders])
+  sheet.getRange(9, 1, 1, purchHeaders.length).setValues([purchHeaders])
     .setFontWeight("bold")
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
 
   const purchSpillFormula = `=IFERROR(FILTER({'${CONFIG.SHEETS.TRANSACTIONS}'!$A$2:$A, '${CONFIG.SHEETS.TRANSACTIONS}'!$B$2:$B, '${CONFIG.SHEETS.TRANSACTIONS}'!$C$2:$C, '${CONFIG.SHEETS.TRANSACTIONS}'!$E$2:$E, '${CONFIG.SHEETS.TRANSACTIONS}'!$D$2:$D, IF('${CONFIG.SHEETS.TRANSACTIONS}'!$A$2:$A<>"","✅ Recorded","")}, ('${CONFIG.SHEETS.TRANSACTIONS}'!$A$2:$A<>"") * ('${CONFIG.SHEETS.TRANSACTIONS}'!$E$2:$E>0) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), '${CONFIG.SHEETS.TRANSACTIONS}'!$D$2:$D)))) * ('${CONFIG.SHEETS.TRANSACTIONS}'!$B$2:$B>=$Z$1) * ('${CONFIG.SHEETS.TRANSACTIONS}'!$B$2:$B<=$Z$2)), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
-  sheet.getRange("A16").setFormula(purchSpillFormula).setFontSize(9);
-  sheet.getRange("D16:D100").setNumberFormat("#,##0.00");
-  sheet.getRange("B16:B100").setNumberFormat("yyyy-MM-dd");
+  sheet.getRange("A10").setFormula(purchSpillFormula).setFontSize(9);
+  sheet.getRange("D10:D150").setNumberFormat("#,##0.00");
+  sheet.getRange("B10:B150").setNumberFormat("yyyy-MM-dd");
 
-  // 8. Section 3 (Right Column): Active Monthly Installments & EMIs (Row 8+)
+  // 8. Parallel Table 2 (Right, Cols H-P): Active Monthly Installments & EMIs (Starts Row 8, Spills Row 10+)
   sheet.getRange("H8:P8").merge()
     .setValue("📅 Active Monthly Installments (Current Month EMIs)")
     .setFontWeight("bold")
@@ -2610,22 +2591,22 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
 
   const instSpillFormula = `=IFERROR(FILTER({'${CONFIG.SHEETS.INSTALLMENTS}'!$A$2:$E, '${CONFIG.SHEETS.INSTALLMENTS}'!$H$2:$K}, ('${CONFIG.SHEETS.INSTALLMENTS}'!$A$2:$A<>"") * ('${CONFIG.SHEETS.INSTALLMENTS}'!$K$2:$K<>"Completed") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), '${CONFIG.SHEETS.INSTALLMENTS}'!$I$2:$I)))) * ('${CONFIG.SHEETS.INSTALLMENTS}'!$B$2:$B<=$Z$2)), {"—", "—", "No active installments for this cycle", 0, 0, 0, "—", 0, "—"})`;
   sheet.getRange("H10").setFormula(instSpillFormula).setFontSize(9);
-  sheet.getRange("K10:K100").setNumberFormat("#,##0.00");
-  sheet.getRange("M10:M100").setNumberFormat("#,##0.00").setFontWeight("bold");
-  sheet.getRange("I10:I100").setNumberFormat("yyyy-MM-dd");
+  sheet.getRange("K10:K150").setNumberFormat("#,##0.00");
+  sheet.getRange("M10:M150").setNumberFormat("#,##0.00").setFontWeight("bold");
+  sheet.getRange("I10:I150").setNumberFormat("yyyy-MM-dd");
 
   // 9. Layout Fitting & Ergonomics
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
     bannerHeight: 30,
-    customRowHeights: { 2: 20, 3: 26, 5: 22, 6: 28, 8: 24, 9: 22, 14: 24, 15: 22 },
+    customRowHeights: { 2: 20, 3: 26, 5: 22, 6: 28, 7: 20, 8: 24, 9: 22 },
     explicitColWidths: {
       1: 45,   // A: #
       2: 100,  // B: Date / Dropdown
       3: 175,  // C: Description
       4: 95,   // D: Amount / Label
       5: 85,   // E: Payer / Cycle
-      6: 85,   // F: Note / Label
+      6: 85,   // F: Status / Label
       7: 25,   // G: Spacer
       8: 45,   // H: #
       9: 95,   // I: Start Date
