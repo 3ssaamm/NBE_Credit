@@ -14,6 +14,7 @@ const CONFIG = {
     BANK_STATEMENT: "Bank Statement",
     ACTIVE_RECON: "Active Bill & Reconciliation",
     HISTORY_FORECAST: "Monthly History & Forecast",
+    MEMBER_BREAKDOWN: "Member Breakdown",
     RECON_STORE: "_Recon_Store"
   },
   COLORS: {
@@ -2441,6 +2442,205 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
 }
 
 // ==========================================
+// 10B. UI: MEMBER BREAKDOWN (INTERACTIVE FILTER)
+// ==========================================
+
+function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
+  const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.MEMBER_BREAKDOWN);
+
+  // Preserve currently selected person if valid
+  let currentSelection = "All Family Members";
+  try {
+    const existingVal = sheet.getRange("B3").getValue();
+    if (existingVal && typeof existingVal === "string" && existingVal.trim()) {
+      currentSelection = existingVal.trim();
+    }
+  } catch (e) { }
+
+  sheet.clear();
+  sheet.setHiddenGridlines(false);
+
+  // 1. Title Banner
+  sheet.getRange("A1:P1").merge()
+    .setValue("💳 NBE Credit Card — Personal Member Expense & Bill Breakdown")
+    .setFontWeight("bold")
+    .setFontSize(13)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff")
+    .setHorizontalAlignment("center");
+
+  sheet.getRange("A2:P2").merge()
+    .setValue("Select any family member below or choose 'All Family Members' to inspect itemized purchases, monthly installment EMIs, and fees.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED)
+    .setHorizontalAlignment("center");
+
+  // 2. Filter & Metadata Bar (Row 3)
+  const uniquePayers = getAllUniquePayers(ss);
+  const payerOptions = ["All Family Members", ...uniquePayers];
+
+  sheet.getRange("A3").setValue("Family Member:").setFontWeight("bold").setFontSize(9).setHorizontalAlignment("right");
+  const filterCell = sheet.getRange("B3:C3").merge();
+  filterCell.setValue(payerOptions.includes(currentSelection) ? currentSelection : "All Family Members")
+    .setFontWeight("bold")
+    .setFontSize(10)
+    .setHorizontalAlignment("center")
+    .setBackground("#fffde7")
+    .setBorder(true, true, true, true, false, false);
+
+  const valRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(payerOptions, true)
+    .setAllowInvalid(true)
+    .build();
+  filterCell.setDataValidation(valRule);
+
+  sheet.getRange("D3").setValue("Billing Cycle:").setFontWeight("bold").setFontSize(9).setHorizontalAlignment("right");
+  sheet.getRange("E3").setFormula(`='${CONFIG.SHEETS.ACTIVE_RECON}'!B7`).setFontWeight("bold").setFontSize(9).setHorizontalAlignment("center");
+
+  sheet.getRange("F3").setValue("Due Date:").setFontWeight("bold").setFontSize(9).setHorizontalAlignment("right");
+  sheet.getRange("G3:H3").merge().setFormula(`='${CONFIG.SHEETS.ACTIVE_RECON}'!B6`).setFontSize(9).setHorizontalAlignment("center");
+
+  sheet.getRange("I3").setValue("Status:").setFontWeight("bold").setFontSize(9).setHorizontalAlignment("right");
+  sheet.getRange("J3:K3").merge().setFormula(`='${CONFIG.SHEETS.ACTIVE_RECON}'!H7`).setFontWeight("bold").setFontSize(9).setHorizontalAlignment("center");
+
+  // 3. Helper Dates for Period Filtering (Hidden in Col Z)
+  const cardBal = recon.cardBal || calculateCardBalance(ss, tz);
+  const pStart = cardBal.stmtPeriod && cardBal.stmtPeriod.start;
+  const pEnd = cardBal.stmtPeriod && cardBal.stmtPeriod.end;
+  if (pStart) sheet.getRange("Z1").setValue(pStart).setNumberFormat("yyyy-MM-dd");
+  if (pEnd) sheet.getRange("Z2").setValue(pEnd).setNumberFormat("yyyy-MM-dd");
+  try { sheet.hideColumns(26); } catch (e) { }
+
+  // 4. Dynamic Row Indices from Active Bill & Reconciliation
+  const numPayers = ledger.personShares.length;
+  const startShareRow = 12;
+  const endShareRow = startShareRow + numPayers - 1;
+  const totShareRow = endShareRow + 1;
+
+  const numExceptions = (recon.stmtFees ? recon.stmtFees.length : 0) +
+                        (recon.stmtCredits ? recon.stmtCredits.length : 0) +
+                        (recon.missingInSheet ? recon.missingInSheet.length : 0);
+  const startExRow = totShareRow + 5;
+  const endExRow = startExRow + Math.max(1, numExceptions) - 1;
+
+  // 5. KPI Summary Ribbon (Rows 5 & 6)
+  const kpiCards = [
+    { title: "Net Total Owed", headerRange: "A5:C5", valRange: "A6:C6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$H$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$H$${startShareRow}:$H$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Direct Purchases", headerRange: "D5:F5", valRange: "D6:F6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$C$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$C$${startShareRow}:$C$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Monthly Installments", headerRange: "H5:J5", valRange: "H6:J6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$D$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$D$${startShareRow}:$D$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Bank Fees & Taxes", headerRange: "K5:M5", valRange: "K6:M6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${totShareRow} + '${CONFIG.SHEETS.ACTIVE_RECON}'!$F$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${startShareRow}:$E$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*") + SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$F$${startShareRow}:$F$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Credits & Refunds", headerRange: "N5:P5", valRange: "N6:P6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${startShareRow}:$G$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` }
+  ];
+
+  kpiCards.forEach((kpi, idx) => {
+    sheet.getRange(kpi.headerRange).merge()
+      .setValue(kpi.title)
+      .setFontWeight("bold")
+      .setFontSize(9)
+      .setHorizontalAlignment("center")
+      .setBackground(idx === 0 ? CONFIG.COLORS.PRIMARY : CONFIG.COLORS.HEADER)
+      .setFontColor(idx === 0 ? "#ffffff" : "#333333")
+      .setBorder(true, true, false, true, false, false);
+
+    const valCell = sheet.getRange(kpi.valRange).merge();
+    valCell.setFormula(kpi.formula)
+      .setFontWeight("bold")
+      .setFontSize(idx === 0 ? 12 : 10)
+      .setHorizontalAlignment("center")
+      .setBackground(idx === 0 ? CONFIG.COLORS.PRIMARY_LIGHT : "#ffffff")
+      .setFontColor(idx === 0 ? "#1b5e20" : "#333333")
+      .setBorder(false, true, true, true, false, false)
+      .setNumberFormat("#,##0.00 \"EGP\"");
+  });
+
+  // 6. Section 1 (Left Top): Bank Fees, Adjustments & Credits (Rows 8-12)
+  sheet.getRange("A8:F8").merge()
+    .setValue("🏦 Bank Fees, Taxes & Adjustments (Active Cycle)")
+    .setFontWeight("bold")
+    .setFontSize(10)
+    .setBackground(CONFIG.COLORS.HEADER);
+
+  const feeHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Category", "Custom Note"];
+  sheet.getRange(9, 1, 1, feeHeaders.length).setValues([feeHeaders])
+    .setFontWeight("bold")
+    .setFontSize(9)
+    .setBackground(CONFIG.COLORS.HEADER);
+
+  let feeSpillFormula;
+  if (numExceptions > 0) {
+    feeSpillFormula = `=IFERROR(FILTER({'${CONFIG.SHEETS.ACTIVE_RECON}'!$A$${startExRow}:$E$${endExRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${startExRow}:$G$${endExRow}}, (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), '${CONFIG.SHEETS.ACTIVE_RECON}'!$F$${startExRow}:$F$${endExRow})))) * ('${CONFIG.SHEETS.ACTIVE_RECON}'!$A$${startExRow}:$A$${endExRow}<>"")), {"—", "—", "No extra bank fees or adjustments assigned", 0, "—", "—"})`;
+  } else {
+    feeSpillFormula = `={"—", "—", "No bank fees or adjustments for this cycle", 0, "—", "—"}`;
+  }
+  sheet.getRange("A10").setFormula(feeSpillFormula).setFontSize(9);
+  sheet.getRange("D10:D12").setNumberFormat("#,##0.00");
+  sheet.getRange("B10:B12").setNumberFormat("yyyy-MM-dd");
+
+  // 7. Section 2 (Left Bottom): Direct Purchases & Card Expenses (Row 14+)
+  sheet.getRange("A14:F14").merge()
+    .setValue("🛍️ Direct Purchases & Card Expenses (Active Cycle)")
+    .setFontWeight("bold")
+    .setFontSize(10)
+    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
+
+  const purchHeaders = ["#", "Tx Date", "Merchant / Description", "Amount (EGP)", "Assigned Payer", "Status"];
+  sheet.getRange(15, 1, 1, purchHeaders.length).setValues([purchHeaders])
+    .setFontWeight("bold")
+    .setFontSize(9)
+    .setBackground(CONFIG.COLORS.HEADER);
+
+  const purchSpillFormula = `=IFERROR(FILTER({'${CONFIG.SHEETS.TRANSACTIONS}'!$A$2:$A, '${CONFIG.SHEETS.TRANSACTIONS}'!$B$2:$B, '${CONFIG.SHEETS.TRANSACTIONS}'!$C$2:$C, '${CONFIG.SHEETS.TRANSACTIONS}'!$E$2:$E, '${CONFIG.SHEETS.TRANSACTIONS}'!$D$2:$D, IF('${CONFIG.SHEETS.TRANSACTIONS}'!$A$2:$A<>"","✅ Recorded","")}, ('${CONFIG.SHEETS.TRANSACTIONS}'!$A$2:$A<>"") * ('${CONFIG.SHEETS.TRANSACTIONS}'!$E$2:$E>0) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), '${CONFIG.SHEETS.TRANSACTIONS}'!$D$2:$D)))) * ('${CONFIG.SHEETS.TRANSACTIONS}'!$B$2:$B>=$Z$1) * ('${CONFIG.SHEETS.TRANSACTIONS}'!$B$2:$B<=$Z$2)), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
+  sheet.getRange("A16").setFormula(purchSpillFormula).setFontSize(9);
+  sheet.getRange("D16:D100").setNumberFormat("#,##0.00");
+  sheet.getRange("B16:B100").setNumberFormat("yyyy-MM-dd");
+
+  // 8. Section 3 (Right Column): Active Monthly Installments & EMIs (Row 8+)
+  sheet.getRange("H8:P8").merge()
+    .setValue("📅 Active Monthly Installments (Current Month EMIs)")
+    .setFontWeight("bold")
+    .setFontSize(10)
+    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
+
+  const instHeaders = ["#", "Start Date", "Item Description", "Total Price (EGP)", "Months", "Monthly EMI (EGP)", "Payer", "Payments Made", "Status"];
+  sheet.getRange(9, 8, 1, instHeaders.length).setValues([instHeaders])
+    .setFontWeight("bold")
+    .setFontSize(9)
+    .setBackground(CONFIG.COLORS.HEADER);
+
+  const instSpillFormula = `=IFERROR(FILTER({'${CONFIG.SHEETS.INSTALLMENTS}'!$A$2:$E, '${CONFIG.SHEETS.INSTALLMENTS}'!$H$2:$K}, ('${CONFIG.SHEETS.INSTALLMENTS}'!$A$2:$A<>"") * ('${CONFIG.SHEETS.INSTALLMENTS}'!$K$2:$K<>"Completed") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), '${CONFIG.SHEETS.INSTALLMENTS}'!$I$2:$I)))) * ('${CONFIG.SHEETS.INSTALLMENTS}'!$B$2:$B<=$Z$2)), {"—", "—", "No active installments for this cycle", 0, 0, 0, "—", 0, "—"})`;
+  sheet.getRange("H10").setFormula(instSpillFormula).setFontSize(9);
+  sheet.getRange("K10:K100").setNumberFormat("#,##0.00");
+  sheet.getRange("M10:M100").setNumberFormat("#,##0.00").setFontWeight("bold");
+  sheet.getRange("I10:I100").setNumberFormat("yyyy-MM-dd");
+
+  // 9. Layout Fitting & Ergonomics
+  applySheetLayoutFitting(sheet, {
+    bannerRow: 1,
+    bannerHeight: 30,
+    customRowHeights: { 2: 20, 3: 26, 5: 22, 6: 28, 8: 24, 9: 22, 14: 24, 15: 22 },
+    explicitColWidths: {
+      1: 45,   // A: #
+      2: 100,  // B: Date / Dropdown
+      3: 175,  // C: Description
+      4: 95,   // D: Amount / Label
+      5: 85,   // E: Payer / Cycle
+      6: 85,   // F: Note / Label
+      7: 25,   // G: Spacer
+      8: 45,   // H: #
+      9: 95,   // I: Start Date
+      10: 165, // J: Description
+      11: 85,  // K: Total
+      12: 55,  // L: Months
+      13: 95,  // M: EMI
+      14: 75,  // N: Payer
+      15: 65,  // O: Paid
+      16: 80   // P: Status
+    }
+  });
+}
+
+// ==========================================
 // 11. FAST onEdit & WORKFLOW TRIGGERS
 // ==========================================
 
@@ -2809,6 +3009,17 @@ function updateLiveDashboard(options) {
 
   renderActiveReconciliationSheet(ss, tz, ledger, recon);
   renderMonthlyHistoryForecastSheet(ss, tz, ledger);
+  renderMemberBreakdownSheet(ss, tz, ledger, recon);
+}
+
+function navToMemberBreakdown() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let s = ss.getSheetByName(CONFIG.SHEETS.MEMBER_BREAKDOWN);
+  if (!s) {
+    updateLiveDashboard();
+    s = ss.getSheetByName(CONFIG.SHEETS.MEMBER_BREAKDOWN);
+  }
+  if (s) ss.setActiveSheet(s);
 }
 
 function applyPaymentDateNow() {
@@ -2862,6 +3073,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("💳 NBE Tracker")
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
+    .addItem("👥 View Member Breakdown Sheet", "navToMemberBreakdown")
     .addItem("📥 Process New Bank Statements from Drive", "manualProcessStatements")
     .addSeparator()
     .addItem("⚡ Apply Payment Date to Installments Now", "applyPaymentDateNow")
