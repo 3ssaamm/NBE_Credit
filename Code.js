@@ -2509,8 +2509,9 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
 
   // 3. Helper Dates for Period Filtering (Hidden in Col Z)
   const cardBal = recon.cardBal || calculateCardBalance(ss, tz);
-  const pStart = cardBal.stmtPeriod && cardBal.stmtPeriod.start;
-  const pEnd = cardBal.stmtPeriod && cardBal.stmtPeriod.end;
+  const cycleDateRange = getCycleDateRange(cardBal.activeCycleKey, tz);
+  const pStart = cycleDateRange ? cycleDateRange.start : (cardBal.stmtPeriod && cardBal.stmtPeriod.start);
+  const pEnd = cycleDateRange ? cycleDateRange.end : (cardBal.stmtPeriod && cardBal.stmtPeriod.end);
   if (pStart) sheet.getRange("Z1").setValue(pStart).setNumberFormat("yyyy-MM-dd");
   if (pEnd) sheet.getRange("Z2").setValue(pEnd).setNumberFormat("yyyy-MM-dd");
   try { sheet.hideColumns(26); } catch (e) { }
@@ -2522,20 +2523,21 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
   const totShareRow = endShareRow + 1;
 
   // 5. KPI Summary Ribbon (Rows 5 & 6)
-  // Cards directly sum the tables below them to ensure 100% mathematical consistency!
+  // Perfectly mirrors Table 1 of Active Bill & Reconciliation so Net Total Owed ALWAYS equals the actual payment!
   const kpiCards = [
-    { title: "Net Total Owed", headerRange: "A5:C5", valRange: "A6:C6", formula: `=D6 + H6 + K6 - N6` },
-    { title: "Direct Purchases", headerRange: "D5:F5", valRange: "D6:F6", formula: `=IFERROR(SUM(D10:D), 0)` },
-    { title: "Monthly Installments", headerRange: "H5:J5", valRange: "H6:J6", formula: `=IFERROR(SUM(M10:M), 0)` },
-    { title: "Bank Fees & Taxes", headerRange: "K5:M5", valRange: "K6:M6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${startShareRow}:$E$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
-    { title: "Credits & Refunds", headerRange: "N5:P5", valRange: "N6:P6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${startShareRow}:$G$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` }
+    { title: "Net Total Owed", headerRange: "A5:C5", valRange: "A6:C6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$H$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$H$${startShareRow}:$H$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Direct Purchases", headerRange: "D5:F5", valRange: "D6:F6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$C$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$C$${startShareRow}:$C$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Monthly Installments", headerRange: "G5:I5", valRange: "G6:I6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$D$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$D$${startShareRow}:$D$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Unrecorded Statement Items", headerRange: "J5:L5", valRange: "J6:L6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$F$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$F$${startShareRow}:$F$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Bank Fees & Taxes", headerRange: "M5:N5", valRange: "M6:N6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$E$${startShareRow}:$E$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` },
+    { title: "Credits & Refunds", headerRange: "O5:P5", valRange: "O6:P6", formula: `=IF($B$3="All Family Members", '${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${totShareRow}, IFERROR(SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$G$${startShareRow}:$G$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($B$3) & "*"), 0))` }
   ];
 
   kpiCards.forEach((kpi, idx) => {
     sheet.getRange(kpi.headerRange).merge()
       .setValue(kpi.title)
       .setFontWeight("bold")
-      .setFontSize(9)
+      .setFontSize(8)
       .setHorizontalAlignment("center")
       .setBackground(idx === 0 ? CONFIG.COLORS.PRIMARY : CONFIG.COLORS.HEADER)
       .setFontColor(idx === 0 ? "#ffffff" : "#333333")
@@ -2553,7 +2555,7 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
   });
 
   // 6. Informative Note Strip (Row 7)
-  const noteFormula = `="ℹ️ " & IF(K6>0, "Bank Fee (" & TEXT(K6, "#,##0.00") & " EGP) assigned to primary cardholder. ", "No bank fees or taxes on this member. ") & IF(N6>0, "Refund credit (" & TEXT(N6, "#,##0.00") & " EGP) applied.", "")`;
+  const noteFormula = `="ℹ️ Active Bill Breakdown: Purchases (" & TEXT(D6, "#,##0.00") & ") + Installments (" & TEXT(G6, "#,##0.00") & ")" & IF(J6>0, " + Unrecorded Purchases (" & TEXT(J6, "#,##0.00") & ")", "") & IF(M6>0, " + Bank Fees (" & TEXT(M6, "#,##0.00") & ")", "") & IF(O6>0, " - Refunds (" & TEXT(O6, "#,##0.00") & ")", "") & " = Net Total Due: " & TEXT(A6, "#,##0.00") & " EGP"`;
   sheet.getRange("A7:P7").merge()
     .setFormula(noteFormula)
     .setFontSize(8)
