@@ -71,6 +71,7 @@ class MockRange {
   getRow() { return this.r; }
   getColumn() { return this.c; }
   getLastRow() { return this.r + this.nr - 1; }
+  getNumRows() { return this.nr; }
   getNumColumns() { return this.nc; }
   getValue() { return this.sheet._getCell(this.r, this.c); }
   getValues() {
@@ -512,4 +513,241 @@ sandbox.syncInstallmentsFromStatement(ss, tz, false);
 assert.strictEqual(instSheet._getCell(2, 10), 9, "Hard drive (10 of 12, unpaid) should sync to 9 payments made");
 
 console.log("  PASS: Table 3+4 coexistence, 3-way rounding, clearing override, and syncInstallments verified!");
+
+// ==========================================
+// Test 5: Multi-Date NUTOPIA Persistence, Legacy _#k Recovery & Same-Date Isolation
+// ==========================================
+console.log("Running Test 5: Multi-Date NUTOPIA Persistence, Legacy _#k Recovery & Same-Date Isolation...");
+
+const ss5 = new MockSpreadsheet();
+sandbox.SpreadsheetApp.getActiveSpreadsheet = () => ss5;
+
+const stmt5 = ss5.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
+stmt5.getRange(2, 1, 3, 6).setValues([
+  ["Statement Date:", new Date(2026, 9, 30, 12, 0, 0), "Due Date:", new Date(2026, 10, 25, 12, 0, 0), "Credit Limit:", 100000],
+  ["Opening Balance:", 0, "Closing Balance:", 3200.00, "Total Debit:", 3209.27],
+  ["Total Credit:", 9.27, "Card Number:", "1234", "Net:", 3200.00]
+]);
+stmt5.getRange(7, 1, 12, 7).setValues([
+  [1, new Date(2026, 9, 28, 12, 0, 0), new Date(2026, 9, 28, 12, 0, 0), "NUTOPIA-SUTHERLAND ALEX. -02G", "DEBIT", 40.00, ""],
+  [2, new Date(2026, 9, 24, 12, 0, 0), new Date(2026, 9, 24, 12, 0, 0), "NUTOPIA-SUTHERLAND ALEX. -02G", "DEBIT", 40.00, ""],
+  [3, new Date(2026, 9, 21, 12, 0, 0), new Date(2026, 9, 21, 12, 0, 0), "NUTOPIA-SUTHERLAND ALEX. -02G", "DEBIT", 40.00, ""],
+  [4, new Date(2026, 9, 28, 12, 0, 0), new Date(2026, 9, 28, 12, 0, 0), "NUTOPIA-SUTHERLAND ALEX. -02G", "DEBIT", 80.00, ""],
+  [5, new Date(2026, 9, 12, 12, 0, 0), new Date(2026, 9, 12, 12, 0, 0), "NUTOPIA-SUTHERLAND ALEX. -02G", "DEBIT", 80.00, ""],
+  [6, new Date(2026, 9, 22, 12, 0, 0), new Date(2026, 9, 22, 12, 0, 0), "NUTOPIA-SUTHERLAND ALEX. -02G", "DEBIT", 85.00, ""],
+  [7, new Date(2026, 9, 20, 12, 0, 0), new Date(2026, 9, 20, 12, 0, 0), "NUTOPIA-SUTHERLAND ALEX. -02G", "DEBIT", 85.00, ""],
+  [8, new Date(2026, 9, 23, 12, 0, 0), new Date(2026, 9, 23, 12, 0, 0), "Google One 650-2530000 USACA", "DEBIT", 179.99, ""],
+  [9, new Date(2026, 9, 23, 12, 0, 0), new Date(2026, 9, 23, 12, 0, 0), "Google One 650-2530000 USACA", "DEBIT", 179.99, ""],
+  [10, new Date(2026, 9, 12, 12, 0, 0), new Date(2026, 9, 12, 12, 0, 0), "MICROSOFT*MICROSOFT 365 BMSE", "CREDIT", 9.00, ""],
+  [11, new Date(2026, 9, 12, 12, 0, 0), new Date(2026, 9, 12, 12, 0, 0), "DCC Markup Refund-MICROSO*MICR", "CREDIT", 0.27, ""],
+  [12, new Date(2026, 9, 3, 12, 0, 0), new Date(2026, 9, 3, 12, 0, 0), "FAWRY*THE H CAF", "DEBIT", 2316.00, ""]
+]);
+
+const tx5 = ss5.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
+tx5.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
+tx5.getRange(2, 1, 1, 5).setValues([[307, new Date(2026, 9, 3, 0, 0, 0), "Fawry", "Mido", 2316.00]]);
+
+// Pre-seed _Recon_Store with legacy _#2/_#3 entries caused by date-agnostic occ counting,
+// plus a same-date occ=2 entry for Google One (leaving occ=1 unassigned).
+const store5 = sandbox.getReconStoreSheet(ss5);
+store5.getRange(2, 1, 5, 10).setValues([
+  ["TABLE2_ASSIGNMENT", "2026-10-24_40.00_nutopia-sutherland alex. -02g_#2", "2026-10-24", "NUTOPIA-SUTHERLAND ALEX. -02G", 40.00, "Mai", "nutopia", false, false, "2026-11-17"],
+  ["TABLE2_ASSIGNMENT", "2026-10-21_40.00_nutopia-sutherland alex. -02g_#3", "2026-10-21", "NUTOPIA-SUTHERLAND ALEX. -02G", 40.00, "Mai", "nutopia", false, false, "2026-11-17"],
+  ["TABLE2_ASSIGNMENT", "2026-10-12_80.00_nutopia-sutherland alex. -02g_#2", "2026-10-12", "NUTOPIA-SUTHERLAND ALEX. -02G", 80.00, "Mai", "nutopia", false, false, "2026-11-17"],
+  ["TABLE2_ASSIGNMENT", "2026-10-20_85.00_nutopia-sutherland alex. -02g_#2", "2026-10-20", "NUTOPIA-SUTHERLAND ALEX. -02G", 85.00, "Mai", "nutopia", false, false, "2026-11-17"],
+  ["TABLE2_ASSIGNMENT", "2026-10-23_179.99_google one 650-2530000 usaca_#2", "2026-10-23", "Google One 650-2530000 USACA", 179.99, "Muhanad", "google one", false, false, "2026-11-17"]
+]);
+
+sandbox.updateLiveDashboard();
+const reconSheet5 = ss5.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+
+function readTable2Rows(sheet) {
+  const rows = [];
+  for (let r = 12; r <= sheet.getLastRow(); r++) {
+    const id = String(sheet._getCell(r, 1) || "");
+    if (/^[FCM]-\d+/i.test(id)) {
+      rows.push({
+        row: r,
+        id,
+        date: sheet._getCell(r, 2),
+        desc: String(sheet._getCell(r, 3) || ""),
+        amount: parseFloat(sheet._getCell(r, 4)) || 0,
+        category: String(sheet._getCell(r, 5) || ""),
+        payer: String(sheet._getCell(r, 6) || "")
+      });
+    }
+  }
+  return rows;
+}
+
+const t2AfterRecovery = readTable2Rows(reconSheet5);
+// FAWRY*THE H CAF (2316.00) must match Fawry (2316.00) via Pass 1 and NOT appear in Table 2
+assert.ok(!t2AfterRecovery.some(r => Math.abs(r.amount - 2316.00) < 0.01), "FAWRY*THE H CAF must match Fawry via Pass 1");
+
+const recoveredNutopia = t2AfterRecovery.filter(r => r.desc.includes("NUTOPIA"));
+assert.strictEqual(recoveredNutopia.length, 7, "All 7 NUTOPIA charges must appear in Table 2");
+// The 4 legacy _#2/_#3 dates (Oct 24, Oct 21, Oct 12, Oct 20) must be recovered automatically as Mai
+["2026-10-24", "2026-10-21", "2026-10-12", "2026-10-20"].forEach(dStr => {
+  const match = recoveredNutopia.find(r => sandbox.makeNormDateStr(r.date, tz) === dStr);
+  assert.ok(match, `Should find NUTOPIA row for ${dStr}`);
+  assert.strictEqual(match.payer, "Mai", `Legacy _#k NUTOPIA row on ${dStr} should auto-recover to Mai`);
+});
+
+// Same-date Google One (2026-10-23): occ=1 must stay blank, occ=2 must stay Muhanad
+const googleRows5 = t2AfterRecovery.filter(r => r.desc.includes("Google One"));
+assert.strictEqual(googleRows5.length, 2);
+assert.strictEqual(googleRows5[0].payer, "", "Google One occ=1 must NOT be clobbered by occ=2");
+assert.strictEqual(googleRows5[1].payer, "Muhanad", "Google One occ=2 must remain Muhanad");
+
+// Now assign Mai to the remaining 3 NUTOPIA rows (Oct 28 40.00, Oct 28 80.00, Oct 22 85.00),
+// assign Mido to the 2 CREDIT rows and Google One occ=1, and verify multi-row range edit + refresh!
+const nutopiaOct28_40 = recoveredNutopia.find(r => sandbox.makeNormDateStr(r.date, tz) === "2026-10-28" && r.amount === 40);
+const nutopiaOct28_80 = recoveredNutopia.find(r => sandbox.makeNormDateStr(r.date, tz) === "2026-10-28" && r.amount === 80);
+const nutopiaOct22_85 = recoveredNutopia.find(r => sandbox.makeNormDateStr(r.date, tz) === "2026-10-22" && r.amount === 85);
+reconSheet5._setCell(nutopiaOct28_40.row, 6, "Mai");
+reconSheet5._setCell(nutopiaOct28_80.row, 6, "Mai");
+reconSheet5._setCell(nutopiaOct22_85.row, 6, "Mai");
+sandbox.handleActiveReconEdit({ range: reconSheet5.getRange(nutopiaOct28_40.row, 6) });
+sandbox.handleActiveReconEdit({ range: reconSheet5.getRange(nutopiaOct28_80.row, 6) });
+sandbox.handleActiveReconEdit({ range: reconSheet5.getRange(nutopiaOct22_85.row, 6) });
+
+// Multi-row paste edit on the two Credit rows (C-1, C-2 -> Mido)
+const creditRows5 = t2AfterRecovery.filter(r => r.category === "Refund / Credit");
+assert.strictEqual(creditRows5.length, 2);
+reconSheet5._setCell(creditRows5[0].row, 6, "Mido");
+reconSheet5._setCell(creditRows5[1].row, 6, "Mido");
+sandbox.handleActiveReconEdit({ range: reconSheet5.getRange(creditRows5[0].row, 6, 2, 1) });
+
+// Assign Google One occ=1 to Mido (leaving occ=2 as Muhanad)
+reconSheet5._setCell(googleRows5[0].row, 6, "Mido");
+sandbox.handleActiveReconEdit({ range: reconSheet5.getRange(googleRows5[0].row, 6) });
+
+// Refresh dashboard and verify NOTHING is cleared!
+sandbox.updateLiveDashboard();
+const t2AfterRefresh = readTable2Rows(reconSheet5);
+const nutopiaFinal = t2AfterRefresh.filter(r => r.desc.includes("NUTOPIA"));
+assert.strictEqual(nutopiaFinal.length, 7);
+assert.ok(nutopiaFinal.every(r => r.payer === "Mai"), "Every single NUTOPIA row across all dates must retain Mai after refresh!");
+
+const googleFinal = t2AfterRefresh.filter(r => r.desc.includes("Google One"));
+assert.strictEqual(googleFinal[0].payer, "Mido", "Google One occ=1 must retain Mido");
+assert.strictEqual(googleFinal[1].payer, "Muhanad", "Google One occ=2 must retain Muhanad");
+
+const creditsFinal = t2AfterRefresh.filter(r => r.category === "Refund / Credit");
+assert.ok(creditsFinal.every(r => r.payer === "Mido"), "Both credit rows from multi-row edit must retain Mido");
+console.log("  PASS: Multi-date NUTOPIA persistence, legacy _#k recovery, and same-date isolation verified!");
+
+// ==========================================
+// Test 6: Member Breakdown Midnight Date Boundary, Installment Parity (1,484.61) & Section 3
+// ==========================================
+console.log("Running Test 6: Member Breakdown Midnight Date Boundary, Installment Parity & Section 3...");
+
+const ss6 = new MockSpreadsheet();
+sandbox.SpreadsheetApp.getActiveSpreadsheet = () => ss6;
+
+const stmt6 = ss6.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
+stmt6.getRange(2, 1, 3, 6).setValues([
+  ["Statement Date:", new Date(2026, 9, 30, 12, 0, 0), "Due Date:", new Date(2026, 10, 25, 12, 0, 0), "Credit Limit:", 100000],
+  ["Opening Balance:", 0, "Closing Balance:", 9000.00, "Total Debit:", 9000.00],
+  ["Total Credit:", 0, "Card Number:", "1234", "Net:", 9000.00]
+]);
+stmt6.getRange(7, 1, 13, 7).setValues([
+  [1, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "KETTLE 10 OF 12", "INSTALLMENT", 123.00, ""],
+  [2, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "HAIR DRYER 10 OF 12", "INSTALLMENT", 45.76, ""],
+  [3, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "HAND WREST 10 OF 12", "INSTALLMENT", 8.33, ""],
+  [4, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "HARD DRIVE 10 OF 12", "INSTALLMENT", 154.39, ""],
+  [5, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "TRIMMER 10 OF 12", "INSTALLMENT", 52.42, ""],
+  [6, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "DEEPFREEZER 10 OF 12", "INSTALLMENT", 1473.00, ""],
+  [7, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "HAND BLENDER 10 OF 12", "INSTALLMENT", 93.67, ""],
+  [8, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "HEADPHONES 7 OF 9", "INSTALLMENT", 194.33, ""],
+  [9, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "MUHANAD'S EARPHONES 5 OF 9", "INSTALLMENT", 222.21, ""],
+  [10, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "CREATINE 3 OF 6", "INSTALLMENT", 252.45, ""],
+  [11, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "POWER BANK 2 OF 6", "INSTALLMENT", 174.07, ""],
+  // Intentional 0.02 statement rounding diff on multi-row Fan (Dad 80 + Mum 84.33 + Mido 84.50 = 248.83 vs stmt 248.81)
+  [12, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "FAN 1 OF 6", "INSTALLMENT", 248.81, ""],
+  [13, new Date(2026, 9, 23, 12, 0, 0), new Date(2026, 9, 23, 12, 0, 0), "Google One 650-2530000 USACA", "DEBIT", 179.99, ""]
+]);
+
+const inst6 = ss6.insertSheet(CONFIG.SHEETS.INSTALLMENTS);
+inst6.getRange(1, 1, 1, 11).setValues([["#", "Start Date", "Description", "Total Price", "Months", "C6", "C7", "EMI", "Payer", "Paid", "Status"]]);
+inst6.getRange(2, 1, 21, 11).setValues([
+  [1, new Date(2025, 10, 7, 12, 0, 0), "Kettle", 738, 12, 0, 0, 61.50, "Mido", 9, "Ongoing"],
+  [2, new Date(2025, 10, 7, 12, 0, 0), "Kettle", 738, 12, 0, 0, 61.50, "Mai", 9, "Ongoing"],
+  [3, new Date(2025, 10, 7, 12, 0, 0), "Hair dryer", 274.50, 12, 0, 0, 22.88, "Mai", 9, "Ongoing"],
+  [4, new Date(2025, 10, 7, 12, 0, 0), "Hair dryer", 274.50, 12, 0, 0, 22.88, "Mido", 9, "Ongoing"],
+  [5, new Date(2025, 10, 7, 12, 0, 0), "Hand Wrest", 100, 12, 0, 0, 8.33, "Mido", 9, "Ongoing"],
+  [6, new Date(2025, 10, 7, 12, 0, 0), "Hard drive", 1852.70, 12, 0, 0, 154.39, "Mido", 9, "Ongoing"],
+  [7, new Date(2025, 10, 7, 12, 0, 0), "Trimmer", 629, 12, 0, 0, 52.42, "Mido", 9, "Ongoing"],
+  [8, new Date(2025, 10, 11, 12, 0, 0), "Deepfreezer", 4800, 12, 0, 0, 400.00, "Dad", 9, "Ongoing"],
+  [9, new Date(2025, 10, 11, 12, 0, 0), "Deepfreezer", 4860, 12, 0, 0, 405.00, "Mum", 9, "Ongoing"],
+  [10, new Date(2025, 10, 11, 12, 0, 0), "Deepfreezer", 4320, 12, 0, 0, 360.00, "Mido", 9, "Ongoing"],
+  [11, new Date(2025, 10, 11, 12, 0, 0), "Deepfreezer", 3696, 12, 0, 0, 308.00, "Mai", 9, "Ongoing"],
+  [12, new Date(2025, 10, 27, 12, 0, 0), "Hand blender", 396, 12, 0, 0, 33.00, "Mai", 9, "Ongoing"],
+  [13, new Date(2025, 10, 27, 12, 0, 0), "Hand blender", 180, 12, 0, 0, 15.00, "Mum", 9, "Ongoing"],
+  [14, new Date(2025, 10, 27, 12, 0, 0), "Hand blender", 548, 12, 0, 0, 45.67, "Mido", 9, "Ongoing"],
+  [15, new Date(2026, 1, 3, 12, 0, 0), "Headphones", 1748.97, 9, 0, 0, 194.33, "Mido", 6, "Ongoing"],
+  [16, new Date(2026, 3, 18, 12, 0, 0), "Muhanad's Earphones", 666.67, 9, 0, 0, 74.07, "Mido", 4, "Ongoing"],
+  [17, new Date(2026, 3, 18, 12, 0, 0), "Muhanad's Earphones", 666.67, 9, 0, 0, 74.07, "Mai", 4, "Ongoing"],
+  [18, new Date(2026, 3, 18, 12, 0, 0), "Muhanad's Earphones", 666.67, 9, 0, 0, 74.07, "Mum", 4, "Ongoing"],
+  [19, new Date(2026, 5, 26, 12, 0, 0), "Creatine", 1514.70, 6, 0, 0, 252.45, "Mido", 2, "Ongoing"],
+  [20, new Date(2026, 6, 18, 12, 0, 0), "Power bank", 1044.44, 6, 0, 0, 174.07, "Mido", 1, "Ongoing"],
+  [21, new Date(2026, 7, 28, 12, 0, 0), "Fan", 507, 6, 0, 0, 84.50, "Mido", 0, "Ongoing"]
+]);
+inst6.getRange(23, 1, 2, 11).setValues([
+  [22, new Date(2026, 7, 28, 12, 0, 0), "Fan", 480, 6, 0, 0, 80.00, "Dad", 0, "Ongoing"],
+  [23, new Date(2026, 7, 28, 12, 0, 0), "Fan", 506, 6, 0, 0, 84.33, "Mum", 0, "Ongoing"]
+]);
+
+// Transactions including 2026-09-30 stored at 00:00:00 midnight (1,320.00 EGP) + Oct purchases (5,625.89 EGP) = 6,945.89 EGP
+const tx6 = ss6.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
+tx6.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
+tx6.getRange(2, 1, 10, 5).setValues([
+  [302, new Date(2026, 8, 30, 0, 0, 0), "Sep 30 Rollover", "Mido", 1320.00],
+  [304, new Date(2026, 9, 2, 0, 0, 0), "Basilico", "Mido", 1447.80],
+  [305, new Date(2026, 9, 3, 0, 0, 0), "Wave", "Mido", 570.00],
+  [307, new Date(2026, 9, 3, 0, 0, 0), "Fawry", "Mido", 2316.00],
+  [309, new Date(2026, 9, 6, 0, 0, 0), "Mosaab", "Mido", 80.00],
+  [310, new Date(2026, 9, 8, 0, 0, 0), "Amazon", "Mido", 333.10],
+  [320, new Date(2026, 9, 14, 0, 0, 0), "We Internet", "Mido", 367.00],
+  [328, new Date(2026, 9, 23, 0, 0, 0), "Amazon", "Mido", 164.99],
+  [330, new Date(2026, 9, 29, 0, 0, 0), "ElAbd", "Mido", 250.00],
+  [332, new Date(2026, 9, 20, 0, 0, 0), "Via caffe", "Mido", 97.00]
+]);
+
+const recon6 = sandbox.reconcileActiveStatement(ss6, tz);
+const ledger6 = sandbox.buildDebtLedger(ss6, tz, recon6);
+const midoShare6 = ledger6.personShares.find(ps => ps.person === "Mido");
+assert.strictEqual(Number(midoShare6.purchases.toFixed(2)), 6945.89, `Mido purchases must equal 6945.89, got ${midoShare6.purchases}`);
+assert.strictEqual(Number(midoShare6.installments.toFixed(2)), 1484.61, `Mido installments must equal exact 1484.61 without multi-row residual subtraction, got ${midoShare6.installments}`);
+
+const cycleRange6 = sandbox.getCycleDateRange("2026-11", tz);
+const midnightSep30 = new Date(2026, 8, 30, 0, 0, 0);
+assert.ok(midnightSep30 >= cycleRange6.start && midnightSep30 <= cycleRange6.end, "Sep 30 00:00:00 midnight must fall inside Nov 2026 cycle date range!");
+
+sandbox.updateLiveDashboard();
+const mbSheet6 = ss6.getSheetByName(CONFIG.SHEETS.MEMBER_BREAKDOWN);
+assert.strictEqual(mbSheet6._getCell(1, 26), "=DATE(2026,9,30)", "Z1 must be midnight DATE(2026,9,30)");
+assert.strictEqual(mbSheet6._getCell(2, 26), "=DATE(2026,10,30)", "Z2 must be midnight DATE(2026,10,30)");
+
+const purchFormula6 = String(mbSheet6._getCell(10, 1) || "");
+assert.ok(purchFormula6.includes("ARRAYFORMULA(") && purchFormula6.includes("<($Z$2+1)"), "Purchases spill must use ARRAYFORMULA and <($Z$2+1)");
+
+const instFormula6 = String(mbSheet6._getCell(10, 8) || "");
+assert.ok(instFormula6.includes("MAP(") && instFormula6.includes("LAMBDA(") && instFormula6.includes("COUNTIFS("), "Installments spill must use MAP + LAMBDA + scalar COUNTIFS");
+
+// Verify Section 3 header and spill formula exist in Col H below Installments
+let sec3BannerRow = -1;
+for (let r = 12; r <= mbSheet6.getLastRow(); r++) {
+  const val = String(mbSheet6._getCell(r, 8) || "");
+  if (val.includes("Assigned Statement Items")) {
+    sec3BannerRow = r;
+    break;
+  }
+}
+assert.ok(sec3BannerRow >= 27, `Section 3 banner should be placed safely below Installments, found at row ${sec3BannerRow}`);
+assert.strictEqual(mbSheet6._getCell(sec3BannerRow + 1, 13), "Amount (EGP)", "Section 3 Col M must align Amount (EGP)");
+const sec3Formula = String(mbSheet6._getCell(sec3BannerRow + 2, 8) || "");
+assert.ok(sec3Formula.includes("FILTER(ARRAYFORMULA(") && sec3Formula.includes("Active Bill & Reconciliation"), "Section 3 spill must filter Table 2 from Active Bill & Reconciliation");
+
+console.log("  PASS: Member Breakdown midnight date boundary, installment parity (1,484.61), and Section 3 verified!");
 console.log("ALL TABLE 4 INSTALLMENT TESTS PASSED!");

@@ -143,8 +143,12 @@ function cleanMerchantName(str) {
 }
 
 function hasMerchantKeywordOverlap(desc1, desc2) {
+  const raw1 = String(desc1 || "").toLowerCase();
+  const raw2 = String(desc2 || "").toLowerCase();
   const c1 = cleanMerchantName(desc1);
   const c2 = cleanMerchantName(desc2);
+  const full1 = raw1 + " " + c1;
+  const full2 = raw2 + " " + c2;
 
   const aliases = [
     { key: "internet", terms: ["internet", "we-fbb", "we-mobile", "vodafone", "telecom", "we"] },
@@ -163,12 +167,19 @@ function hasMerchantKeywordOverlap(desc1, desc2) {
     { key: "shein", terms: ["shein"] },
     { key: "google", terms: ["google"] },
     { key: "microsoft", terms: ["microsoft"] },
-    { key: "nutopia", terms: ["nutopia", "sutherland"] }
+    { key: "nutopia", terms: ["nutopia", "sutherland"] },
+    { key: "fawry", terms: ["fawry"] },
+    { key: "paymob", terms: ["paymob"] },
+    { key: "geidea", terms: ["geidea"] },
+    { key: "basata", terms: ["basata"] },
+    { key: "elabd", terms: ["elabd", "el abd"] },
+    { key: "viacaffe", terms: ["via caffe", "viacaffe", "caffe"] },
+    { key: "wave", terms: ["wave"] }
   ];
 
   for (const a of aliases) {
-    const has1 = a.terms.some(t => c1.includes(t));
-    const has2 = a.terms.some(t => c2.includes(t));
+    const has1 = a.terms.some(t => full1.includes(t));
+    const has2 = a.terms.some(t => full2.includes(t));
     if (has1 && has2) return true;
   }
 
@@ -501,8 +512,8 @@ function getCycleDateRange(cycleSortKey, tz) {
     const d = new Date(anchor.getTime() + offset * 86400000);
     const info = getBillingCycleForPurchase(d, tz);
     if (info && info.cycleSortKey === cycleSortKey) {
-      if (!start) start = new Date(d);
-      end = new Date(d);
+      if (!start) start = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+      end = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
     }
   }
 
@@ -578,6 +589,7 @@ function makeReconKey(dateVal, amountVal, descVal, tz, occurrenceIndex) {
 function loadAllReconStore(ss, tz) {
   const store = {
     table2Map: {},
+    table2ByBaseKey: {},
     table2List: [],
     confirmedMatches: new Set(),
     neglectedTx: new Set(),
@@ -630,6 +642,11 @@ function loadAllReconStore(ss, tz) {
               isNeglected: isNeg
             };
             store.table2Map[pKey] = rec;
+            const strippedBaseKey = pKey.replace(/_#\d+$/, "");
+            if (strippedBaseKey) {
+              if (!store.table2ByBaseKey[strippedBaseKey]) store.table2ByBaseKey[strippedBaseKey] = [];
+              store.table2ByBaseKey[strippedBaseKey].push(rec);
+            }
             const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(desc).substring(0, 30)}`;
             if (!store.table2Map[amtDescKey]) store.table2Map[amtDescKey] = rec;
             store.table2List.push(rec);
@@ -813,35 +830,48 @@ function matchStatementInstallments(statementInstallments, sheetInstallmentRows)
     return aComp - bComp;
   });
 
-  statementInstallments.forEach((st, sIdx) => {
-    const cand = orderedSheetRows.find(sh => {
-      if (matchedSheet.has(sh.index)) return false;
-      if (Math.abs(st.amount - sh.emi) > 0.50) return false;
-      if (st.instTotal && sh.duration && Math.abs(st.instTotal - sh.duration) > 1) return false;
-      return true;
-    });
-
-    if (cand) {
-      matchedStmt.add(sIdx);
-      matchedSheet.add(cand.index);
-      results.push({
-        stmtIdx: sIdx,
-        stmt: st,
-        sheetRows: [cand],
-        payerLabel: cand.payer,
-        type: "1-to-1"
-      });
-    }
-  });
-
   const descGroups = {};
   orderedSheetRows.forEach(sh => {
-    if (matchedSheet.has(sh.index)) return;
     const key = (sh.desc || "").toLowerCase().trim() + "_" + (sh.duration || 0);
     if (!descGroups[key]) descGroups[key] = [];
     descGroups[key].push(sh);
   });
 
+  function runOneToOnePass(strictGroupGuard) {
+    statementInstallments.forEach((st, sIdx) => {
+      if (matchedStmt.has(sIdx)) return;
+      const cand = orderedSheetRows.find(sh => {
+        if (matchedSheet.has(sh.index)) return false;
+        if (Math.abs(st.amount - sh.emi) > 0.50) return false;
+        if (st.instTotal && sh.duration && Math.abs(st.instTotal - sh.duration) > 1) return false;
+        if (strictGroupGuard) {
+          const key = (sh.desc || "").toLowerCase().trim() + "_" + (sh.duration || 0);
+          const groupLen = descGroups[key] ? descGroups[key].length : 1;
+          const isExactAmt = Math.abs(st.amount - sh.emi) <= 0.05;
+          const isDescMatch = hasMerchantKeywordOverlap(st.desc, sh.desc);
+          if (groupLen > 1 && !isExactAmt && !isDescMatch) return false;
+        }
+        return true;
+      });
+
+      if (cand) {
+        matchedStmt.add(sIdx);
+        matchedSheet.add(cand.index);
+        results.push({
+          stmtIdx: sIdx,
+          stmt: st,
+          sheetRows: [cand],
+          payerLabel: cand.payer,
+          type: "1-to-1"
+        });
+      }
+    });
+  }
+
+  // Pass 1a: 1-to-1 matches that do not steal rows from multi-row split groups unless exact EMI or desc overlaps
+  runOneToOnePass(true);
+
+  // Pass 2: Multi-row split groups with identical description & duration
   statementInstallments.forEach((st, sIdx) => {
     if (matchedStmt.has(sIdx)) return;
     for (const key in descGroups) {
@@ -867,6 +897,10 @@ function matchStatementInstallments(statementInstallments, sheetInstallmentRows)
     }
   });
 
+  // Pass 3: Fallback 1-to-1 within 0.50 for any remaining unmatched items
+  runOneToOnePass(false);
+
+  // Pass 4: Subset combination split matching across remaining rows
   statementInstallments.forEach((st, sIdx) => {
     if (matchedStmt.has(sIdx)) return;
     const available = orderedSheetRows.filter(sh => {
@@ -1702,8 +1736,9 @@ function reconcileActiveStatement(ss, tz) {
       const progressStr = (m.stmt.instCurrent && m.stmt.instTotal)
         ? `${m.stmt.instCurrent} of ${m.stmt.instTotal}`
         : (sh.duration ? `${sh.paymentsMade + 1} of ${sh.duration}` : "Active");
+      const rowEntries = [];
       targetPayers.forEach(p => {
-        entries.push({
+        rowEntries.push({
           date: m.stmt.date || sh.startDate || m.stmt.dateStr || "",
           desc: `${sh.desc} (${progressStr})`,
           rawEmi: shareEmi,
@@ -1714,13 +1749,24 @@ function reconcileActiveStatement(ss, tz) {
           defaultNote: `Matched Stmt: ${m.stmt.desc}`
         });
       });
+
+      if (targetPayers.length > 1 && rowEntries.length > 0) {
+        const rowRoundedSum = rowEntries.reduce((s, e) => s + e.amount, 0);
+        const rowResidual = Number((Number(sh.emi.toFixed(2)) - rowRoundedSum).toFixed(2));
+        if (Math.abs(rowResidual) >= 0.01) {
+          const lastRowEntry = rowEntries[rowEntries.length - 1];
+          lastRowEntry.amount = Number((lastRowEntry.amount + rowResidual).toFixed(2));
+        }
+      }
+
+      rowEntries.forEach(e => entries.push(e));
     });
 
     if (entries.length > 0) {
       const rawSum = entries.reduce((s, e) => s + e.rawEmi, 0);
       const roundedSum = entries.reduce((s, e) => s + e.amount, 0);
       const roundingResidual = Number((m.stmt.amount - roundedSum).toFixed(2));
-      if (Math.abs(roundingResidual) >= 0.01) {
+      if (m.sheetRows.length === 1 && Math.abs(roundingResidual) >= 0.01) {
         const last = entries[entries.length - 1];
         last.amount = Number((last.amount + roundingResidual).toFixed(2));
       }
@@ -1768,9 +1814,9 @@ function reconcileActiveStatement(ss, tz) {
     const pKey = makeReconKey(st.date || st.dateStr, st.amount, st.desc, tz);
     const amtDescKey = `${st.amount.toFixed(2)}_${makeNormDesc(st.desc).substring(0, 20)}`;
     if (reconStore.confirmedMatches.has(pKey) || reconStore.confirmedMatches.has(amtDescKey)) {
-      st.matched = true;
       const match = txDebits.find(tx => !tx.matched && Math.abs(tx.amount - st.amount) <= 0.05);
       if (match) {
+        st.matched = true;
         match.matched = true;
         st.assignedPayer = match.person;
       }
@@ -1780,7 +1826,7 @@ function reconcileActiveStatement(ss, tz) {
   // Pass 1: Strict Match (Amount within 0.05, Date within 3 days, Keyword Overlap)
   stmtDebits.forEach(st => {
     if (st.matched) return;
-    const match = txDebits.find(tx => {
+    const candidates = txDebits.filter(tx => {
       if (tx.matched) return false;
       if (Math.abs(tx.amount - st.amount) > 0.05) return false;
       if (st.date && tx.date) {
@@ -1790,109 +1836,93 @@ function reconcileActiveStatement(ss, tz) {
       return hasMerchantKeywordOverlap(st.desc, tx.desc);
     });
 
-    if (match) {
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => {
+        const dA = (st.date && a.date) ? Math.abs(a.date.getTime() - st.date.getTime()) : 0;
+        const dB = (st.date && b.date) ? Math.abs(b.date.getTime() - st.date.getTime()) : 0;
+        return dA - dB;
+      });
+      const match = candidates[0];
       st.matched = true;
       match.matched = true;
       st.assignedPayer = match.person;
     }
   });
 
-  // Pass 2: Suggested Matches (Requires user confirmation)
   const suggestedMatches = [];
-  stmtDebits.forEach(st => {
-    if (st.matched) return;
-    const nearby = txDebits.filter(tx => {
-      if (tx.matched) return false;
-      if (st.date && tx.date) {
-        return Math.abs((tx.date.getTime() - st.date.getTime()) / (1000 * 60 * 60 * 24)) <= 5;
-      }
-      return true;
-    });
+  const missingInSheet = stmtDebits.filter(st => !st.matched);
 
-    const singleAmtMatch = nearby.find(tx => Math.abs(tx.amount - st.amount) < 0.05);
-    if (singleAmtMatch) {
-      suggestedMatches.push({
-        stmt: st,
-        sheetItems: [singleAmtMatch],
-        reason: `Exact amount (${st.amount.toFixed(2)} EGP), dates within 5 days — verify shop name`
-      });
-      return;
-    }
-
-    const combo = findSubsetCombination(nearby, st.amount, 6, 0.10);
-    if (combo) {
-      const peopleList = combo.map(it => it.person).join(" + ");
-      suggestedMatches.push({
-        stmt: st,
-        sheetItems: combo,
-        reason: `${combo.length}-way split sum matches ${st.amount.toFixed(2)} EGP (${peopleList})`
-      });
-    }
-  });
-
-  const suggestedStmtIds = new Set(suggestedMatches.map(s => s.stmt.id));
-  const missingInSheet = stmtDebits.filter(st => !st.matched && !suggestedStmtIds.has(st.id));
-
-  // Prune matched items from reconStore
+  // Prune matched items from reconStore (only when no unmatched debit shares the same baseKey)
+  const missingBaseKeys = new Set(missingInSheet.map(m => makeReconKey(m.date || m.dateStr, m.amount, m.desc, tz)));
   stmtDebits.forEach(st => {
     if (st.matched) {
       const pKey = makeReconKey(st.date || st.dateStr, st.amount, st.desc, tz);
-      delete reconStore.table2Map[pKey];
-      reconStore.table2List = reconStore.table2List.filter(it => it.primaryKey !== pKey);
+      if (!missingBaseKeys.has(pKey)) {
+        Object.keys(reconStore.table2Map).forEach(k => {
+          const v = reconStore.table2Map[k];
+          if (v && v.primaryKey && v.primaryKey.replace(/_#\d+$/, "") === pKey) {
+            delete reconStore.table2Map[k];
+          }
+        });
+        reconStore.table2List = reconStore.table2List.filter(it => !it.primaryKey || it.primaryKey.replace(/_#\d+$/, "") !== pKey);
+      }
     }
   });
 
-  // 6. Fees Default to Mai (or restored from store)
-  const feeOccTracker = {};
-  stmtFees.forEach((fee, idx) => {
-    const baseKey = makeReconKey(fee.date || fee.dateStr, fee.amount, fee.desc, tz);
-    feeOccTracker[baseKey] = (feeOccTracker[baseKey] || 0) + 1;
-    const occ = feeOccTracker[baseKey];
-    const pKeyWithOcc = `${baseKey}_#${occ}`;
-    const exId = `F-${idx + 1}`;
+  function restoreTable2Group(items, options) {
+    const totalOccMap = {};
+    items.forEach(it => {
+      const bk = makeReconKey(it.date || it.dateStr, it.amount, it.desc, tz);
+      totalOccMap[bk] = (totalOccMap[bk] || 0) + 1;
+    });
 
-    const saved = reconStore.table2Map[exId] ||
-                  reconStore.table2Map[pKeyWithOcc] ||
+    const occTracker = {};
+    items.forEach(it => {
+      const baseKey = makeReconKey(it.date || it.dateStr, it.amount, it.desc, tz);
+      occTracker[baseKey] = (occTracker[baseKey] || 0) + 1;
+      const occ = occTracker[baseKey];
+      if (options.trackOccIndex) it.occurrenceIndex = occ;
+      const pKeyWithOcc = `${baseKey}_#${occ}`;
+
+      let saved = reconStore.table2Map[pKeyWithOcc] ||
                   (occ === 1 ? reconStore.table2Map[baseKey] : null);
-    fee.assignedPayer = (saved && saved.payer) ? saved.payer : CONFIG.DEFAULT_FEE_PAYER;
-    fee.note = (saved && saved.note) ? saved.note : "Bank Fee / Tax";
+      if (!saved && totalOccMap[baseKey] === 1 && reconStore.table2ByBaseKey && reconStore.table2ByBaseKey[baseKey] && reconStore.table2ByBaseKey[baseKey].length === 1) {
+        saved = reconStore.table2ByBaseKey[baseKey][0];
+        if (saved) {
+          delete reconStore.table2Map[saved.primaryKey];
+          saved.primaryKey = pKeyWithOcc;
+          reconStore.table2Map[pKeyWithOcc] = saved;
+          reconStore.table2Map[baseKey] = saved;
+        }
+      }
+
+      if (saved && saved.payer) {
+        it.assignedPayer = (saved.payer === "NEGLECT" || saved.isNeglected)
+          ? "🚫 Neglect / Ignore"
+          : (formatPayerCell(saved.payer) || saved.payer);
+        it.note = saved.note || options.defaultNote(it);
+      } else if (options.defaultPayer !== undefined) {
+        it.assignedPayer = options.defaultPayer;
+        it.note = options.defaultNote(it);
+      }
+    });
+  }
+
+  // 6. Fees Default to Mai (or restored from store)
+  restoreTable2Group(stmtFees, {
+    defaultPayer: CONFIG.DEFAULT_FEE_PAYER,
+    defaultNote: () => "Bank Fee / Tax"
   });
 
   // 7. Restore missing in sheet assignments with unique occurrence tracking
-  const missingOccTracker = {};
-  missingInSheet.forEach((m, idx) => {
-    const baseKey = makeReconKey(m.date || m.dateStr, m.amount, m.desc, tz);
-    missingOccTracker[baseKey] = (missingOccTracker[baseKey] || 0) + 1;
-    const occ = missingOccTracker[baseKey];
-    m.occurrenceIndex = occ;
-    const pKeyWithOcc = `${baseKey}_#${occ}`;
-    const exId = `M-${idx + 1}`;
-
-    const saved = reconStore.table2Map[exId] ||
-                  reconStore.table2Map[pKeyWithOcc] ||
-                  (occ === 1 ? reconStore.table2Map[baseKey] : null);
-    if (saved && saved.payer) {
-      m.assignedPayer = (saved.payer === "NEGLECT" || saved.isNeglected) ? "🚫 Neglect / Ignore" : saved.payer;
-      m.note = saved.note || cleanMerchantName(m.desc);
-    }
+  restoreTable2Group(missingInSheet, {
+    trackOccIndex: true,
+    defaultNote: m => cleanMerchantName(m.desc)
   });
 
   // 8. Restore refunds / credits assignments
-  const creditOccTracker = {};
-  stmtCredits.forEach((cr, idx) => {
-    const baseKey = makeReconKey(cr.date || cr.dateStr, cr.amount, cr.desc, tz);
-    creditOccTracker[baseKey] = (creditOccTracker[baseKey] || 0) + 1;
-    const occ = creditOccTracker[baseKey];
-    const pKeyWithOcc = `${baseKey}_#${occ}`;
-    const exId = `C-${idx + 1}`;
-
-    const saved = reconStore.table2Map[exId] ||
-                  reconStore.table2Map[pKeyWithOcc] ||
-                  (occ === 1 ? reconStore.table2Map[baseKey] : null);
-    if (saved && saved.payer) {
-      cr.assignedPayer = (saved.payer === "NEGLECT" || saved.isNeglected) ? "🚫 Neglect / Ignore" : saved.payer;
-      cr.note = saved.note || cr.desc;
-    }
+  restoreTable2Group(stmtCredits, {
+    defaultNote: cr => cr.desc
   });
 
   saveAllReconStore(ss, reconStore);
@@ -1901,16 +1931,24 @@ function reconcileActiveStatement(ss, tz) {
 
   // Expand unmatched sheet transactions (including split items) for transparent attribution
   const expandedUnmatched = [];
+  const txOccTracker = {};
   unmatchedTx.forEach((tx, idx) => {
     const payers = splitPayerNames(tx.person);
-    const baseKey = makeReconKey(tx.date, tx.amount, tx.desc, tz);
     if (payers.length <= 1) {
       const p = payers[0] || tx.person;
       const exId = `TX-${idx + 1}`;
-      const isNeg = reconStore.neglectedTx && (reconStore.neglectedTx.has(exId) || reconStore.neglectedTx.has(baseKey));
+      const baseKey = makeReconKey(tx.date, tx.amount, tx.desc, tz);
+      txOccTracker[baseKey] = (txOccTracker[baseKey] || 0) + 1;
+      const occ = txOccTracker[baseKey];
+      const pKeyWithOcc = `${baseKey}_#${occ}`;
+      const isNeg = reconStore.neglectedTx && (
+        reconStore.neglectedTx.has(pKeyWithOcc) ||
+        (occ === 1 && reconStore.neglectedTx.has(baseKey)) ||
+        reconStore.neglectedTx.has(exId)
+      );
       expandedUnmatched.push({
         id: exId,
-        primaryKey: baseKey,
+        primaryKey: pKeyWithOcc,
         date: tx.date,
         desc: tx.desc,
         amount: tx.amount,
@@ -1919,13 +1957,22 @@ function reconcileActiveStatement(ss, tz) {
       });
     } else {
       const splitAmt = tx.amount / payers.length;
+      const legacyWholeKey = makeReconKey(tx.date, tx.amount, tx.desc, tz);
       payers.forEach((p, pIdx) => {
         const exId = `TX-${idx + 1}.${pIdx + 1}`;
-        const pKey = `${baseKey}_#${pIdx + 1}`;
-        const isNeg = reconStore.neglectedTx && (reconStore.neglectedTx.has(exId) || reconStore.neglectedTx.has(pKey) || reconStore.neglectedTx.has(baseKey));
+        const baseKey = makeReconKey(tx.date, splitAmt, tx.desc, tz);
+        txOccTracker[baseKey] = (txOccTracker[baseKey] || 0) + 1;
+        const occ = txOccTracker[baseKey];
+        const pKeyWithOcc = `${baseKey}_#${occ}`;
+        const isNeg = reconStore.neglectedTx && (
+          reconStore.neglectedTx.has(pKeyWithOcc) ||
+          (occ === 1 && reconStore.neglectedTx.has(baseKey)) ||
+          reconStore.neglectedTx.has(`${legacyWholeKey}_#${pIdx + 1}`) ||
+          reconStore.neglectedTx.has(exId)
+        );
         expandedUnmatched.push({
           id: exId,
-          primaryKey: pKey,
+          primaryKey: pKeyWithOcc,
           date: tx.date,
           desc: `${tx.desc} (Split ${pIdx + 1}/${payers.length})`,
           amount: splitAmt,
@@ -2139,6 +2186,39 @@ function buildDebtLedger(ss, tz, recon) {
 // 9. UI: ACTIVE BILL & RECONCILIATION
 // ==========================================
 
+function getReconTableBounds(ledger, recon) {
+  const numPayers = ledger.personShares.length;
+  const startShareRow = 12;
+  const endShareRow = startShareRow + numPayers - 1;
+  const totShareRow = endShareRow + 1;
+
+  const nonPaymentCreditsCount = (recon.stmtCredits || []).filter(c => !/\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(c.desc)).length;
+  const numExceptions = (recon.stmtFees ? recon.stmtFees.length : 0) + nonPaymentCreditsCount + (recon.missingInSheet ? recon.missingInSheet.length : 0);
+  const startExHeaderRow = totShareRow + 3;
+  const startExRow = startExHeaderRow + 2;
+  const endExRow = startExRow + Math.max(1, numExceptions) - 1;
+
+  const numUnmatched = (recon.expandedUnmatched || []).length;
+  const hasTable3 = numUnmatched > 0;
+  const startTxHeaderRow = endExRow + 3;
+  const startTxRow = startTxHeaderRow + 2;
+  const endTxRow = startTxRow + Math.max(1, numUnmatched) - 1;
+
+  const numInstRecon = (recon.installmentReconItems || []).length;
+  const hasTable4 = numInstRecon > 0;
+  const prevEndRow = hasTable3 ? endTxRow : endExRow;
+  const startInstHeaderRow = prevEndRow + 3;
+  const startInstRow = startInstHeaderRow + 2;
+  const endInstRow = startInstRow + Math.max(1, numInstRecon) - 1;
+
+  return {
+    numPayers, startShareRow, endShareRow, totShareRow,
+    numExceptions, startExHeaderRow, startExRow, endExRow,
+    numUnmatched, hasTable3, startTxHeaderRow, startTxRow, endTxRow,
+    numInstRecon, hasTable4, startInstHeaderRow, startInstRow, endInstRow
+  };
+}
+
 function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.ACTIVE_RECON);
   sheet.clear();
@@ -2159,11 +2239,12 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
 
   // 2. Prepare Data & Dynamic Bounds for Declarative Equations
+  const bounds = getReconTableBounds(ledger, recon);
   const sharePeople = ledger.personShares;
-  const numPayers = sharePeople.length;
-  const startShareRow = 12;
-  const endShareRow = startShareRow + numPayers - 1;
-  const totShareRow = endShareRow + 1;
+  const numPayers = bounds.numPayers;
+  const startShareRow = bounds.startShareRow;
+  const endShareRow = bounds.endShareRow;
+  const totShareRow = bounds.totShareRow;
 
   // Build Table 2 Exceptions Items
   const exceptionItems = [];
@@ -2207,26 +2288,25 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   });
 
   const numExceptions = exceptionItems.length;
-  const startExHeaderRow = totShareRow + 3;
-  const startExRow = startExHeaderRow + 2;
-  const endExRow = startExRow + Math.max(1, numExceptions) - 1;
+  const startExHeaderRow = bounds.startExHeaderRow;
+  const startExRow = bounds.startExRow;
+  const endExRow = bounds.endExRow;
 
   // Build Table 3 Unmatched Sheet Transactions (Billed by Default)
   const unmatchedList = recon.expandedUnmatched || [];
   const numUnmatched = unmatchedList.length;
-  const hasTable3 = numUnmatched > 0;
-  const startTxHeaderRow = endExRow + 3;
-  const startTxRow = startTxHeaderRow + 2;
-  const endTxRow = startTxRow + Math.max(1, numUnmatched) - 1;
+  const hasTable3 = bounds.hasTable3;
+  const startTxHeaderRow = bounds.startTxHeaderRow;
+  const startTxRow = bounds.startTxRow;
+  const endTxRow = bounds.endTxRow;
 
   // Build Table 4 Installments Reconciliation Items
   const instReconList = recon.installmentReconItems || [];
   const numInstRecon = instReconList.length;
-  const hasTable4 = numInstRecon > 0;
-  const prevEndRow = hasTable3 ? endTxRow : endExRow;
-  const startInstHeaderRow = prevEndRow + 3;
-  const startInstRow = startInstHeaderRow + 2;
-  const endInstRow = startInstRow + Math.max(1, numInstRecon) - 1;
+  const hasTable4 = bounds.hasTable4;
+  const startInstHeaderRow = bounds.startInstHeaderRow;
+  const startInstRow = bounds.startInstRow;
+  const endInstRow = bounds.endInstRow;
 
   // 3. Overview Card & Balance Waterfall (Declarative Formulas)
   sheet.getRange("A4:H4").merge()
@@ -2769,15 +2849,23 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
   const cycleDateRange = getCycleDateRange(cardBal.activeCycleKey, tz);
   const pStart = cycleDateRange ? cycleDateRange.start : (cardBal.stmtPeriod && cardBal.stmtPeriod.start);
   const pEnd = cycleDateRange ? cycleDateRange.end : (cardBal.stmtPeriod && cardBal.stmtPeriod.end);
-  if (pStart) sheet.getRange("Z1").setValue(pStart).setNumberFormat("yyyy-MM-dd");
-  if (pEnd) sheet.getRange("Z2").setValue(pEnd).setNumberFormat("yyyy-MM-dd");
+  if (pStart) {
+    sheet.getRange("Z1")
+      .setFormula(`=DATE(${pStart.getFullYear()},${pStart.getMonth() + 1},${pStart.getDate()})`)
+      .setNumberFormat("yyyy-MM-dd");
+  }
+  if (pEnd) {
+    sheet.getRange("Z2")
+      .setFormula(`=DATE(${pEnd.getFullYear()},${pEnd.getMonth() + 1},${pEnd.getDate()})`)
+      .setNumberFormat("yyyy-MM-dd");
+  }
   try { sheet.hideColumns(26); } catch (e) { }
 
   // 4. Dynamic Row Indices from Active Bill & Reconciliation
-  const numPayers = ledger.personShares.length;
-  const startShareRow = 12;
-  const endShareRow = startShareRow + numPayers - 1;
-  const totShareRow = endShareRow + 1;
+  const bounds = getReconTableBounds(ledger, recon);
+  const startShareRow = bounds.startShareRow;
+  const endShareRow = bounds.endShareRow;
+  const totShareRow = bounds.totShareRow;
 
   // 5. KPI Summary Ribbon (Rows 5 & 6)
   // Perfectly mirrors Table 1 of Active Bill & Reconciliation so Net Total Owed ALWAYS equals the actual payment!
@@ -2833,7 +2921,16 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
 
-  const purchSpillFormula = `=IFERROR(FILTER({'${CONFIG.SHEETS.TRANSACTIONS}'!$A$2:$A, '${CONFIG.SHEETS.TRANSACTIONS}'!$B$2:$B, '${CONFIG.SHEETS.TRANSACTIONS}'!$C$2:$C, '${CONFIG.SHEETS.TRANSACTIONS}'!$E$2:$E, '${CONFIG.SHEETS.TRANSACTIONS}'!$D$2:$D, IF('${CONFIG.SHEETS.TRANSACTIONS}'!$A$2:$A<>"","✅ Recorded","")}, ('${CONFIG.SHEETS.TRANSACTIONS}'!$A$2:$A<>"") * ('${CONFIG.SHEETS.TRANSACTIONS}'!$E$2:$E>0) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), '${CONFIG.SHEETS.TRANSACTIONS}'!$D$2:$D)))) * ('${CONFIG.SHEETS.TRANSACTIONS}'!$B$2:$B>=$Z$1) * ('${CONFIG.SHEETS.TRANSACTIONS}'!$B$2:$B<=$Z$2)), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
+  const txRef = `'${CONFIG.SHEETS.TRANSACTIONS}'`;
+  const instRef = `'${CONFIG.SHEETS.INSTALLMENTS}'`;
+  const arRef = `'${CONFIG.SHEETS.ACTIVE_RECON}'`;
+
+  const txColsExpr = `ARRAYFORMULA({${txRef}!$A$2:$C, IFERROR(${txRef}!$E$2:$E / IF($B$3="All Family Members", 1, LEN(${txRef}!$D$2:$D) - LEN(SUBSTITUTE(${txRef}!$D$2:$D, "+", "")) + 1), 0), ${txRef}!$D$2:$D, IF(${txRef}!$A$2:$A<>"","✅ Recorded","")})`;
+  const txBaseCond = `(${txRef}!$A$2:$A<>"") * (${txRef}!$E$2:$E>0) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${txRef}!$D$2:$D)))) * (${txRef}!$B$2:$B>=$Z$1) * (${txRef}!$B$2:$B<($Z$2+1))`;
+  const txNotNegCond = bounds.hasTable3
+    ? ` * MAP(${txRef}!$B$2:$B, ${txRef}!$C$2:$C, ${txRef}!$D$2:$D, LAMBDA(dt, dc, pr, IF(dc="", FALSE, COUNTIFS(${arRef}!$B$${bounds.startTxRow}:$B$${bounds.endTxRow}, dt, ${arRef}!$C$${bounds.startTxRow}:$C$${bounds.endTxRow}, dc & "*", ${arRef}!$E$${bounds.startTxRow}:$E$${bounds.endTxRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", pr)), "*", "*" & TRIM(pr) & "*"), "*" & TRIM($B$3) & "*"), ${arRef}!$F$${bounds.startTxRow}:$F$${bounds.endTxRow}, "🚫*") < IF($B$3="All Family Members", LEN(pr) - LEN(SUBSTITUTE(pr, "+", "")) + 1, 1))))`
+    : "";
+  const purchSpillFormula = `=IFERROR(FILTER(${txColsExpr}, ${txBaseCond}${txNotNegCond}), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
   sheet.getRange("A10").setFormula(purchSpillFormula).setFontSize(9);
   sheet.getRange("D10:D150").setNumberFormat("#,##0.00");
   sheet.getRange("B10:B150").setNumberFormat("yyyy-MM-dd");
@@ -2851,17 +2948,54 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
 
-  const instSpillFormula = `=IFERROR(FILTER({'${CONFIG.SHEETS.INSTALLMENTS}'!$A$2:$E, '${CONFIG.SHEETS.INSTALLMENTS}'!$H$2:$K}, ('${CONFIG.SHEETS.INSTALLMENTS}'!$A$2:$A<>"") * ('${CONFIG.SHEETS.INSTALLMENTS}'!$K$2:$K<>"Completed") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), '${CONFIG.SHEETS.INSTALLMENTS}'!$I$2:$I)))) * ('${CONFIG.SHEETS.INSTALLMENTS}'!$B$2:$B<=$Z$2)), {"—", "—", "No active installments for this cycle", 0, 0, 0, "—", 0, "—"})`;
+  const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  const maxInstRows = instSheet ? Math.max(15, instSheet.getLastRow()) : 35;
+  const startExSectionRow = 10 + maxInstRows + 2;
+
+  const instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$K})`;
+  const instFilterCond = bounds.hasTable4
+    ? `(${instRef}!$A$2:$A<>"") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1)) * MAP(${instRef}!$C$2:$C, ${instRef}!$I$2:$I, LAMBDA(d, p, IF(d="", FALSE, COUNTIFS(${arRef}!$C$${bounds.startInstRow}:$C$${bounds.endInstRow}, d & " (*", ${arRef}!$F$${bounds.startInstRow}:$F$${bounds.endInstRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", p)), "✅*", "✅*" & TRIM(p) & "*"), "✅*" & TRIM($B$3) & "*"))>0)))`
+    : `(${instRef}!$A$2:$A<>"") * (${instRef}!$K$2:$K<>"Completed") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1))`;
+  const instSpillFormula = `=IFERROR(FILTER(${instColsExpr}, ${instFilterCond}), {"—", "—", "No active installments for this cycle", 0, 0, 0, "—", 0, "—"})`;
   sheet.getRange("H10").setFormula(instSpillFormula).setFontSize(9);
-  sheet.getRange("K10:K150").setNumberFormat("#,##0.00");
-  sheet.getRange("M10:M150").setNumberFormat("#,##0.00").setFontWeight("bold");
-  sheet.getRange("I10:I150").setNumberFormat("yyyy-MM-dd");
+  sheet.getRange(10, 11, startExSectionRow - 10, 1).setNumberFormat("#,##0.00");
+  sheet.getRange(10, 13, startExSectionRow - 10, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+  sheet.getRange(10, 9, startExSectionRow - 10, 1).setNumberFormat("yyyy-MM-dd");
+
+  // 8B. Section 3 (Right, Cols H-P below Installments): Assigned Statement Items (Unrecorded, Fees & Refunds)
+  sheet.getRange(`H${startExSectionRow}:P${startExSectionRow}`).merge()
+    .setValue("🧾 Assigned Statement Items — Unrecorded Purchases, Bank Fees & Refunds (Active Cycle)")
+    .setFontWeight("bold")
+    .setFontSize(10)
+    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
+
+  const exSectionHeaders = ["#", "Date", "Description / Merchant", "Category", "Impact", "Amount (EGP)", "Payer", "Note", "Status"];
+  sheet.getRange(startExSectionRow + 1, 8, 1, exSectionHeaders.length).setValues([exSectionHeaders])
+    .setFontWeight("bold")
+    .setFontSize(9)
+    .setBackground(CONFIG.COLORS.HEADER);
+
+  let exSpillFormula;
+  if (bounds.numExceptions > 0) {
+    const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}, IF(${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}="Refund / Credit", "- Credit", "+ Debit"), ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}, ${arRef}!$F$${bounds.startExRow}:$H$${bounds.endExRow}})`;
+    const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (LEFT(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, 1)<>"🚫") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
+    exSpillFormula = `=IFERROR(FILTER(${exColsExpr}, ${exFilterCond}), {"—", "—", "No assigned statement adjustments or fees for this selection", "—", "—", 0, "—", "—", "—"})`;
+  } else {
+    exSpillFormula = `={"—", "—", "No statement adjustments for this cycle", "—", "—", 0, "—", "—", "—"}`;
+  }
+  sheet.getRange(startExSectionRow + 2, 8).setFormula(exSpillFormula).setFontSize(9);
+  const exFormatRows = Math.max(15, bounds.numExceptions + 5);
+  sheet.getRange(startExSectionRow + 2, 9, exFormatRows, 1).setNumberFormat("yyyy-MM-dd");
+  sheet.getRange(startExSectionRow + 2, 13, exFormatRows, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
 
   // 9. Layout Fitting & Ergonomics
+  const customRowHeights = { 2: 20, 3: 26, 5: 22, 6: 28, 7: 20, 8: 24, 9: 22 };
+  customRowHeights[startExSectionRow] = 24;
+  customRowHeights[startExSectionRow + 1] = 22;
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
     bannerHeight: 30,
-    customRowHeights: { 2: 20, 3: 26, 5: 22, 6: 28, 7: 20, 8: 24, 9: 22 },
+    customRowHeights: customRowHeights,
     explicitColWidths: {
       1: 45,   // A: #
       2: 100,  // B: Date / Dropdown
@@ -2873,11 +3007,11 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
       8: 45,   // H: #
       9: 95,   // I: Start Date
       10: 165, // J: Description
-      11: 85,  // K: Total
-      12: 55,  // L: Months
-      13: 95,  // M: EMI
+      11: 85,  // K: Total / Category
+      12: 60,  // L: Months / Impact
+      13: 95,  // M: EMI / Amount
       14: 75,  // N: Payer
-      15: 65,  // O: Paid
+      15: 65,  // O: Paid / Note
       16: 80   // P: Status
     }
   });
@@ -3073,187 +3207,204 @@ function handlePaymentDateEdit(sheet, range, tz, forceReapply) {
   ss.toast("Payment recorded (" + dateStr + ")! Synchronized active installments to paid state.", "💳 NBE Tracker", 4);
 }
 
-function handleActiveReconEdit(e) {
-  if (!e || !e.range) return;
-  const sheet = e.range.getSheet();
-  const col = e.range.getColumn();
-  const row = e.range.getRow();
-
-  // Check if user edited the Payment Date cell (Row 6 Col 8, or adjacent to "Payment Date")
-  let isPaymentDateCell = (row === 6 && col === 8);
-  if (!isPaymentDateCell && col >= 2 && col <= 8 && row <= 8) {
-    const prevCellVal = String(sheet.getRange(row, col - 1).getValue() || "").trim().toLowerCase();
-    if (prevCellVal.includes("payment date")) {
-      isPaymentDateCell = true;
+function computeRowKeyOccurrence(allRows, row, prefixRegex, prefixChar, extractKeyFields, tz) {
+  const curr = extractKeyFields(allRows[row - 1]);
+  const baseKey = makeReconKey(curr.rawDate, curr.amt, curr.desc, tz);
+  let occ = 1;
+  let totalWithBaseKey = 1;
+  for (let idx = 11; idx < allRows.length; idx++) {
+    if (idx === row - 1) continue;
+    const id = String(allRows[idx][0] || "").trim();
+    if (!prefixRegex.test(id)) continue;
+    if (prefixChar && id.charAt(0).toUpperCase() !== prefixChar) continue;
+    const prev = extractKeyFields(allRows[idx]);
+    const k = makeReconKey(prev.rawDate, prev.amt, prev.desc, tz);
+    if (k === baseKey) {
+      totalWithBaseKey++;
+      if (idx < row - 1) occ++;
     }
   }
+  return { curr, baseKey, occ, pKeyWithOcc: `${baseKey}_#${occ}`, totalWithBaseKey };
+}
 
-  if (isPaymentDateCell) {
-    const ss = sheet.getParent();
-    const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
-    handlePaymentDateEdit(sheet, e.range, tz, true);
-    return;
-  }
+function deleteReconMapEntriesForRecord(mapObj, pKeyWithOcc, baseKey, occ, totalWithBaseKey, fallbackId) {
+  if (!mapObj) return;
+  Object.keys(mapObj).forEach(k => {
+    const v = mapObj[k];
+    const pk = v && v.primaryKey ? v.primaryKey : "";
+    if (k === fallbackId || k === pKeyWithOcc || (occ === 1 && k === baseKey) ||
+        pk === pKeyWithOcc || (occ === 1 && pk === baseKey) ||
+        (totalWithBaseKey === 1 && pk && pk.replace(/_#\d+$/, "") === baseKey)) {
+      delete mapObj[k];
+    }
+  });
+}
 
-  if (row < 12) return;
-  const lastR = sheet.getLastRow();
-  if (row > lastR) return;
-
-  const rowVals = sheet.getRange(row, 1, 1, 8).getValues()[0];
+function processActiveReconRowChange(sheet, allRows, row, reconStore, tz, options) {
+  const opts = options || {};
+  const allowDelete = opts.allowDelete === true;
+  const forceStyle = opts.forceStyle === true;
+  const rowVals = allRows[row - 1];
   const firstCol = String(rowVals[0] || "").trim();
-
-  const ss = sheet.getParent();
-  const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
-  const reconStore = loadAllReconStore(ss, tz);
 
   // Case 1: Edit in Table 2 (F-*, C-*, M-*)
   if (/^[FCM]-\d+/i.test(firstCol)) {
-    const exId = firstCol;
-    const rawDate = rowVals[1];
-    const origDesc = String(rowVals[2] || "").trim();
-    const amt = parseFloat(rowVals[3]);
-    const payer = String(rowVals[5] || "").trim();
+    const prefix = firstCol.charAt(0).toUpperCase();
+    const keyInfo = computeRowKeyOccurrence(
+      allRows,
+      row,
+      /^[FCM]-\d+/i,
+      prefix,
+      r => ({ rawDate: r[1], amt: parseFloat(r[3]), desc: String(r[2] || "").trim() }),
+      tz
+    );
+    const { rawDate, amt, desc: origDesc } = keyInfo.curr;
+    if (isNaN(amt) || amt <= 0 || !origDesc) return false;
+
+    let payer = String(rowVals[5] || "").trim();
     const note = String(rowVals[6] || "").trim();
 
-    if (isNaN(amt) || amt <= 0 || !origDesc) return;
-
-    // Calculate occurrence number within Table 2
-    let occ = 1;
-    const startExRow = 14;
-    if (row > startExRow) {
-      const prevRange = sheet.getRange(startExRow, 1, row - startExRow, 4).getValues();
-      prevRange.forEach(pr => {
-        const pDesc = String(pr[2] || "").trim();
-        const pAmt = parseFloat(pr[3]) || 0;
-        if (Math.abs(pAmt - amt) < 0.01 && makeNormDesc(pDesc) === makeNormDesc(origDesc)) {
-          occ++;
-        }
-      });
-    }
-
-    const baseKey = makeReconKey(rawDate, amt, origDesc, tz);
-    const pKeyWithOcc = `${baseKey}_#${occ}`;
-    const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}_#${occ}`;
-
     if (payer && !isNeglectedPayer(payer)) {
-      const rec = {
-        primaryKey: pKeyWithOcc,
-        exId: exId,
-        dateStr: makeNormDateStr(rawDate, tz),
-        desc: origDesc,
-        amount: amt,
-        payer: payer,
-        note: note,
-        isNeglected: false
-      };
-      reconStore.table2Map[pKeyWithOcc] = rec;
-      reconStore.table2Map[amtDescKey] = rec;
-      reconStore.table2Map[exId] = rec;
-      if (occ === 1) {
-        reconStore.table2Map[baseKey] = rec;
-        reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
+      const cleanPayer = formatPayerCell(payer);
+      if (cleanPayer && cleanPayer !== payer) {
+        payer = cleanPayer;
+        rowVals[5] = payer;
+        sheet.getRange(row, 6).setValue(payer);
       }
-      sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
-    } else if (isNeglectedPayer(payer)) {
-      const rec = {
-        primaryKey: pKeyWithOcc,
-        exId: exId,
-        dateStr: makeNormDateStr(rawDate, tz),
-        desc: origDesc,
-        amount: amt,
-        payer: "NEGLECT",
-        note: note,
-        isNeglected: true
-      };
-      reconStore.table2Map[pKeyWithOcc] = rec;
-      reconStore.table2Map[amtDescKey] = rec;
-      reconStore.table2Map[exId] = rec;
-      if (occ === 1) {
-        reconStore.table2Map[baseKey] = rec;
-        reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
-      }
-      sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
-    } else {
-      delete reconStore.table2Map[pKeyWithOcc];
-      delete reconStore.table2Map[amtDescKey];
-      delete reconStore.table2Map[exId];
-      if (occ === 1) {
-        delete reconStore.table2Map[baseKey];
-        delete reconStore.table2Map[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`];
-      }
-      sheet.getRange(row, 1, 1, 8).setBackground("#ffffff");
     }
 
-    saveAllReconStore(ss, reconStore);
-    // ZERO SCREEN WIPE: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
-    return;
+    const { baseKey, occ, pKeyWithOcc, totalWithBaseKey } = keyInfo;
+
+    if (!allowDelete) {
+      if (!payer) return false;
+      const existing = reconStore.table2Map[pKeyWithOcc] || (occ === 1 ? reconStore.table2Map[baseKey] : null);
+      if (!existing && (prefix === "F" || prefix === "C") && payer === CONFIG.DEFAULT_FEE_PAYER) {
+        return false;
+      }
+    }
+
+    if (payer) {
+      const isNeg = isNeglectedPayer(payer);
+      const rec = {
+        primaryKey: pKeyWithOcc,
+        exId: firstCol,
+        dateStr: makeNormDateStr(rawDate, tz),
+        desc: origDesc,
+        amount: amt,
+        payer: isNeg ? "NEGLECT" : payer,
+        note: note,
+        isNeglected: isNeg
+      };
+
+      const existing = reconStore.table2Map[pKeyWithOcc];
+      if (!forceStyle && existing && existing.payer === rec.payer && existing.note === rec.note && existing.primaryKey === pKeyWithOcc) {
+        return false;
+      }
+
+      if (totalWithBaseKey === 1) {
+        Object.keys(reconStore.table2Map).forEach(k => {
+          const v = reconStore.table2Map[k];
+          if (v && v.primaryKey && v.primaryKey.replace(/_#\d+$/, "") === baseKey && v.primaryKey !== pKeyWithOcc) {
+            delete reconStore.table2Map[k];
+          }
+        });
+      }
+      reconStore.table2Map[pKeyWithOcc] = rec;
+      if (occ === 1) reconStore.table2Map[baseKey] = rec;
+      if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground(isNeg ? "#eeeeee" : CONFIG.COLORS.PAID);
+      return true;
+    }
+
+    deleteReconMapEntriesForRecord(reconStore.table2Map, pKeyWithOcc, baseKey, occ, totalWithBaseKey, firstCol);
+    if (reconStore.table2List) {
+      reconStore.table2List = reconStore.table2List.filter(it =>
+        it.primaryKey !== pKeyWithOcc &&
+        !(occ === 1 && it.primaryKey === baseKey) &&
+        !(totalWithBaseKey === 1 && it.primaryKey && it.primaryKey.replace(/_#\d+$/, "") === baseKey)
+      );
+    }
+    if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#ffffff");
+    return true;
   }
 
   // Case 2: Edit in Table 3 (TX-*)
   if (/^TX-/i.test(firstCol)) {
-    const txId = firstCol;
+    const keyInfo = computeRowKeyOccurrence(
+      allRows,
+      row,
+      /^TX-/i,
+      null,
+      r => ({
+        rawDate: r[1],
+        amt: parseFloat(r[3]) || 0,
+        desc: String(r[2] || "").replace(/\s*\(Split\s+\d+\/\d+\)$/i, "").trim()
+      }),
+      tz
+    );
+    const { baseKey, occ, pKeyWithOcc } = keyInfo;
     const actionVal = String(rowVals[5] || "").trim();
     const isNeg = isNeglectedPayer(actionVal);
 
     if (isNeg) {
-      reconStore.neglectedTx.add(txId);
-      sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
-    } else {
-      reconStore.neglectedTx.delete(txId);
-      sheet.getRange(row, 1, 1, 8).setBackground("#f8f9fa");
+      if (!forceStyle && reconStore.neglectedTx.has(pKeyWithOcc)) return false;
+      reconStore.neglectedTx.add(pKeyWithOcc);
+      if (occ === 1) reconStore.neglectedTx.add(baseKey);
+      if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
+      return true;
     }
 
-    saveAllReconStore(ss, reconStore);
-    // ZERO SCREEN WIPE: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
-    return;
+    if (!allowDelete) return false;
+    reconStore.neglectedTx.delete(pKeyWithOcc);
+    if (occ === 1) reconStore.neglectedTx.delete(baseKey);
+    reconStore.neglectedTx.delete(firstCol);
+    if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#f8f9fa");
+    return true;
   }
 
   // Case 3: Edit in Table 4 (INST-*)
   if (/^INST-\d+/i.test(firstCol)) {
-    const instId = firstCol;
-    const rawDate = rowVals[1];
-    const origDesc = String(rowVals[2] || "").trim();
-    const amt = parseFloat(rowVals[3]);
+    const keyInfo = computeRowKeyOccurrence(
+      allRows,
+      row,
+      /^INST-\d+/i,
+      null,
+      r => ({ rawDate: r[1], amt: parseFloat(r[3]), desc: String(r[2] || "").trim() }),
+      tz
+    );
+    const { rawDate, amt, desc: origDesc } = keyInfo.curr;
+    if (isNaN(amt) || amt <= 0 || !origDesc) return false;
+
     let actionVal = String(rowVals[5] || "").trim();
+    const sourceCat = String(rowVals[4] || "").trim();
     const note = String(rowVals[6] || "").trim();
+    const { baseKey, occ, pKeyWithOcc, totalWithBaseKey } = keyInfo;
 
-    if (isNaN(amt) || amt <= 0 || !origDesc) return;
+    if (!allowDelete) {
+      if (!actionVal) return false;
+      const existing = reconStore.installmentOverrides &&
+        (reconStore.installmentOverrides[pKeyWithOcc] || (occ === 1 ? reconStore.installmentOverrides[baseKey] : null));
+      if (!existing) {
+        if (sourceCat.includes("Sheet Only") && actionVal === "🚫 Not on Statement (Skip)") return false;
+        if (sourceCat.includes("Matched") && !isNeglectedPayer(actionVal) && /^✅\s*Billed\s+to\s+/i.test(actionVal)) return false;
+      }
+    }
 
-    // Normalize bare family member name (e.g. "Mido" -> "✅ Billed to Mido")
     if (actionVal && !isNeglectedPayer(actionVal) && !/^✅\s*Billed\s+to\s+/i.test(actionVal)) {
       const cleanName = formatPayerCell(actionVal);
       if (cleanName) {
         actionVal = `✅ Billed to ${cleanName}`;
+        rowVals[5] = actionVal;
         sheet.getRange(row, 6).setValue(actionVal);
       }
     }
 
-    // Calculate occurrence number within Table 4
-    let occ = 1;
-    let scanRow = row - 1;
-    while (scanRow >= 14) {
-      const prevVals = sheet.getRange(scanRow, 1, 1, 4).getValues()[0];
-      const prevId = String(prevVals[0] || "").trim();
-      if (!/^INST-\d+/i.test(prevId)) break;
-      const pDesc = String(prevVals[2] || "").trim();
-      const pAmt = parseFloat(prevVals[3]) || 0;
-      if (Math.abs(pAmt - amt) < 0.01 && makeNormDesc(pDesc) === makeNormDesc(origDesc)) {
-        occ++;
-      }
-      scanRow--;
-    }
-
-    const baseKey = makeReconKey(rawDate, amt, origDesc, tz);
-    const pKeyWithOcc = `${baseKey}_#${occ}`;
-    const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}_#${occ}`;
     const isNeg = isNeglectedPayer(actionVal);
-
     if (!reconStore.installmentOverrides) reconStore.installmentOverrides = {};
 
     if (actionVal) {
       const rec = {
         primaryKey: pKeyWithOcc,
-        instId: instId,
+        instId: firstCol,
         dateStr: makeNormDateStr(rawDate, tz),
         desc: origDesc,
         amount: amt,
@@ -3261,29 +3412,101 @@ function handleActiveReconEdit(e) {
         note: note,
         isNeglected: isNeg
       };
+      const existing = reconStore.installmentOverrides[pKeyWithOcc];
+      if (!forceStyle && existing && existing.action === rec.action && existing.note === rec.note && existing.primaryKey === pKeyWithOcc) {
+        return false;
+      }
+      if (totalWithBaseKey === 1) {
+        Object.keys(reconStore.installmentOverrides).forEach(k => {
+          const v = reconStore.installmentOverrides[k];
+          if (v && v.primaryKey && v.primaryKey.replace(/_#\d+$/, "") === baseKey && v.primaryKey !== pKeyWithOcc) {
+            delete reconStore.installmentOverrides[k];
+          }
+        });
+      }
       reconStore.installmentOverrides[pKeyWithOcc] = rec;
-      reconStore.installmentOverrides[amtDescKey] = rec;
-      reconStore.installmentOverrides[instId] = rec;
-      if (occ === 1) {
-        reconStore.installmentOverrides[baseKey] = rec;
-        reconStore.installmentOverrides[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
-      }
-      sheet.getRange(row, 1, 1, 8).setBackground(isNeg ? "#eeeeee" : CONFIG.COLORS.PAID);
-    } else {
-      delete reconStore.installmentOverrides[pKeyWithOcc];
-      delete reconStore.installmentOverrides[amtDescKey];
-      delete reconStore.installmentOverrides[instId];
-      if (occ === 1) {
-        delete reconStore.installmentOverrides[baseKey];
-        delete reconStore.installmentOverrides[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`];
-      }
-      sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.DUE_SOON);
+      if (occ === 1) reconStore.installmentOverrides[baseKey] = rec;
+      if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground(isNeg ? "#eeeeee" : CONFIG.COLORS.PAID);
+      return true;
     }
 
-    saveAllReconStore(ss, reconStore);
-    // ZERO SCREEN WIPE: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
-    return;
+    deleteReconMapEntriesForRecord(reconStore.installmentOverrides, pKeyWithOcc, baseKey, occ, totalWithBaseKey, firstCol);
+    if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.DUE_SOON);
+    return true;
   }
+
+  return false;
+}
+
+function syncActiveReconSheetToStore(ss, tz) {
+  const sheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+  if (!sheet || sheet.getLastRow() < 12) return;
+
+  const lastR = sheet.getLastRow();
+  const allRows = sheet.getRange(1, 1, lastR, 8).getValues();
+  const reconStore = loadAllReconStore(ss, tz);
+  let changed = false;
+
+  for (let row = 12; row <= lastR; row++) {
+    if (processActiveReconRowChange(sheet, allRows, row, reconStore, tz, { allowDelete: false, forceStyle: false })) {
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveAllReconStore(ss, reconStore);
+  }
+}
+
+function handleActiveReconEdit(e) {
+  if (!e || !e.range) return;
+  const sheet = e.range.getSheet();
+  const col = e.range.getColumn();
+  const startRow = e.range.getRow();
+  const numRows = typeof e.range.getNumRows === "function"
+    ? e.range.getNumRows()
+    : (e.range.getLastRow ? (e.range.getLastRow() - startRow + 1) : 1);
+  const numCols = typeof e.range.getNumColumns === "function" ? e.range.getNumColumns() : 1;
+
+  // Check if user edited the Payment Date cell (Row 6 Col 8, or adjacent to "Payment Date")
+  if (numRows === 1 && numCols === 1) {
+    let isPaymentDateCell = (startRow === 6 && col === 8);
+    if (!isPaymentDateCell && col >= 2 && col <= 8 && startRow <= 8) {
+      const prevCellVal = String(sheet.getRange(startRow, col - 1).getValue() || "").trim().toLowerCase();
+      if (prevCellVal.includes("payment date")) {
+        isPaymentDateCell = true;
+      }
+    }
+
+    if (isPaymentDateCell) {
+      const ss = sheet.getParent();
+      const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+      handlePaymentDateEdit(sheet, e.range, tz, true);
+      return;
+    }
+  }
+
+  const lastR = sheet.getLastRow();
+  const loopStart = Math.max(12, startRow);
+  const loopEnd = Math.min(lastR, startRow + numRows - 1);
+  if (loopStart > loopEnd) return;
+
+  const ss = sheet.getParent();
+  const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+  const reconStore = loadAllReconStore(ss, tz);
+  const allRows = sheet.getRange(1, 1, lastR, 8).getValues();
+  let modified = false;
+
+  for (let row = loopStart; row <= loopEnd; row++) {
+    if (processActiveReconRowChange(sheet, allRows, row, reconStore, tz, { allowDelete: true, forceStyle: true })) {
+      modified = true;
+    }
+  }
+
+  if (modified) {
+    saveAllReconStore(ss, reconStore);
+  }
+  // ZERO SCREEN WIPE: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
 }
 
 function onEdit(e) {
@@ -3342,6 +3565,7 @@ function updateLiveDashboard(options) {
   cleanupDeprecatedSheets(ss);
   sanitizeAllPayerNames(ss);
   sanitizeTransactionDates(ss);
+  syncActiveReconSheetToStore(ss, tz);
 
   // Check active payment state from Active Bill & Reconciliation cell H6
   let isBillPaid = false;
