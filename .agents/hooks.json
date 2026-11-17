@@ -1,0 +1,16 @@
+{
+  "auto-clasp-push": {
+    "PostToolUse": [
+      {
+        "matcher": "edit_file|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./hooks/auto-clasp-push.js",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

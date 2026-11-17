@@ -197,7 +197,7 @@ When receiving form submissions or webhook notifications:
   !appsscript.json
   !Code.js
   ```
-- Push changes with `npx @google/clasp push -f` after syntax-validating with `node -c Code.js`.
+- **Always push automatically:** After every change to `Code.js`, `.gs` files, or `appsscript.json`, validate syntax with `node -c Code.js` and immediately run `clasp push -f` (or `npx @google/clasp push -f`) without waiting for the user to ask.
 
 ---
 
