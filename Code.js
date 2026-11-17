@@ -2985,10 +2985,33 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
   const txNotNegCond = bounds.hasTable3
     ? ` * MAP(${txRef}!$B$2:$B, ${txRef}!$C$2:$C, ${txRef}!$D$2:$D, LAMBDA(dt, dc, pr, IF(dc="", FALSE, COUNTIFS(${arRef}!$B$${bounds.startTxRow}:$B$${bounds.endTxRow}, dt, ${arRef}!$C$${bounds.startTxRow}:$C$${bounds.endTxRow}, dc & "*", ${arRef}!$E$${bounds.startTxRow}:$E$${bounds.endTxRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", pr)), "*", "*" & TRIM(pr) & "*"), "*" & TRIM($B$3) & "*"), ${arRef}!$F$${bounds.startTxRow}:$F$${bounds.endTxRow}, "🚫*") < IF($B$3="All Family Members", LEN(pr) - LEN(SUBSTITUTE(pr, "+", "")) + 1, 1))))`
     : "";
-  const purchSpillFormula = `=IFERROR(FILTER(${txColsExpr}, ${txBaseCond}${txNotNegCond}), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
+  const purchFilterPart = `IFERROR(FILTER(${txColsExpr}, ${txBaseCond}${txNotNegCond}), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
+
+  let exFilterPart;
+  if (bounds.numExceptions > 0) {
+    const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, IF(${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}="Refund / Credit", -1, 1) * ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}, ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}})`;
+    const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (LEFT(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, 1)<>"🚫") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
+    exFilterPart = `IFERROR(FILTER(${exColsExpr}, ${exFilterCond}), {"—", "—", "No unrecorded statement items, fees, or refunds", 0, "—", "—"})`;
+  } else {
+    exFilterPart = `{"—", "—", "No statement adjustments for this cycle", 0, "—", "—"}`;
+  }
+
+  const purchSpillFormula = `=VSTACK(${purchFilterPart}, {"", "", "", "", "", ""}, {"#", "Tx Date", "🧾 Unrecorded Statement Items, Fees & Refunds", "Amount (EGP)", "Assigned Payer", "Category"}, ${exFilterPart})`;
   sheet.getRange("A10").setFormula(purchSpillFormula).setFontSize(9);
-  sheet.getRange("D10:D150").setNumberFormat("#,##0.00");
-  sheet.getRange("B10:B150").setNumberFormat("yyyy-MM-dd");
+  sheet.getRange("D10:D250").setNumberFormat("#,##0.00");
+  sheet.getRange("B10:B250").setNumberFormat("yyyy-MM-dd");
+
+  if (typeof SpreadsheetApp.newConditionalFormatRule === "function" && typeof sheet.setConditionalFormatRules === "function") {
+    try {
+      const subHeaderRule = SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied('=$C10="🧾 Unrecorded Statement Items, Fees & Refunds"')
+        .setBold(true)
+        .setBackground(CONFIG.COLORS.HEADER)
+        .setRanges([sheet.getRange("A10:F250")])
+        .build();
+      sheet.setConditionalFormatRules([subHeaderRule]);
+    } catch (e) { }
+  }
 
   // 8. Parallel Table 2 (Right, Cols H-P): Active Monthly Installments & EMIs (Starts Row 8, Spills Row 10+)
   sheet.getRange("H8:P8").merge()
@@ -3003,70 +3026,37 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
 
-  const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
-  const maxInstRows = instSheet ? Math.max(15, instSheet.getLastRow()) : 35;
-  const startExSectionRow = 10 + maxInstRows + 2;
-
   const instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$K})`;
   const instFilterCond = bounds.hasTable4
     ? `(${instRef}!$A$2:$A<>"") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1)) * MAP(${instRef}!$C$2:$C, ${instRef}!$I$2:$I, LAMBDA(d, p, IF(d="", FALSE, COUNTIFS(${arRef}!$C$${bounds.startInstRow}:$C$${bounds.endInstRow}, d & " (*", ${arRef}!$F$${bounds.startInstRow}:$F$${bounds.endInstRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", p)), "✅*", "✅*" & TRIM(p) & "*"), "✅*" & TRIM($B$3) & "*"))>0)))`
     : `(${instRef}!$A$2:$A<>"") * (${instRef}!$K$2:$K<>"Completed") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1))`;
   const instSpillFormula = `=IFERROR(FILTER(${instColsExpr}, ${instFilterCond}), {"—", "—", "No active installments for this cycle", 0, 0, 0, "—", 0, "—"})`;
   sheet.getRange("H10").setFormula(instSpillFormula).setFontSize(9);
-  sheet.getRange(10, 11, startExSectionRow - 10, 1).setNumberFormat("#,##0.00");
-  sheet.getRange(10, 13, startExSectionRow - 10, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
-  sheet.getRange(10, 9, startExSectionRow - 10, 1).setNumberFormat("yyyy-MM-dd");
-
-  // 8B. Section 3 (Right, Cols H-P below Installments): Assigned Statement Items (Unrecorded, Fees & Refunds)
-  sheet.getRange(`H${startExSectionRow}:P${startExSectionRow}`).merge()
-    .setValue("🧾 Assigned Statement Items — Unrecorded Purchases, Bank Fees & Refunds (Active Cycle)")
-    .setFontWeight("bold")
-    .setFontSize(10)
-    .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
-
-  const exSectionHeaders = ["#", "Date", "Description / Merchant", "Category", "Impact", "Amount (EGP)", "Payer", "Note", "Status"];
-  sheet.getRange(startExSectionRow + 1, 8, 1, exSectionHeaders.length).setValues([exSectionHeaders])
-    .setFontWeight("bold")
-    .setFontSize(9)
-    .setBackground(CONFIG.COLORS.HEADER);
-
-  let exSpillFormula;
-  if (bounds.numExceptions > 0) {
-    const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}, IF(${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}="Refund / Credit", "- Credit", "+ Debit"), ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}, ${arRef}!$F$${bounds.startExRow}:$H$${bounds.endExRow}})`;
-    const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (LEFT(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, 1)<>"🚫") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
-    exSpillFormula = `=IFERROR(FILTER(${exColsExpr}, ${exFilterCond}), {"—", "—", "No assigned statement adjustments or fees for this selection", "—", "—", 0, "—", "—", "—"})`;
-  } else {
-    exSpillFormula = `={"—", "—", "No statement adjustments for this cycle", "—", "—", 0, "—", "—", "—"}`;
-  }
-  sheet.getRange(startExSectionRow + 2, 8).setFormula(exSpillFormula).setFontSize(9);
-  const exFormatRows = Math.max(15, bounds.numExceptions + 5);
-  sheet.getRange(startExSectionRow + 2, 9, exFormatRows, 1).setNumberFormat("yyyy-MM-dd");
-  sheet.getRange(startExSectionRow + 2, 13, exFormatRows, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+  sheet.getRange("K10:K150").setNumberFormat("#,##0.00");
+  sheet.getRange("M10:M150").setNumberFormat("#,##0.00").setFontWeight("bold");
+  sheet.getRange("I10:I150").setNumberFormat("yyyy-MM-dd");
 
   // 9. Layout Fitting & Ergonomics
-  const customRowHeights = { 2: 20, 3: 26, 5: 22, 6: 28, 7: 20, 8: 24, 9: 22 };
-  customRowHeights[startExSectionRow] = 24;
-  customRowHeights[startExSectionRow + 1] = 22;
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
     bannerHeight: 30,
-    customRowHeights: customRowHeights,
+    customRowHeights: { 2: 20, 3: 26, 5: 22, 6: 28, 7: 20, 8: 24, 9: 22 },
     explicitColWidths: {
       1: 45,   // A: #
       2: 100,  // B: Date / Dropdown
       3: 175,  // C: Description
       4: 95,   // D: Amount / Label
       5: 85,   // E: Payer / Cycle
-      6: 85,   // F: Status / Label
+      6: 85,   // F: Status / Category
       7: 25,   // G: Spacer
       8: 45,   // H: #
       9: 95,   // I: Start Date
       10: 165, // J: Description
-      11: 85,  // K: Total / Category
-      12: 60,  // L: Months / Impact
-      13: 95,  // M: EMI / Amount
+      11: 85,  // K: Total
+      12: 55,  // L: Months
+      13: 95,  // M: EMI
       14: 75,  // N: Payer
-      15: 65,  // O: Paid / Note
+      15: 65,  // O: Paid
       16: 80   // P: Status
     }
   });

@@ -730,26 +730,19 @@ assert.strictEqual(mbSheet6._getCell(1, 26), "=DATE(2026,9,30)", "Z1 must be mid
 assert.strictEqual(mbSheet6._getCell(2, 26), "=DATE(2026,10,30)", "Z2 must be midnight DATE(2026,10,30)");
 
 const purchFormula6 = String(mbSheet6._getCell(10, 1) || "");
-assert.ok(purchFormula6.includes("ARRAYFORMULA(") && purchFormula6.includes("<($Z$2+1)"), "Purchases spill must use ARRAYFORMULA and <($Z$2+1)");
+assert.ok(
+  purchFormula6.startsWith("=VSTACK(") &&
+  purchFormula6.includes("ARRAYFORMULA(") &&
+  purchFormula6.includes("<($Z$2+1)") &&
+  purchFormula6.includes("Unrecorded Statement Items, Fees & Refunds") &&
+  purchFormula6.includes("Active Bill & Reconciliation"),
+  "A10 must VSTACK Direct Purchases and Active Bill & Reconciliation Table 2 exceptions"
+);
 
 const instFormula6 = String(mbSheet6._getCell(10, 8) || "");
 assert.ok(instFormula6.includes("MAP(") && instFormula6.includes("LAMBDA(") && instFormula6.includes("COUNTIFS("), "Installments spill must use MAP + LAMBDA + scalar COUNTIFS");
 
-// Verify Section 3 header and spill formula exist in Col H below Installments
-let sec3BannerRow = -1;
-for (let r = 12; r <= mbSheet6.getLastRow(); r++) {
-  const val = String(mbSheet6._getCell(r, 8) || "");
-  if (val.includes("Assigned Statement Items")) {
-    sec3BannerRow = r;
-    break;
-  }
-}
-assert.ok(sec3BannerRow >= 27, `Section 3 banner should be placed safely below Installments, found at row ${sec3BannerRow}`);
-assert.strictEqual(mbSheet6._getCell(sec3BannerRow + 1, 13), "Amount (EGP)", "Section 3 Col M must align Amount (EGP)");
-const sec3Formula = String(mbSheet6._getCell(sec3BannerRow + 2, 8) || "");
-assert.ok(sec3Formula.includes("FILTER(ARRAYFORMULA(") && sec3Formula.includes("Active Bill & Reconciliation"), "Section 3 spill must filter Table 2 from Active Bill & Reconciliation");
-
-console.log("  PASS: Member Breakdown midnight date boundary, installment parity (1,484.61), and Section 3 verified!");
+console.log("  PASS: Member Breakdown midnight date boundary, installment parity (1,484.61), and VSTACK unrecorded table verified!");
 
 // ==========================================
 // Test 7: Multi-Pass Cross-Gateway Matching, Multi-Row Uneven Split & No Table 2/3 Duplication
