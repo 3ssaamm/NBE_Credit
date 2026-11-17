@@ -581,7 +581,8 @@ function loadAllReconStore(ss, tz) {
     table2List: [],
     confirmedMatches: new Set(),
     neglectedTx: new Set(),
-    paymentRecords: {}
+    paymentRecords: {},
+    installmentOverrides: {}
   };
 
   try {
@@ -632,6 +633,30 @@ function loadAllReconStore(ss, tz) {
             const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(desc).substring(0, 30)}`;
             if (!store.table2Map[amtDescKey]) store.table2Map[amtDescKey] = rec;
             store.table2List.push(rec);
+          }
+        } else if (type === "TABLE4_INSTALLMENT") {
+          if (pKey) {
+            const rec = {
+              primaryKey: pKey,
+              dateStr: dStr,
+              desc: desc,
+              amount: amt,
+              action: payer,
+              note: note,
+              isNeglected: isNeglected || isNeglectedPayer(payer)
+            };
+            store.installmentOverrides[pKey] = rec;
+            const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(desc).substring(0, 30)}`;
+            const occMatch = pKey.match(/_#(\d+)$/);
+            if (occMatch) {
+              const occAmtDescKey = `${amtDescKey}_#${occMatch[1]}`;
+              if (!store.installmentOverrides[occAmtDescKey]) store.installmentOverrides[occAmtDescKey] = rec;
+              if (occMatch[1] === "1" && !store.installmentOverrides[amtDescKey]) {
+                store.installmentOverrides[amtDescKey] = rec;
+              }
+            } else if (!store.installmentOverrides[amtDescKey]) {
+              store.installmentOverrides[amtDescKey] = rec;
+            }
           }
         } else if (type === "TABLE1_CONFIRMED" || isConfirmed) {
           if (pKey) store.confirmedMatches.add(pKey);
@@ -707,6 +732,28 @@ function saveAllReconStore(ss, store) {
       });
     }
 
+    const seenInstKeys = new Set();
+    if (store.installmentOverrides) {
+      Object.keys(store.installmentOverrides).forEach(k => {
+        const item = store.installmentOverrides[k];
+        if (item && item.primaryKey && !seenInstKeys.has(item.primaryKey)) {
+          seenInstKeys.add(item.primaryKey);
+          rows.push([
+            "TABLE4_INSTALLMENT",
+            item.primaryKey,
+            item.dateStr || "",
+            item.desc || "",
+            item.amount || 0,
+            item.action || "",
+            item.note || "",
+            false,
+            item.isNeglected === true || isNeglectedPayer(item.action),
+            nowStr
+          ]);
+        }
+      });
+    }
+
     const lastRow = sheet.getLastRow();
     if (lastRow > 1) {
       sheet.getRange(2, 1, lastRow - 1, 10).clearContent();
@@ -759,9 +806,16 @@ function matchStatementInstallments(statementInstallments, sheetInstallmentRows)
   const matchedSheet = new Set();
   const results = [];
 
+  // Prioritize active/ongoing installment rows before completed ones while preserving relative order
+  const orderedSheetRows = sheetInstallmentRows.slice().sort((a, b) => {
+    const aComp = a.isCompleted ? 1 : 0;
+    const bComp = b.isCompleted ? 1 : 0;
+    return aComp - bComp;
+  });
+
   statementInstallments.forEach((st, sIdx) => {
-    const cand = sheetInstallmentRows.find((sh, shIdx) => {
-      if (matchedSheet.has(shIdx)) return false;
+    const cand = orderedSheetRows.find(sh => {
+      if (matchedSheet.has(sh.index)) return false;
       if (Math.abs(st.amount - sh.emi) > 0.50) return false;
       if (st.instTotal && sh.duration && Math.abs(st.instTotal - sh.duration) > 1) return false;
       return true;
@@ -781,8 +835,8 @@ function matchStatementInstallments(statementInstallments, sheetInstallmentRows)
   });
 
   const descGroups = {};
-  sheetInstallmentRows.forEach((sh, shIdx) => {
-    if (matchedSheet.has(shIdx)) return;
+  orderedSheetRows.forEach(sh => {
+    if (matchedSheet.has(sh.index)) return;
     const key = (sh.desc || "").toLowerCase().trim() + "_" + (sh.duration || 0);
     if (!descGroups[key]) descGroups[key] = [];
     descGroups[key].push(sh);
@@ -793,6 +847,7 @@ function matchStatementInstallments(statementInstallments, sheetInstallmentRows)
     for (const key in descGroups) {
       const group = descGroups[key];
       if (!group || group.length < 2) continue;
+      if (!group.every(it => !matchedSheet.has(it.index))) continue;
       if (st.instTotal && group[0].duration && Math.abs(group[0].duration - st.instTotal) > 1) continue;
       const groupSum = group.reduce((sum, it) => sum + it.emi, 0);
       if (Math.abs(groupSum - st.amount) <= 0.60) {
@@ -814,8 +869,8 @@ function matchStatementInstallments(statementInstallments, sheetInstallmentRows)
 
   statementInstallments.forEach((st, sIdx) => {
     if (matchedStmt.has(sIdx)) return;
-    const available = sheetInstallmentRows.filter((sh, shIdx) => {
-      if (matchedSheet.has(shIdx)) return false;
+    const available = orderedSheetRows.filter(sh => {
+      if (matchedSheet.has(sh.index)) return false;
       if (st.instTotal && sh.duration && Math.abs(sh.duration - st.instTotal) > 1) return false;
       return true;
     });
@@ -1562,29 +1617,149 @@ function reconcileActiveStatement(ss, tz) {
   if (instSheet && instSheet.getLastRow() >= 2) {
     const instData = instSheet.getRange(2, 1, instSheet.getLastRow() - 1, 11).getValues();
     instData.forEach((row, idx) => {
+      const startDate = parseDateValue(row[1], tz);
+      const desc = String(row[2] || "").trim();
+      const totalPrice = parseFloat(row[3]) || 0;
+      const duration = parseInt(row[4], 10);
       const emi = parseFloat(row[7]);
       const payer = String(row[8] || "").replace(/[\u00A0\s]+/g, " ").trim();
-      const desc = String(row[2] || "").trim();
-      const duration = parseInt(row[4], 10);
+      const paymentsMade = parseInt(row[9], 10) || 0;
+      const status = String(row[10] || "").trim();
+      const isCompleted = status.toLowerCase() === "completed" && duration > 0 && paymentsMade >= duration;
       if (!isNaN(emi) && emi > 0 && payer) {
         sheetInstallmentRows.push({
           index: idx,
+          rowNum: idx + 2,
+          startDate: startDate,
+          dateStr: startDate ? makeNormDateStr(startDate, tz) : String(row[1] || ""),
+          desc: desc,
+          totalPrice: totalPrice,
+          duration: duration,
           emi: emi,
           payer: payer,
-          desc: desc,
-          duration: duration
+          paymentsMade: paymentsMade,
+          status: status,
+          isCompleted: isCompleted
         });
       }
     });
   }
 
-  // 4. Match Installments
+  // 4. Match Installments & Build Table 4 Reconciliation Items
   const instMatches = matchStatementInstallments(stmtInstallments, sheetInstallmentRows);
   const instMatchMap = {};
+  const matchedStmtIdxSet = new Set();
+  const matchedSheetIdxSet = new Set();
   instMatches.forEach(m => {
     instMatchMap[m.stmtIdx] = m.payerLabel;
+    matchedStmtIdxSet.add(m.stmtIdx);
+    m.sheetRows.forEach(sh => matchedSheetIdxSet.add(sh.index));
     stmtInstallments[m.stmtIdx].matched = true;
     stmtInstallments[m.stmtIdx].assignedPayer = m.payerLabel;
+  });
+
+  const unmatchedStmtItems = [];
+  stmtInstallments.forEach((st, sIdx) => {
+    if (matchedStmtIdxSet.has(sIdx)) return;
+    unmatchedStmtItems.push({
+      date: st.date || st.dateStr || "",
+      desc: st.desc,
+      amount: st.amount,
+      sourceCategory: "⚠️ Statement Only",
+      defaultPayer: "",
+      defaultAction: "",
+      defaultNote: "On Bank Statement but missing in Installments sheet — assign payer"
+    });
+  });
+
+  const unmatchedSheetItems = [];
+  sheetInstallmentRows.forEach(sh => {
+    if (matchedSheetIdxSet.has(sh.index)) return;
+    if (sh.status.toLowerCase() === "completed") return;
+    const payers = splitPayerNames(sh.payer);
+    const targetPayers = payers.length > 0 ? payers : [sh.payer];
+    const shareEmi = sh.emi / targetPayers.length;
+    targetPayers.forEach(p => {
+      unmatchedSheetItems.push({
+        date: sh.startDate || sh.dateStr || "",
+        desc: `${sh.desc} (${sh.paymentsMade}/${sh.duration || "?"} Paid)`,
+        amount: Number(shareEmi.toFixed(2)),
+        sourceCategory: "⏳ Sheet Only",
+        defaultPayer: p,
+        defaultAction: "🚫 Not on Statement (Skip)",
+        defaultNote: `In Installments sheet (${p}) — not billed on current statement`
+      });
+    });
+  });
+
+  const matchedInstItems = [];
+  instMatches.forEach(m => {
+    const entries = [];
+    m.sheetRows.forEach(sh => {
+      const payers = splitPayerNames(sh.payer);
+      const targetPayers = payers.length > 0 ? payers : [sh.payer];
+      const shareEmi = sh.emi / targetPayers.length;
+      const progressStr = (m.stmt.instCurrent && m.stmt.instTotal)
+        ? `${m.stmt.instCurrent} of ${m.stmt.instTotal}`
+        : (sh.duration ? `${sh.paymentsMade + 1} of ${sh.duration}` : "Active");
+      targetPayers.forEach(p => {
+        entries.push({
+          date: m.stmt.date || sh.startDate || m.stmt.dateStr || "",
+          desc: `${sh.desc} (${progressStr})`,
+          rawEmi: shareEmi,
+          amount: Number(shareEmi.toFixed(2)),
+          sourceCategory: (m.sheetRows.length === 1 && targetPayers.length === 1) ? "✅ Matched Statement" : "✅ Matched Split",
+          defaultPayer: p,
+          defaultAction: `✅ Billed to ${p}`,
+          defaultNote: `Matched Stmt: ${m.stmt.desc}`
+        });
+      });
+    });
+
+    if (entries.length > 0) {
+      const rawSum = entries.reduce((s, e) => s + e.rawEmi, 0);
+      const roundedSum = entries.reduce((s, e) => s + e.amount, 0);
+      const roundingResidual = Number((m.stmt.amount - roundedSum).toFixed(2));
+      if (Math.abs(roundingResidual) >= 0.01) {
+        const last = entries[entries.length - 1];
+        last.amount = Number((last.amount + roundingResidual).toFixed(2));
+      }
+      const rawDiff = m.stmt.amount - rawSum;
+      if (Math.abs(rawDiff) >= 0.01) {
+        entries.forEach(e => {
+          e.defaultNote += ` (⚠️ Stmt: ${m.stmt.amount.toFixed(2)} vs Sheet: ${rawSum.toFixed(2)})`;
+        });
+      }
+      entries.forEach(e => matchedInstItems.push(e));
+    }
+  });
+
+  const installmentReconItems = [...unmatchedStmtItems, ...unmatchedSheetItems, ...matchedInstItems];
+  const instOccTracker = {};
+  installmentReconItems.forEach((item, idx) => {
+    item.id = `INST-${idx + 1}`;
+    const baseKey = makeReconKey(item.date, item.amount, item.desc, tz);
+    instOccTracker[baseKey] = (instOccTracker[baseKey] || 0) + 1;
+    const occ = instOccTracker[baseKey];
+    const pKeyWithOcc = `${baseKey}_#${occ}`;
+    const amtDescKey = `${item.amount.toFixed(2)}_${makeNormDesc(item.desc).substring(0, 30)}`;
+    const amtDescKeyWithOcc = `${amtDescKey}_#${occ}`;
+
+    const saved = (reconStore.installmentOverrides && (
+      reconStore.installmentOverrides[pKeyWithOcc] ||
+      reconStore.installmentOverrides[amtDescKeyWithOcc] ||
+      (occ === 1 ? (reconStore.installmentOverrides[baseKey] || reconStore.installmentOverrides[amtDescKey]) : null)
+    )) || null;
+
+    if (saved && saved.action !== undefined) {
+      item.action = saved.action;
+      item.note = saved.note || item.defaultNote;
+    } else {
+      item.action = item.defaultAction;
+      item.note = item.defaultNote;
+    }
+    item.primaryKey = pKeyWithOcc;
+    item.isNeglected = isNeglectedPayer(item.action);
   });
 
   // 5. Multi-Pass Matching for Purchases (DEBIT)
@@ -1764,6 +1939,7 @@ function reconcileActiveStatement(ss, tz) {
   return {
     stmtDebits,
     stmtInstallments,
+    installmentReconItems,
     stmtFees,
     stmtCredits,
     suggestedMatches,
@@ -1855,10 +2031,13 @@ function buildDebtLedger(ss, tz, recon) {
     }
   });
 
-  // 2. Attributed Installments (Matched Statement Installments)
-  recon.stmtInstallments.forEach(st => {
-    if (st.assignedPayer) {
-      addShare(st.assignedPayer, st.amount, "Installment");
+  // 2. Attributed Installments (From Table 4 Installment Reconciliation Items)
+  (recon.installmentReconItems || []).forEach(inst => {
+    const act = String(inst.action || "").trim();
+    if (!act || isNeglectedPayer(act)) return;
+    const cleanPayer = act.replace(/^✅\s*Billed\s+to\s+/i, "").trim();
+    if (cleanPayer && !isNeglectedPayer(cleanPayer)) {
+      addShare(cleanPayer, inst.amount, "Installment");
     }
   });
 
@@ -2040,6 +2219,15 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const startTxRow = startTxHeaderRow + 2;
   const endTxRow = startTxRow + Math.max(1, numUnmatched) - 1;
 
+  // Build Table 4 Installments Reconciliation Items
+  const instReconList = recon.installmentReconItems || [];
+  const numInstRecon = instReconList.length;
+  const hasTable4 = numInstRecon > 0;
+  const prevEndRow = hasTable3 ? endTxRow : endExRow;
+  const startInstHeaderRow = prevEndRow + 3;
+  const startInstRow = startInstHeaderRow + 2;
+  const endInstRow = startInstRow + Math.max(1, numInstRecon) - 1;
+
   // 3. Overview Card & Balance Waterfall (Declarative Formulas)
   sheet.getRange("A4:H4").merge()
     .setValue("📊 Active Statement Overview & Mathematical Balance Waterfall")
@@ -2141,6 +2329,9 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       const purchFormula = hasTable3
         ? `=${ps.matchedPurchases.toFixed(2)} + SUMIFS($D$${startTxRow}:$D$${endTxRow}, $E$${startTxRow}:$E$${endTxRow}, $B${r}, $F$${startTxRow}:$F$${endTxRow}, "<>🚫*")`
         : `=${ps.matchedPurchases.toFixed(2)}`;
+      const instFormula = hasTable4
+        ? `=SUMIFS($D$${startInstRow}:$D$${endInstRow}, $F$${startInstRow}:$F$${endInstRow}, "*" & TRIM($B${r}) & "*", $F$${startInstRow}:$F$${endInstRow}, "<>🚫*")`
+        : `=${ps.installments.toFixed(2)}`;
       const feesFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Bank Fee / Tax")`;
       const unrecFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Missing Purchase")`;
       const refFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Refund / Credit")`;
@@ -2150,7 +2341,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
         idx + 1,
         ps.person,
         purchFormula,
-        ps.installments,
+        instFormula,
         feesFormula,
         unrecFormula,
         refFormula,
@@ -2281,6 +2472,72 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
 
       if (unmatchedList[i].isNeglected) {
         sheet.getRange(r, 1, 1, 8).setBackground("#eeeeee");
+      } else {
+        sheet.getRange(r, 1, 1, 8).setBackground("#f8f9fa");
+      }
+    }
+  }
+
+  // 7. Active Installments & Statement EMI Reconciliation (Table 4)
+  if (hasTable4) {
+    sheet.getRange(startInstHeaderRow, 1, 1, 8).merge()
+      .setValue(`📅 Active Installments & Statement EMI Reconciliation (${numInstRecon} Items — Live Formula Linked to Table 1)`)
+      .setFontWeight("bold")
+      .setFontSize(10)
+      .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
+
+    const instHeaders = ["#", "Date", "Installment Description", "Monthly EMI (EGP)", "Match Source", "Billing Action / Payer", "Custom Note", "Status"];
+    sheet.getRange(startInstHeaderRow + 1, 1, 1, instHeaders.length).setValues([instHeaders])
+      .setFontWeight("bold")
+      .setFontSize(9)
+      .setBackground(CONFIG.COLORS.HEADER);
+
+    const instRows = instReconList.map((inst, idx) => {
+      const r = startInstRow + idx;
+      const statusFormula = `=IF(ISBLANK(F${r}), "⚠️ Needs Payer", IF(LEFT(F${r}, 1)="🚫", "🚫 Skipped This Cycle", IF(LEFT(F${r}, 1)="✅", F${r}, "✅ Billed to " & F${r})))`;
+      return [
+        inst.id,
+        inst.date,
+        inst.desc,
+        inst.amount,
+        inst.sourceCategory,
+        inst.action,
+        inst.note,
+        statusFormula
+      ];
+    });
+
+    sheet.getRange(startInstRow, 1, instRows.length, instHeaders.length).setValues(instRows).setFontSize(9);
+    sheet.getRange(startInstRow, 2, instRows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(startInstRow, 4, instRows.length, 1).setNumberFormat("#,##0.00");
+
+    const instPayersList = getAllUniquePayers(ss);
+    for (let i = 0; i < instReconList.length; i++) {
+      const r = startInstRow + i;
+      const inst = instReconList[i];
+      const options = [];
+      if (inst.defaultPayer) {
+        options.push(`✅ Billed to ${inst.defaultPayer}`);
+      }
+      instPayersList.forEach(p => {
+        const opt = `✅ Billed to ${p}`;
+        if (!options.includes(opt)) options.push(opt);
+      });
+      options.push("🚫 Neglect / Skip This Cycle");
+      options.push("🚫 Not on Statement (Skip)");
+
+      const instValidation = SpreadsheetApp.newDataValidation()
+        .requireValueInList(options, true)
+        .setAllowInvalid(true)
+        .build();
+      sheet.getRange(r, 6).setDataValidation(instValidation);
+
+      if (!inst.action) {
+        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.DUE_SOON);
+      } else if (isNeglectedPayer(inst.action)) {
+        sheet.getRange(r, 1, 1, 8).setBackground("#eeeeee");
+      } else if (inst.sourceCategory && inst.sourceCategory.includes("Statement Only")) {
+        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
       } else {
         sheet.getRange(r, 1, 1, 8).setBackground("#f8f9fa");
       }
@@ -2944,6 +3201,83 @@ function handleActiveReconEdit(e) {
     } else {
       reconStore.neglectedTx.delete(txId);
       sheet.getRange(row, 1, 1, 8).setBackground("#f8f9fa");
+    }
+
+    saveAllReconStore(ss, reconStore);
+    // ZERO SCREEN WIPE: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
+    return;
+  }
+
+  // Case 3: Edit in Table 4 (INST-*)
+  if (/^INST-\d+/i.test(firstCol)) {
+    const instId = firstCol;
+    const rawDate = rowVals[1];
+    const origDesc = String(rowVals[2] || "").trim();
+    const amt = parseFloat(rowVals[3]);
+    let actionVal = String(rowVals[5] || "").trim();
+    const note = String(rowVals[6] || "").trim();
+
+    if (isNaN(amt) || amt <= 0 || !origDesc) return;
+
+    // Normalize bare family member name (e.g. "Mido" -> "✅ Billed to Mido")
+    if (actionVal && !isNeglectedPayer(actionVal) && !/^✅\s*Billed\s+to\s+/i.test(actionVal)) {
+      const cleanName = formatPayerCell(actionVal);
+      if (cleanName) {
+        actionVal = `✅ Billed to ${cleanName}`;
+        sheet.getRange(row, 6).setValue(actionVal);
+      }
+    }
+
+    // Calculate occurrence number within Table 4
+    let occ = 1;
+    let scanRow = row - 1;
+    while (scanRow >= 14) {
+      const prevVals = sheet.getRange(scanRow, 1, 1, 4).getValues()[0];
+      const prevId = String(prevVals[0] || "").trim();
+      if (!/^INST-\d+/i.test(prevId)) break;
+      const pDesc = String(prevVals[2] || "").trim();
+      const pAmt = parseFloat(prevVals[3]) || 0;
+      if (Math.abs(pAmt - amt) < 0.01 && makeNormDesc(pDesc) === makeNormDesc(origDesc)) {
+        occ++;
+      }
+      scanRow--;
+    }
+
+    const baseKey = makeReconKey(rawDate, amt, origDesc, tz);
+    const pKeyWithOcc = `${baseKey}_#${occ}`;
+    const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}_#${occ}`;
+    const isNeg = isNeglectedPayer(actionVal);
+
+    if (!reconStore.installmentOverrides) reconStore.installmentOverrides = {};
+
+    if (actionVal) {
+      const rec = {
+        primaryKey: pKeyWithOcc,
+        instId: instId,
+        dateStr: makeNormDateStr(rawDate, tz),
+        desc: origDesc,
+        amount: amt,
+        action: actionVal,
+        note: note,
+        isNeglected: isNeg
+      };
+      reconStore.installmentOverrides[pKeyWithOcc] = rec;
+      reconStore.installmentOverrides[amtDescKey] = rec;
+      reconStore.installmentOverrides[instId] = rec;
+      if (occ === 1) {
+        reconStore.installmentOverrides[baseKey] = rec;
+        reconStore.installmentOverrides[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`] = rec;
+      }
+      sheet.getRange(row, 1, 1, 8).setBackground(isNeg ? "#eeeeee" : CONFIG.COLORS.PAID);
+    } else {
+      delete reconStore.installmentOverrides[pKeyWithOcc];
+      delete reconStore.installmentOverrides[amtDescKey];
+      delete reconStore.installmentOverrides[instId];
+      if (occ === 1) {
+        delete reconStore.installmentOverrides[baseKey];
+        delete reconStore.installmentOverrides[`${amt.toFixed(2)}_${makeNormDesc(origDesc).substring(0, 30)}`];
+      }
+      sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.DUE_SOON);
     }
 
     saveAllReconStore(ss, reconStore);
