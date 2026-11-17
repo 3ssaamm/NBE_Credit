@@ -159,7 +159,8 @@ function hasMerchantKeywordOverlap(desc1, desc2) {
     { key: "fathalla", terms: ["fathalla"] },
     { key: "buffalo", terms: ["buffalo"] },
     { key: "caribou", terms: ["caribou"] },
-    { key: "basilico", terms: ["basilico"] },
+    { key: "basilico", terms: ["basilico", "bazlykwa", "bazlikwa"] },
+    { key: "rabbit", terms: ["rabbit", "sahl"] },
     { key: "maria", terms: ["maria"] },
     { key: "lail", terms: ["lail"] },
     { key: "asteria", terms: ["asteria"] },
@@ -1809,6 +1810,40 @@ function reconcileActiveStatement(ss, tz) {
   });
 
   // 5. Multi-Pass Matching for Purchases (DEBIT)
+  function daysBetween(d1, d2) {
+    if (!d1 || !d2) return 0;
+    return Math.abs((d1.getTime() - d2.getTime()) / (1000 * 60 * 60 * 24));
+  }
+
+  function markStatementMatched(st, items) {
+    st.matched = true;
+    st.matchedItems = items;
+    items.forEach(tx => { tx.matched = true; });
+    st.assignedPayer = [...new Set(items.map(tx => tx.person))].join(" + ");
+  }
+
+  function isDedicatedUnrecordedMerchant(desc) {
+    const d = String(desc || "").toLowerCase();
+    return d.includes("nutopia") || d.includes("sutherland") || d.includes("google one") || d.includes("stamp tax");
+  }
+
+  function runSubsetSplitPass(requireKeywordOverlap) {
+    stmtDebits.forEach(st => {
+      if (st.matched) return;
+      if (!requireKeywordOverlap && isDedicatedUnrecordedMerchant(st.desc)) return;
+      const nearby = txDebits.filter(tx => {
+        if (tx.matched) return false;
+        if (st.date && tx.date && daysBetween(st.date, tx.date) > 5) return false;
+        return !requireKeywordOverlap || hasMerchantKeywordOverlap(st.desc, tx.desc);
+      });
+      if (nearby.length < 2) return;
+      const combo = findSubsetCombination(nearby, st.amount, 6, 0.10);
+      if (combo) {
+        markStatementMatched(st, combo);
+      }
+    });
+  }
+
   // Pass 0: Confirmed Matches from Store
   stmtDebits.forEach(st => {
     const pKey = makeReconKey(st.date || st.dateStr, st.amount, st.desc, tz);
@@ -1816,38 +1851,51 @@ function reconcileActiveStatement(ss, tz) {
     if (reconStore.confirmedMatches.has(pKey) || reconStore.confirmedMatches.has(amtDescKey)) {
       const match = txDebits.find(tx => !tx.matched && Math.abs(tx.amount - st.amount) <= 0.05);
       if (match) {
-        st.matched = true;
-        match.matched = true;
-        st.assignedPayer = match.person;
+        markStatementMatched(st, [match]);
       }
     }
   });
 
-  // Pass 1: Strict Match (Amount within 0.05, Date within 3 days, Keyword Overlap)
+  // Pass 1: Strict 1-to-1 Match (Amount within 0.05, Date within 5 days, Keyword Overlap)
   stmtDebits.forEach(st => {
     if (st.matched) return;
     const candidates = txDebits.filter(tx => {
       if (tx.matched) return false;
       if (Math.abs(tx.amount - st.amount) > 0.05) return false;
-      if (st.date && tx.date) {
-        const daysDiff = Math.abs((tx.date.getTime() - st.date.getTime()) / (1000 * 60 * 60 * 24));
-        if (daysDiff > 3) return false;
-      }
+      if (st.date && tx.date && daysBetween(st.date, tx.date) > 5) return false;
       return hasMerchantKeywordOverlap(st.desc, tx.desc);
     });
 
     if (candidates.length > 0) {
-      candidates.sort((a, b) => {
-        const dA = (st.date && a.date) ? Math.abs(a.date.getTime() - st.date.getTime()) : 0;
-        const dB = (st.date && b.date) ? Math.abs(b.date.getTime() - st.date.getTime()) : 0;
-        return dA - dB;
-      });
-      const match = candidates[0];
-      st.matched = true;
-      match.matched = true;
-      st.assignedPayer = match.person;
+      candidates.sort((a, b) => daysBetween(st.date, a.date) - daysBetween(st.date, b.date));
+      markStatementMatched(st, [candidates[0]]);
     }
   });
+
+  // Pass 2a: N-way Split Match with Keyword Overlap (e.g. multi-person Amazon order)
+  runSubsetSplitPass(true);
+
+  // Pass 2b: 1-to-1 Exact Amount (<= 0.05) + Date (<= 5 days) sorted globally by smallest date diff
+  const pairCandidates = [];
+  stmtDebits.forEach(st => {
+    if (st.matched || isDedicatedUnrecordedMerchant(st.desc)) return;
+    txDebits.forEach(tx => {
+      if (tx.matched) return;
+      if (Math.abs(tx.amount - st.amount) > 0.05) return;
+      const diff = (st.date && tx.date) ? daysBetween(st.date, tx.date) : 0;
+      if (st.date && tx.date && diff > 5) return;
+      pairCandidates.push({ st, tx, diff });
+    });
+  });
+  pairCandidates.sort((a, b) => a.diff - b.diff);
+  pairCandidates.forEach(pair => {
+    if (!pair.st.matched && !pair.tx.matched) {
+      markStatementMatched(pair.st, [pair.tx]);
+    }
+  });
+
+  // Pass 2c: N-way Split Match by Amount + Date (<= 5 days) across different POS names
+  runSubsetSplitPass(false);
 
   const suggestedMatches = [];
   const missingInSheet = stmtDebits.filter(st => !st.matched);
@@ -2066,7 +2114,14 @@ function buildDebtLedger(ss, tz, recon) {
 
   // 1a. Attributed Matched Purchases (Statement Debits matched to Sheet)
   recon.stmtDebits.forEach(st => {
-    if (st.matched && st.assignedPayer && !isNeglectedPayer(st.assignedPayer)) {
+    if (!st.matched) return;
+    if (st.matchedItems && st.matchedItems.length > 1) {
+      st.matchedItems.forEach(tx => {
+        if (tx.person && !isNeglectedPayer(tx.person)) {
+          addShare(tx.person, tx.amount, "MatchedPurchase");
+        }
+      });
+    } else if (st.assignedPayer && !isNeglectedPayer(st.assignedPayer)) {
       addShare(st.assignedPayer, st.amount, "MatchedPurchase");
     }
   });

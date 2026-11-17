@@ -750,4 +750,52 @@ const sec3Formula = String(mbSheet6._getCell(sec3BannerRow + 2, 8) || "");
 assert.ok(sec3Formula.includes("FILTER(ARRAYFORMULA(") && sec3Formula.includes("Active Bill & Reconciliation"), "Section 3 spill must filter Table 2 from Active Bill & Reconciliation");
 
 console.log("  PASS: Member Breakdown midnight date boundary, installment parity (1,484.61), and Section 3 verified!");
+
+// ==========================================
+// Test 7: Multi-Pass Cross-Gateway Matching, Multi-Row Uneven Split & No Table 2/3 Duplication
+// ==========================================
+console.log("Running Test 7: Multi-Pass Cross-Gateway Matching, Multi-Row Uneven Split & No Duplication...");
+
+const ss7 = new MockSpreadsheet();
+sandbox.SpreadsheetApp.getActiveSpreadsheet = () => ss7;
+
+const stmt7 = ss7.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
+stmt7.getRange(2, 1, 3, 6).setValues([
+  ["Statement Date:", new Date(2026, 9, 30, 12, 0, 0), "Due Date:", new Date(2026, 10, 25, 12, 0, 0), "Credit Limit:", 100000],
+  ["Opening Balance:", 0, "Closing Balance:", 2375.90, "Total Debit:", 2375.90],
+  ["Total Credit:", 0, "Card Number:", "1234", "Net:", 2375.90]
+]);
+stmt7.getRange(7, 1, 4, 7).setValues([
+  [1, new Date(2026, 9, 2, 12, 0, 0), new Date(2026, 9, 2, 12, 0, 0), "FAWRY*BAZLYKWA ALEX EGY \"MOBILE TOKEN\"", "DEBIT", 1447.80, ""],
+  [2, new Date(2026, 9, 4, 12, 0, 0), new Date(2026, 9, 4, 12, 0, 0), "SAHL GIZA EGY", "DEBIT", 80.00, ""],
+  [3, new Date(2026, 9, 3, 12, 0, 0), new Date(2026, 9, 3, 12, 0, 0), "BASATA PAY MAADI EGY \"MOBILE TOKEN\"", "DEBIT", 15.00, ""],
+  [4, new Date(2026, 9, 8, 12, 0, 0), new Date(2026, 9, 8, 12, 0, 0), "AMAZON", "DEBIT", 833.10, ""]
+]);
+
+const tx7 = ss7.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
+tx7.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
+tx7.getRange(2, 1, 7, 5).setValues([
+  [1, new Date(2026, 9, 2, 0, 0, 0), "Basilico", "Mido", 1447.80],
+  [2, new Date(2026, 9, 4, 0, 0, 0), "rabbit", "Muhanad", 80.00],
+  [3, new Date(2026, 9, 6, 0, 0, 0), "rabbit", "Muhanad", 15.00],
+  [4, new Date(2026, 9, 8, 0, 0, 0), "Amazon", "Mido", 333.10],
+  [5, new Date(2026, 9, 8, 0, 0, 0), "Amazon", "Dad", 200.00],
+  [6, new Date(2026, 9, 8, 0, 0, 0), "Amazon", "Mum", 200.00],
+  [7, new Date(2026, 9, 8, 0, 0, 0), "Amazon", "Muhanad", 100.00]
+]);
+
+const recon7 = sandbox.reconcileActiveStatement(ss7, tz);
+assert.strictEqual(recon7.missingInSheet.length, 0, `Expected 0 missing in Table 2, got ${recon7.missingInSheet.length}`);
+assert.strictEqual(recon7.expandedUnmatched.length, 0, `Expected 0 unmatched in Table 3, got ${recon7.expandedUnmatched.length}`);
+assert.ok(recon7.stmtDebits.every(st => st.matched), "All 4 statement debits must match!");
+
+const ledger7 = sandbox.buildDebtLedger(ss7, tz, recon7);
+const shares7 = {};
+ledger7.personShares.forEach(ps => { shares7[ps.person] = Number(ps.purchases.toFixed(2)); });
+assert.strictEqual(shares7["Mido"], 1780.90, `Mido purchases mismatch: ${shares7["Mido"]}`);
+assert.strictEqual(shares7["Dad"], 200.00, `Dad purchases mismatch: ${shares7["Dad"]}`);
+assert.strictEqual(shares7["Mum"], 200.00, `Mum purchases mismatch: ${shares7["Mum"]}`);
+assert.strictEqual(shares7["Muhanad"], 195.00, `Muhanad purchases mismatch: ${shares7["Muhanad"]}`);
+
+console.log("  PASS: Cross-gateway matching, multi-row uneven split attribution, and zero duplication verified!");
 console.log("ALL TABLE 4 INSTALLMENT TESTS PASSED!");
