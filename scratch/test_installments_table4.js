@@ -791,4 +791,62 @@ assert.strictEqual(shares7["Mum"], 200.00, `Mum purchases mismatch: ${shares7["M
 assert.strictEqual(shares7["Muhanad"], 195.00, `Muhanad purchases mismatch: ${shares7["Muhanad"]}`);
 
 console.log("  PASS: Cross-gateway matching, multi-row uneven split attribution, and zero duplication verified!");
+
+// ==========================================
+// Test 8: All Statement Credits Shown in Table 2 & Neglect/Use Persistence
+// ==========================================
+console.log("Running Test 8: All Statement Credits Shown in Table 2 & Neglect/Use Persistence...");
+const ss8 = new MockSpreadsheet();
+const stmt8 = ss8.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
+stmt8.getRange(2, 1, 3, 6).setValues([
+  ["Statement Date:", new Date(2026, 9, 31, 12, 0, 0), "Due Date:", new Date(2026, 10, 27, 12, 0, 0), "Credit Limit:", 100000],
+  ["Opening Balance:", 1000, "Closing Balance:", 0, "Total Debit:", 0],
+  ["Total Credit:", 1600, "Card Number:", "1234", "Net:", 0]
+]);
+stmt8.getRange(7, 1, 3, 7).setValues([
+  [1, new Date(2026, 9, 5, 12, 0, 0), new Date(2026, 9, 5, 12, 0, 0), "INSTAPAY PAYMENT - THANK YOU", "CREDIT", 1000.00, ""],
+  [2, new Date(2026, 9, 10, 12, 0, 0), new Date(2026, 9, 10, 12, 0, 0), "FAWRY SETTLEMENT CREDIT", "CREDIT", 400.00, ""],
+  [3, new Date(2026, 9, 12, 12, 0, 0), new Date(2026, 9, 12, 12, 0, 0), "MICROSOFT*MICROSOFT 365 REFUND", "CREDIT", 200.00, ""]
+]);
+const tx8 = ss8.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
+tx8.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
+tx8.getRange(2, 1, 1, 5).setValues([[1, new Date(2026, 9, 15, 0, 0, 0), "Test", "Mido", 1000.00]]);
+
+let recon8 = sandbox.reconcileActiveStatement(ss8, tz);
+let ledger8 = sandbox.buildDebtLedger(ss8, tz, recon8);
+sandbox.renderActiveReconciliationSheet(ss8, tz, ledger8, recon8);
+
+const ar8 = ss8.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+const cRows8 = [];
+for (let r = 12; r <= ar8.getLastRow(); r++) {
+  const id = String(ar8._getCell(r, 1) || "");
+  if (/^C-\d+/.test(id)) {
+    cRows8.push({ row: r, id, desc: ar8._getCell(r, 3), amt: ar8._getCell(r, 4), payer: ar8._getCell(r, 6) });
+  }
+}
+assert.strictEqual(cRows8.length, 3, `All 3 credits must be shown in Table 2, got ${cRows8.length}`);
+assert.strictEqual(cRows8[0].payer, "🚫 Neglect / Ignore", "Payment credit C-1 should default to Neglect");
+assert.strictEqual(cRows8[1].payer, "🚫 Neglect / Ignore", "Settlement credit C-2 should default to Neglect");
+assert.strictEqual(cRows8[2].payer, CONFIG.DEFAULT_FEE_PAYER, "Refund credit C-3 should default to DEFAULT_FEE_PAYER");
+assert.strictEqual(Number(ledger8.refundsTotal.toFixed(2)), 200.00, "Only non-neglected credit (200) should count initially");
+
+// User decides to USE C-2 for Mido and NEGLECT C-3
+ar8._setCell(cRows8[1].row, 6, "Mido");
+sandbox.handleActiveReconEdit({ range: ar8.getRange(cRows8[1].row, 6, 1, 1) });
+ar8._setCell(cRows8[2].row, 6, "🚫 Neglect / Ignore");
+sandbox.handleActiveReconEdit({ range: ar8.getRange(cRows8[2].row, 6, 1, 1) });
+
+// Refresh and verify persistence + ledger totals
+sandbox.syncActiveReconSheetToStore(ss8, tz);
+recon8 = sandbox.reconcileActiveStatement(ss8, tz);
+ledger8 = sandbox.buildDebtLedger(ss8, tz, recon8);
+sandbox.renderActiveReconciliationSheet(ss8, tz, ledger8, recon8);
+
+const midoShare8 = ledger8.personShares.find(ps => ps.person === "Mido");
+const maiShare8 = ledger8.personShares.find(ps => ps.person === CONFIG.DEFAULT_FEE_PAYER);
+assert.strictEqual(Number(midoShare8.refunds.toFixed(2)), 400.00, "Mido should receive C-2 (400.00) credit after refresh");
+assert.strictEqual(Number(maiShare8.refunds.toFixed(2)), 0.00, "Mai should have 0.00 credit after neglecting C-3");
+assert.strictEqual(Number(ledger8.refundsTotal.toFixed(2)), 400.00, "Total refunds should be 400.00");
+
+console.log("  PASS: All statement credits shown in Table 2 with default Neglect for payments and full persistence!");
 console.log("ALL TABLE 4 INSTALLMENT TESTS PASSED!");

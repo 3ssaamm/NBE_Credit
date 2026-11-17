@@ -196,6 +196,10 @@ function isNeglectedPayer(name) {
   return s.includes("neglect") || s.includes("ignore") || s.startsWith("🚫") || s === "none" || s === "-";
 }
 
+function isPaymentCreditDesc(desc) {
+  return /\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(String(desc || ""));
+}
+
 function normalizePersonName(name) {
   if (!name) return "";
   // Strip any parenthetical suffix like (split), (Split), (cart), etc.
@@ -1950,7 +1954,9 @@ function reconcileActiveStatement(ss, tz) {
           : (formatPayerCell(saved.payer) || saved.payer);
         it.note = saved.note || options.defaultNote(it);
       } else if (options.defaultPayer !== undefined) {
-        it.assignedPayer = options.defaultPayer;
+        it.assignedPayer = typeof options.defaultPayer === "function"
+          ? options.defaultPayer(it)
+          : options.defaultPayer;
         it.note = options.defaultNote(it);
       }
     });
@@ -1970,7 +1976,10 @@ function reconcileActiveStatement(ss, tz) {
 
   // 8. Restore refunds / credits assignments
   restoreTable2Group(stmtCredits, {
-    defaultNote: cr => cr.desc
+    defaultPayer: cr => isPaymentCreditDesc(cr.desc) ? "🚫 Neglect / Ignore" : CONFIG.DEFAULT_FEE_PAYER,
+    defaultNote: cr => isPaymentCreditDesc(cr.desc)
+      ? "Bill Payment / Settlement (Neglected by default)"
+      : "Merchant Refund (Reduces Debt)"
   });
 
   saveAllReconStore(ss, reconStore);
@@ -2171,12 +2180,11 @@ function buildDebtLedger(ss, tz, recon) {
   // 5. Attributed Refunds / Credits
   let billPaymentsTotal = 0;
   recon.stmtCredits.forEach(cr => {
-    const isPayment = /\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(cr.desc);
-    if (isPayment) {
+    if (isPaymentCreditDesc(cr.desc)) {
       billPaymentsTotal += cr.amount;
-    } else {
-      // Refund / Cashback
-      addShare(cr.assignedPayer || CONFIG.DEFAULT_FEE_PAYER, cr.amount, "Refund");
+    }
+    if (cr.assignedPayer && !isNeglectedPayer(cr.assignedPayer)) {
+      addShare(cr.assignedPayer, cr.amount, "Refund");
     }
   });
 
@@ -2247,8 +2255,8 @@ function getReconTableBounds(ledger, recon) {
   const endShareRow = startShareRow + numPayers - 1;
   const totShareRow = endShareRow + 1;
 
-  const nonPaymentCreditsCount = (recon.stmtCredits || []).filter(c => !/\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(c.desc)).length;
-  const numExceptions = (recon.stmtFees ? recon.stmtFees.length : 0) + nonPaymentCreditsCount + (recon.missingInSheet ? recon.missingInSheet.length : 0);
+  const creditsCount = recon.stmtCredits ? recon.stmtCredits.length : 0;
+  const numExceptions = (recon.stmtFees ? recon.stmtFees.length : 0) + creditsCount + (recon.missingInSheet ? recon.missingInSheet.length : 0);
   const startExHeaderRow = totShareRow + 3;
   const startExRow = startExHeaderRow + 2;
   const endExRow = startExRow + Math.max(1, numExceptions) - 1;
@@ -2316,18 +2324,15 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   });
 
   recon.stmtCredits.forEach((c, idx) => {
-    const isPayment = /\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(c.desc);
-    if (!isPayment) {
-      exceptionItems.push({
-        id: `C-${idx + 1}`,
-        date: c.date || c.dateStr,
-        desc: c.desc,
-        amount: c.amount,
-        category: "Refund / Credit",
-        assignedPayer: c.assignedPayer || CONFIG.DEFAULT_FEE_PAYER,
-        note: c.note || "Merchant Refund (Reduces Debt)"
-      });
-    }
+    exceptionItems.push({
+      id: `C-${idx + 1}`,
+      date: c.date || c.dateStr,
+      desc: c.desc,
+      amount: c.amount,
+      category: "Refund / Credit",
+      assignedPayer: c.assignedPayer || "",
+      note: c.note || (isPaymentCreditDesc(c.desc) ? "Bill Payment / Settlement (Neglected by default)" : "Merchant Refund (Reduces Debt)")
+    });
   });
 
   recon.missingInSheet.forEach((m, idx) => {
@@ -2559,10 +2564,10 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     for (let i = 0; i < exceptionItems.length; i++) {
       const cat = exceptionItems[i].category;
       const payer = exceptionItems[i].assignedPayer;
-      if (cat === "Refund / Credit") {
-        sheet.getRange(startExRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
-      } else if (isNeglectedPayer(payer)) {
+      if (isNeglectedPayer(payer)) {
         sheet.getRange(startExRow + i, 1, 1, 8).setBackground("#eeeeee");
+      } else if (cat === "Refund / Credit") {
+        sheet.getRange(startExRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
       } else if (payer) {
         sheet.getRange(startExRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
       }
