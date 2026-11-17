@@ -2435,10 +2435,13 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange("D5:D7").setNumberFormat("#,##0.00");
   sheet.getRange("F6:F7").setNumberFormat("#,##0.00");
 
-  // Waterfall Explanation Bar (Formula)
-  const waterfallFormula = `="Waterfall: Purchases (" & TEXT(C${totShareRow}, "#,##0.00") & ") + Installments (" & TEXT(D${totShareRow}, "#,##0.00") & ") + Fees (" & TEXT(E${totShareRow}, "#,##0.00") & ") + Unrecorded (" & TEXT(F${totShareRow}, "#,##0.00") & ") - Refunds (" & TEXT(G${totShareRow}, "#,##0.00") & ") = Family Shares (" & TEXT(H${totShareRow}, "#,##0.00") & ") | Bank Closing Bill: " & TEXT(D5, "#,##0.00") & " EGP"`;
+  // Difference Detective & Live Breakdown Bar (Formula)
+  const t3BilledExpr = hasTable3 ? `SUMIFS(D${startTxRow}:D${endTxRow}, F${startTxRow}:F${endTxRow}, "<>🚫*")` : "0";
+  const t2UnassignedExpr = numExceptions > 0 ? `SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "", E${startExRow}:E${endExRow}, "<>Refund / Credit")` : "0";
+  const t2NeglectedExpr = numExceptions > 0 ? `SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "🚫*", E${startExRow}:E${endExRow}, "<>Refund / Credit")` : "0";
+  const diffDetectiveFormula = `="🔍 Diff Detective (" & IF(F6>=0,"+","") & TEXT(F6,"#,##0.00") & " EGP): Table 3 Extra Sheet Tx Billed: +" & TEXT(${t3BilledExpr},"#,##0.00") & " | Table 2 Unassigned: -" & TEXT(${t2UnassignedExpr},"#,##0.00") & " | Table 2 Neglected: -" & TEXT(${t2NeglectedExpr},"#,##0.00") & " | Inst/Stmt/Other: " & TEXT(F6 - (${t3BilledExpr}) + (${t2UnassignedExpr}) + (${t2NeglectedExpr}),"+#,##0.00;-#,##0.00;0.00")`;
   sheet.getRange("A8:H8").merge()
-    .setValue(waterfallFormula)
+    .setFormula(diffDetectiveFormula)
     .setFontSize(8)
     .setFontStyle("italic")
     .setFontColor(CONFIG.COLORS.TEXT_MUTED)
@@ -2508,11 +2511,15 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange(totShareRow, 3, 1, 6).setNumberFormat("#,##0.00");
 
   // 5. Actionable Exceptions Table (Table 2 - Statement Review / Assignment)
-  sheet.getRange(startExHeaderRow, 1, 1, 8).merge()
-    .setValue(`⚠️ Actionable Statement Charges & Exceptions (${numExceptions} Items Requiring Review / Assignment)`)
+  const t2BannerRange = sheet.getRange(startExHeaderRow, 1, 1, 8).merge()
     .setFontWeight("bold")
     .setFontSize(10)
     .setBackground(CONFIG.COLORS.DUE_SOON);
+  if (numExceptions > 0) {
+    t2BannerRange.setFormula(`="⚠️ Actionable Statement Charges & Exceptions (" & ${numExceptions} & " Items | Unassigned: " & COUNTIFS(F${startExRow}:F${endExRow}, "") & " items = " & TEXT(${t2UnassignedExpr}, "#,##0.00") & " EGP)"`);
+  } else {
+    t2BannerRange.setValue("⚠️ Actionable Statement Charges & Exceptions (0 Items)");
+  }
 
   const exHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Category", "Assign Payer", "Custom Note", "Status"];
   sheet.getRange(startExHeaderRow + 1, 1, 1, exHeaders.length).setValues([exHeaders])
@@ -2565,7 +2572,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   // 6. Sheet Transactions Not on Current Bank Statement (Table 3 - Billed by Default)
   if (hasTable3) {
     sheet.getRange(startTxHeaderRow, 1, 1, 8).merge()
-      .setValue(`⏳ Transactions in Sheet Not on Current Bank Statement (${numUnmatched} Items — Billed to Family Members by Default)`)
+      .setFormula(`="⏳ Transactions in Sheet Not on Current Bank Statement (" & COUNTIF(F${startTxRow}:F${endTxRow}, "<>🚫*") & " of " & ${numUnmatched} & " Billed = +" & TEXT(${t3BilledExpr}, "#,##0.00") & " EGP added above Bank Bill — Set to 🚫 Neglect to exclude)"`)
       .setFontWeight("bold")
       .setFontSize(10)
       .setBackground("#e8eaed");
