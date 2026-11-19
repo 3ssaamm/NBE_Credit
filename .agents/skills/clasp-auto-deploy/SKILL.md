@@ -18,7 +18,10 @@ All code changes to `Code.js`, `.gs` files, or `appsscript.json` in this workspa
    node -c Code.js
    ```
 2. **Run Local Verification**:
-   Run relevant verification scripts in `scratch/` when modifying logic in `Code.js`.
+   Run the automated test suite (`npm test`) whenever modifying logic in `Code.js` or `src/*.js`:
+   ```powershell
+   npm test
+   ```
 3. **Push to Google Apps Script**:
    Deploy directly from the repository root (where `.clasp.json` resides):
    ```powershell

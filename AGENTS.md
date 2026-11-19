@@ -8,7 +8,10 @@ Whenever you create, edit, or modify `Code.js`, any `.gs` file, or `appsscript.j
    ```powershell
    node -c Code.js
    ```
-2. Run any relevant local unit tests in `scratch/` (if present for the change).
+2. Run the project test suite before deploying (`npm test` must pass):
+   ```powershell
+   npm test
+   ```
 3. Automatically deploy the changes to the live Google Apps Script project without waiting to be asked:
    ```powershell
    clasp push -f

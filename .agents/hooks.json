@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "node ./hooks/auto-clasp-push.js",
-            "timeout": 30
+            "timeout": 45
           }
         ]
       }

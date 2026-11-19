@@ -142,6 +142,45 @@ function cleanMerchantName(str) {
   return s.trim();
 }
 
+const MERCHANT_ALIAS_GROUPS = [
+  { key: "internet", terms: ["internet", "we-fbb", "we-mobile", "vodafone", "telecom", "we"] },
+  { key: "cavalli", terms: ["cavalli"] },
+  { key: "amazon", terms: ["amazon"] },
+  { key: "uber", terms: ["uber"] },
+  { key: "careem", terms: ["careem"] },
+  { key: "fathalla", terms: ["fathalla"] },
+  { key: "buffalo", terms: ["buffalo"] },
+  { key: "caribou", terms: ["caribou"] },
+  { key: "basilico", terms: ["basilico", "bazlykwa", "bazlikwa"] },
+  { key: "rabbit", terms: ["rabbit", "sahl"] },
+  { key: "maria", terms: ["maria"] },
+  { key: "lail", terms: ["lail"] },
+  { key: "asteria", terms: ["asteria"] },
+  { key: "instashop", terms: ["instashop"] },
+  { key: "shein", terms: ["shein"] },
+  { key: "google", terms: ["google"] },
+  { key: "microsoft", terms: ["microsoft"] },
+  { key: "nutopia", terms: ["nutopia", "sutherland"] },
+  { key: "fawry", terms: ["fawry"] },
+  { key: "paymob", terms: ["paymob"] },
+  { key: "geidea", terms: ["geidea"] },
+  { key: "basata", terms: ["basata"] },
+  { key: "elabd", terms: ["elabd", "el abd"] },
+  { key: "viacaffe", terms: ["via caffe", "viacaffe", "caffe"] },
+  { key: "wave", terms: ["wave"] }
+];
+
+function getMerchantAliasKey(desc) {
+  const raw = String(desc || "").toLowerCase();
+  const full = raw + " " + cleanMerchantName(desc);
+  for (const a of MERCHANT_ALIAS_GROUPS) {
+    if (a.terms.some(t => full.includes(t))) {
+      return a.key;
+    }
+  }
+  return null;
+}
+
 function hasMerchantKeywordOverlap(desc1, desc2) {
   const raw1 = String(desc1 || "").toLowerCase();
   const raw2 = String(desc2 || "").toLowerCase();
@@ -150,35 +189,7 @@ function hasMerchantKeywordOverlap(desc1, desc2) {
   const full1 = raw1 + " " + c1;
   const full2 = raw2 + " " + c2;
 
-  const aliases = [
-    { key: "internet", terms: ["internet", "we-fbb", "we-mobile", "vodafone", "telecom", "we"] },
-    { key: "cavalli", terms: ["cavalli"] },
-    { key: "amazon", terms: ["amazon"] },
-    { key: "uber", terms: ["uber"] },
-    { key: "careem", terms: ["careem"] },
-    { key: "fathalla", terms: ["fathalla"] },
-    { key: "buffalo", terms: ["buffalo"] },
-    { key: "caribou", terms: ["caribou"] },
-    { key: "basilico", terms: ["basilico", "bazlykwa", "bazlikwa"] },
-    { key: "rabbit", terms: ["rabbit", "sahl"] },
-    { key: "maria", terms: ["maria"] },
-    { key: "lail", terms: ["lail"] },
-    { key: "asteria", terms: ["asteria"] },
-    { key: "instashop", terms: ["instashop"] },
-    { key: "shein", terms: ["shein"] },
-    { key: "google", terms: ["google"] },
-    { key: "microsoft", terms: ["microsoft"] },
-    { key: "nutopia", terms: ["nutopia", "sutherland"] },
-    { key: "fawry", terms: ["fawry"] },
-    { key: "paymob", terms: ["paymob"] },
-    { key: "geidea", terms: ["geidea"] },
-    { key: "basata", terms: ["basata"] },
-    { key: "elabd", terms: ["elabd", "el abd"] },
-    { key: "viacaffe", terms: ["via caffe", "viacaffe", "caffe"] },
-    { key: "wave", terms: ["wave"] }
-  ];
-
-  for (const a of aliases) {
+  for (const a of MERCHANT_ALIAS_GROUPS) {
     const has1 = a.terms.some(t => full1.includes(t));
     const has2 = a.terms.some(t => full2.includes(t));
     if (has1 && has2) return true;
@@ -1828,7 +1839,7 @@ function reconcileActiveStatement(ss, tz) {
 
   function isDedicatedUnrecordedMerchant(desc) {
     const d = String(desc || "").toLowerCase();
-    return d.includes("nutopia") || d.includes("sutherland") || d.includes("google one") || d.includes("stamp tax");
+    return d.includes("nutopia") || d.includes("sutherland") || d.includes("google one") || d.includes("stamp tax") || d.includes("unr_");
   }
 
   function runSubsetSplitPass(requireKeywordOverlap) {
@@ -3706,6 +3717,435 @@ function recordActiveBillPaymentPrompt() {
   }
 }
 
+function round2_(n) {
+  return Number((Number(n) || 0).toFixed(2));
+}
+
+/**
+ * Builds an anonymized JSON snapshot of the active billing cycle for golden regression tests.
+ * Masks all person names (P1..Pn), merchant names (MERCH01..), card digits, and custom notes
+ * while preserving exact matching topology, statement metadata, decisions, and baseline totals.
+ */
+function buildAnonymizedFixture(ss, tz) {
+  const targetTz = tz || ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+  const activeReconSheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+  if (activeReconSheet) {
+    syncActiveReconSheetToStore(ss, targetTz);
+  }
+
+  const recon = reconcileActiveStatement(ss, targetTz);
+  if (recon.error) {
+    throw new Error(recon.error);
+  }
+  const ledger = buildDebtLedger(ss, targetTz, recon);
+
+  const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
+  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+  const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  const storeSheet = getReconStoreSheet(ss);
+
+  const txRaw = (txSheet && txSheet.getLastRow() >= 2)
+    ? txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues()
+    : [];
+  const instRaw = (instSheet && instSheet.getLastRow() >= 2)
+    ? instSheet.getRange(2, 1, instSheet.getLastRow() - 1, 11).getValues()
+    : [];
+  const stmtRaw = (stmtSheet && stmtSheet.getLastRow() >= 7)
+    ? stmtSheet.getRange(7, 1, stmtSheet.getLastRow() - 6, 7).getValues()
+    : [];
+  const storeRaw = (storeSheet && storeSheet.getLastRow() >= 2)
+    ? storeSheet.getRange(2, 1, storeSheet.getLastRow() - 1, 10).getValues()
+    : [];
+
+  // 1. Deterministic Person Anonymizer (P1..Pn)
+  const rawNames = new Set();
+  const knownAliases = [
+    "me", "myself", "ahmed", "mido", "abd", "abdelrahman", "abdo",
+    "zozza", "zoza", "mohanad", "muhanad", "mom", "mum", "father", "dad",
+    "nour", "nourween", "mai", "hager", "nevin", "neveen"
+  ];
+  function collectPayers(val) {
+    splitPayerNames(val).forEach(p => {
+      if (p) rawNames.add(p);
+    });
+  }
+  const dataNames = new Set();
+  function collectDataPayers(val) {
+    splitPayerNames(val).forEach(p => {
+      if (p) {
+        rawNames.add(p);
+        dataNames.add(p);
+      }
+    });
+  }
+  collectPayers(CONFIG.DEFAULT_FEE_PAYER);
+  (ledger.personShares || []).forEach(ps => collectPayers(ps.person));
+  txRaw.forEach(r => collectDataPayers(r[3]));
+  instRaw.forEach(r => collectDataPayers(r[8]));
+  storeRaw.forEach(r => {
+    const f = String(r[5] || "").trim();
+    if (f && !isNeglectedPayer(f)) {
+      collectDataPayers(f.replace(/^✅\s*Billed\s+to\s+/i, ""));
+    }
+  });
+  if (activeReconSheet && activeReconSheet.getLastRow() >= 12) {
+    const arVals = activeReconSheet.getRange(12, 1, activeReconSheet.getLastRow() - 11, 6).getValues();
+    arVals.forEach(r => {
+      const colA = String(r[0] || "").trim();
+      if (/^[FCM]-\d+/i.test(colA) && r[5] && !isNeglectedPayer(r[5])) {
+        collectDataPayers(r[5]);
+      } else if (/^INST-\d+/i.test(colA) && /^✅\s*Billed\s+to\s+/i.test(String(r[5] || ""))) {
+        collectDataPayers(String(r[5]).replace(/^✅\s*Billed\s+to\s+/i, ""));
+      } else if (/^\d+$/.test(colA) && r[1] && String(r[1]) !== "All Family Members") {
+        collectPayers(r[1]);
+      }
+    });
+  }
+
+  const sortedPeople = Array.from(rawNames).sort((a, b) => a.localeCompare(b));
+  const personMap = {};
+  sortedPeople.forEach((p, idx) => {
+    personMap[p] = `P${idx + 1}`;
+  });
+
+  function mapPerson(name) {
+    const norm = normalizePersonName(name);
+    if (!norm) return "";
+    if (!personMap[norm]) {
+      const nextIdx = Object.keys(personMap).length + 1;
+      personMap[norm] = `P${nextIdx}`;
+    }
+    return personMap[norm];
+  }
+
+  function mapPayerField(val) {
+    const s = String(val || "").trim();
+    if (!s) return "";
+    if (s === "NEGLECT" || isNeglectedPayer(s)) return s;
+    if (s === "All Family Members") return s;
+    const billedMatch = s.match(/^(✅\s*Billed\s+to\s+)(.+)$/i);
+    if (billedMatch) {
+      const people = splitPayerNames(billedMatch[2]).map(mapPerson).filter(Boolean);
+      return people.length > 0 ? `${billedMatch[1]}${people.join(" + ")}` : s;
+    }
+    const people = splitPayerNames(s).map(mapPerson).filter(Boolean);
+    return people.length > 0 ? people.join(" + ") : "";
+  }
+
+  // Build regex tokens for scrubbing person names embedded inside item descriptions
+  const nameTokens = new Set([...sortedPeople, ...knownAliases]);
+  const escapedTokens = Array.from(nameTokens)
+    .filter(t => t && t.length >= 3 && t !== "me" && t !== "abd")
+    .sort((a, b) => b.length - a.length)
+    .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const embeddedNameRegex = escapedTokens.length > 0
+    ? new RegExp(`(^|[^a-z0-9])(?:${escapedTokens.join("|")})(?:'s|’s)?(?=$|[^a-z0-9])`, "gi")
+    : null;
+
+  // 2. Lossless Merchant Anonymizer (MERCH01..)
+  // Pre-seed equivalent CLEAN buckets for pairs that matched by keyword overlap during recon
+  const cleanEquivalent = {};
+  function cleanBaseForKey(str) {
+    let b = String(str || "");
+    if (embeddedNameRegex) b = b.replace(embeddedNameRegex, "$1MEMBER");
+    b = b.replace(/\b(\d+)\s+(?:OF|\/)\s+(\d+)\b/gi, " ")
+      .replace(/\(\d+\s+of\s+\d+\)/gi, " ")
+      .replace(/\(\d+\/\d+\s+Paid\)/gi, " ")
+      .replace(/\(Split\s+\d+\/\d+\)/gi, " ")
+      .replace(/\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|REFUND|CASHBACK|CASH\s*BACK|REVERSAL|REVERSED|DCC\s*MARKUP\s*FEES?|DCC\s*MARKUP|STAMP\s*TAX|STAMP\s*DUTY|FINANCE\s*CHARGE|INTEREST\s*CHARGE|LATE\s*PAYMENT|ANNUAL\s*MEMBERSHIP|FEES?)\b/gi, " ")
+      .replace(/\b\d{3,}[-\s]\d{3,}\b/g, " ")
+      .replace(/\b\d{5,}\b/g, " ");
+    const cl = cleanMerchantName(b).replace(/\d+/g, " ").replace(/[^\w\u0600-\u06FF]+/g, " ").replace(/\s+/g, " ").trim();
+    return cl || makeNormDesc(b);
+  }
+  (recon.stmtDebits || []).forEach(st => {
+    if (!st.matched || !st.matchedItems) return;
+    if (getMerchantAliasKey(st.desc)) return;
+    const stClean = cleanBaseForKey(st.desc);
+    st.matchedItems.forEach(tx => {
+      if (!getMerchantAliasKey(tx.desc) && hasMerchantKeywordOverlap(st.desc, tx.desc)) {
+        const txClean = cleanBaseForKey(tx.desc);
+        if (txClean && stClean && txClean !== stClean) {
+          cleanEquivalent[txClean] = stClean;
+        }
+      }
+    });
+  });
+
+  const merchantMap = {};
+  let nextMerchNum = 1;
+
+  function anonymizeDesc(rawDesc) {
+    const raw = String(rawDesc || "").trim();
+    if (!raw || raw === "—") return raw;
+
+    // Preserve structural suffixes needed by matching/sync engines (extract paren before instSuffix so "(5 of 9)" isn't matched twice)
+    let parenSuffix = "";
+    const parenMatch = raw.match(/(\(\d+\s+of\s+\d+\)|\(\d+\/\d+\s+Paid\)|\(Split\s+\d+\/\d+\))/i);
+    if (parenMatch) parenSuffix = ` ${parenMatch[1]}`;
+    const rawWithoutParen = parenMatch ? raw.replace(parenMatch[0], " ") : raw;
+
+    let instSuffix = "";
+    const instMatch = rawWithoutParen.match(/\b(\d+\s+(?:OF|\/)\s+\d+)\b/i);
+    if (instMatch) instSuffix = ` ${instMatch[1].toUpperCase()}`;
+
+    // Preserve structural bank classification keywords (never containing merchant names)
+    const bankKeywords = [];
+    if (/\bDIRECT\s*DEBIT\b/i.test(raw)) bankKeywords.push("DIRECT DEBIT");
+    else if (/\bPAYMENT\b/i.test(raw)) bankKeywords.push("PAYMENT");
+    if (/\bSETTLEMENT\b/i.test(raw)) bankKeywords.push("SETTLEMENT");
+    if (/\bDEPOSIT\b/i.test(raw)) bankKeywords.push("DEPOSIT");
+    if (/\bDCC\s*MARKUP/i.test(raw)) bankKeywords.push("DCC MARKUP");
+    if (/\bREFUND\b/i.test(raw)) bankKeywords.push("REFUND");
+    if (/\bCASH\s*BACK\b/i.test(raw)) bankKeywords.push("CASHBACK");
+    if (/\bREVERS(?:AL|ED)\b/i.test(raw)) bankKeywords.push("REVERSAL");
+    if (/\bSTAMP\s*(?:TAX|DUTY)\b/i.test(raw)) bankKeywords.push("STAMP TAX");
+    else if (/\b(?:FINANCE|INTEREST)\s*CHARGE\b/i.test(raw)) bankKeywords.push("FINANCE CHARGE");
+    else if (/\bLATE\s*PAYMENT\b/i.test(raw)) bankKeywords.push("LATE PAYMENT");
+    else if (/\bANNUAL\s*MEMBERSHIP\b/i.test(raw)) bankKeywords.push("ANNUAL MEMBERSHIP");
+
+    const isUnr = /nutopia|sutherland|google\s*one|unr_/i.test(raw);
+    let stripped = raw
+      .replace(/\b(\d+)\s+(?:OF|\/)\s+(\d+)\b/gi, " ")
+      .replace(/\(\d+\s+of\s+\d+\)/gi, " ")
+      .replace(/\(\d+\/\d+\s+Paid\)/gi, " ")
+      .replace(/\(Split\s+\d+\/\d+\)/gi, " ")
+      .replace(/\b(?:THANK\s*YOU|MOBILE\s*TOKEN)\b/gi, " ")
+      .replace(/\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|REFUND|CASHBACK|CASH\s*BACK|REVERSAL|REVERSED|DCC\s*MARKUP\s*FEES?|DCC\s*MARKUP|STAMP\s*TAX|STAMP\s*DUTY|FINANCE\s*CHARGE|INTEREST\s*CHARGE|LATE\s*PAYMENT|ANNUAL\s*MEMBERSHIP|FEES?)\b/gi, " ")
+      .replace(/[\-\*\".,\/]+/g, " ")
+      .replace(/\b\d{3,}[-\s]?\d{3,}\b/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (embeddedNameRegex) {
+      stripped = stripped.replace(embeddedNameRegex, "$1MEMBER").replace(/\s+/g, " ").trim();
+    }
+
+    // Pure bank fee or pure generic bank payment line with no merchant name
+    if ((!stripped || /^(?:egy|cairo|alex|giza|thank\s*you)$/i.test(stripped)) && bankKeywords.length > 0) {
+      return `${bankKeywords.join(" ")}${instSuffix}${parenSuffix}`.trim();
+    }
+
+    const aliasKey = getMerchantAliasKey(raw);
+    let bucketKey;
+    if (aliasKey) {
+      bucketKey = `ALIAS:${aliasKey}`;
+    } else {
+      const cleaned = cleanMerchantName(stripped)
+        .replace(/\d+/g, " ")
+        .replace(/[^\w\u0600-\u06FF]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      const canonical = cleanEquivalent[cleaned] || cleaned;
+      bucketKey = canonical ? `CLEAN:${canonical}` : `RAW:${makeNormDesc(stripped || raw)}`;
+    }
+
+    if (!merchantMap[bucketKey]) {
+      const tag = `MERCH${String(nextMerchNum++).padStart(2, "0")}`;
+      merchantMap[bucketKey] = isUnr ? `UNR_${tag}` : tag;
+    }
+    const merchCode = merchantMap[bucketKey];
+    const prefix = bankKeywords.length > 0 ? `${bankKeywords.join(" ")} ` : "";
+    return `${prefix}${merchCode}${instSuffix}${parenSuffix}`.trim();
+  }
+
+  // 3. Serialize Sheets (Dates as ISO yyyy-MM-dd)
+  const cb = recon.cardBal || calculateCardBalance(ss, targetTz);
+  const bankRows = stmtRaw.map((r, idx) => [
+    r[0] || idx + 1,
+    makeNormDateStr(r[1], targetTz),
+    makeNormDateStr(r[2] || r[1], targetTz),
+    anonymizeDesc(r[3]),
+    String(r[4] || "").trim().toUpperCase(),
+    round2_(parseFloat(r[5]) || 0),
+    ""
+  ]);
+
+  const anonTxByDateAmt = [];
+  const txRows = txRaw.map((r, idx) => {
+    const dateStr = makeNormDateStr(r[1], targetTz);
+    const origDesc = String(r[2] || "").trim();
+    const anonDesc = anonymizeDesc(origDesc);
+    const anonPayer = mapPayerField(r[3]);
+    const amt = round2_(parseFloat(r[4]) || 0);
+    anonTxByDateAmt.push({ dateStr, amt, origNorm: makeNormDesc(origDesc), anonDesc, splitCount: splitPayerNames(r[3]).length || 1 });
+    return [r[0] || idx + 1, dateStr, anonDesc, anonPayer, amt];
+  });
+
+  const instRows = instRaw.map((r, idx) => [
+    r[0] || idx + 1,
+    makeNormDateStr(r[1], targetTz),
+    anonymizeDesc(r[2]),
+    round2_(parseFloat(r[3]) || 0),
+    parseInt(r[4], 10) || 0,
+    round2_(parseFloat(r[5]) || 0),
+    round2_(parseFloat(r[6]) || 0),
+    round2_(parseFloat(r[7]) || 0),
+    mapPayerField(r[8]),
+    parseInt(r[9], 10) || 0,
+    String(r[10] || "Ongoing").trim()
+  ]);
+
+  const anonStmtByDateAmt = stmtRaw.map((r, idx) => ({
+    dateStr: makeNormDateStr(r[1], targetTz),
+    amt: round2_(parseFloat(r[5]) || 0),
+    origNorm: makeNormDesc(r[3]),
+    anonDesc: bankRows[idx][3]
+  }));
+
+  function anonymizeReconStoreKey(type, pKey, dateStr, amt, origDesc, anonDesc) {
+    if (!pKey) return "";
+    if (/^TX-\d+(?:\.\d+)?$/i.test(pKey)) return pKey;
+    const occMatch = pKey.match(/(_#\d+)$/);
+    const occSuffix = occMatch ? occMatch[1] : "";
+    const strippedKey = occSuffix ? pKey.slice(0, -occSuffix.length) : pKey;
+
+    if (origDesc && (dateStr || amt > 0)) {
+      return makeReconKey(dateStr, amt, anonDesc, targetTz) + occSuffix;
+    }
+
+    const keyParts = strippedKey.match(/^(\d{4}-\d{2}-\d{2})_(-?\d+\.\d{2})_(.*)$/);
+    if (keyParts) {
+      const kDate = keyParts[1];
+      const kAmt = parseFloat(keyParts[2]);
+      const kDescFrag = keyParts[3];
+      const txMatch = anonTxByDateAmt.find(it =>
+        it.dateStr === kDate &&
+        (Math.abs(it.amt - kAmt) <= 0.02 || Math.abs(it.amt / it.splitCount - kAmt) <= 0.02) &&
+        it.origNorm.substring(0, 30) === kDescFrag
+      );
+      if (txMatch) {
+        return makeReconKey(kDate, kAmt, txMatch.anonDesc, targetTz) + occSuffix;
+      }
+      const stMatch = anonStmtByDateAmt.find(it =>
+        it.dateStr === kDate && Math.abs(it.amt - kAmt) <= 0.02 && it.origNorm.substring(0, 30) === kDescFrag
+      );
+      if (stMatch) {
+        return makeReconKey(kDate, kAmt, stMatch.anonDesc, targetTz) + occSuffix;
+      }
+      return makeReconKey(kDate, kAmt, anonymizeDesc(kDescFrag), targetTz) + occSuffix;
+    }
+
+    const amtKeyParts = strippedKey.match(/^(\d+\.\d{2})_(.*)$/);
+    if (amtKeyParts && type === "TABLE1_CONFIRMED") {
+      const kAmt = parseFloat(amtKeyParts[1]);
+      const kFrag = amtKeyParts[2];
+      const stMatch = anonStmtByDateAmt.find(it =>
+        Math.abs(it.amt - kAmt) <= 0.02 && it.origNorm.substring(0, 20) === kFrag
+      );
+      const repDesc = stMatch ? stMatch.anonDesc : anonymizeDesc(kFrag);
+      return `${kAmt.toFixed(2)}_${makeNormDesc(repDesc).substring(0, 20)}`;
+    }
+
+    return pKey;
+  }
+
+  const reconStoreRows = storeRaw.map(r => {
+    const type = String(r[0] || "").trim();
+    const origKey = String(r[1] || "").trim();
+    const dStr = String(r[2] || "").trim();
+    const origDesc = String(r[3] || "").trim();
+    const amt = round2_(parseFloat(r[4]) || 0);
+    const payerRaw = String(r[5] || "").trim();
+    const isConfirmed = r[7] === true || String(r[7]).toUpperCase() === "TRUE";
+    const isNeglected = r[8] === true || String(r[8]).toUpperCase() === "TRUE";
+    const updatedAt = String(r[9] || "").trim();
+
+    if (type === "CYCLE_PAYMENT") {
+      return [type, origKey, dStr, origDesc, amt, payerRaw, "[]", isConfirmed, false, updatedAt];
+    }
+    const anonDesc = anonymizeDesc(origDesc);
+    const anonKey = anonymizeReconStoreKey(type, origKey, dStr, amt, origDesc, anonDesc);
+    const anonPayer = mapPayerField(payerRaw);
+    return [type, anonKey, dStr, anonDesc, amt, anonPayer, "", isConfirmed, isNeglected, updatedAt];
+  });
+
+  let paymentDate = "";
+  if (activeReconSheet) {
+    const h6Date = parseDateValue(activeReconSheet.getRange(6, 8).getValue(), targetTz);
+    if (h6Date && !isNaN(h6Date.getTime())) {
+      paymentDate = Utilities.formatDate(h6Date, targetTz, "yyyy-MM-dd");
+    }
+  }
+
+  const expectedShares = {};
+  (ledger.personShares || []).forEach(ps => {
+    const hasActivity = ps.purchases !== 0 || ps.installments !== 0 || ps.fees !== 0 ||
+      ps.unrecorded !== 0 || ps.refunds !== 0 || ps.netTotal !== 0 || dataNames.has(ps.person);
+    if (!hasActivity) return;
+    const anonP = mapPerson(ps.person);
+    if (!anonP) return;
+    expectedShares[anonP] = {
+      purchases: round2_(ps.purchases),
+      installments: round2_(ps.installments),
+      fees: round2_(ps.fees),
+      unrecorded: round2_(ps.unrecorded),
+      refunds: round2_(ps.refunds),
+      netTotal: round2_(ps.netTotal)
+    };
+  });
+
+  return {
+    schemaVersion: 1,
+    cycleKey: ledger.activeCycleKey,
+    cycleLabel: ledger.activeCycleLabel,
+    timeZone: targetTz,
+    defaultFeePayer: mapPerson(CONFIG.DEFAULT_FEE_PAYER),
+    exportedAt: new Date().toISOString(),
+    bankStatement: {
+      meta: {
+        statementDate: cb.statementDate ? Utilities.formatDate(cb.statementDate, targetTz, "yyyy-MM-dd") : "",
+        dueDate: cb.statementDueDate ? Utilities.formatDate(cb.statementDueDate, targetTz, "yyyy-MM-dd") : "",
+        creditLimit: round2_(cb.creditLimit),
+        openingBalance: round2_(cb.openingBalance),
+        closingBalance: round2_(cb.billedBalance),
+        totalDebit: round2_(cb.totalDebit),
+        totalCredit: round2_(cb.totalCredit),
+        card: "****0000"
+      },
+      rows: bankRows
+    },
+    transactions: txRows,
+    installments: instRows,
+    reconStore: reconStoreRows,
+    paymentDate: paymentDate,
+    expectedTotals: {
+      closingBill: round2_(ledger.closingBill),
+      purchasesTotal: round2_(ledger.purchasesTotal),
+      installmentsTotal: round2_(ledger.installmentsTotal),
+      feesTotal: round2_(ledger.feesTotal),
+      unrecordedTotal: round2_(ledger.unrecordedTotal),
+      refundsTotal: round2_(ledger.refundsTotal),
+      familySharesTotal: round2_(ledger.familySharesTotal),
+      auditDifference: round2_(ledger.auditDifference)
+    },
+    expectedShares: expectedShares
+  };
+}
+
+function menuExportAnonymizedFixture() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const fixture = buildAnonymizedFixture(ss, tz);
+    const filename = `NBE_Fixture_${fixture.cycleKey}_anonymized.json`;
+    const file = DriveApp.createFile(filename, JSON.stringify(fixture, null, 2), MimeType.PLAIN_TEXT);
+    ui.alert(
+      "Anonymized Test Fixture Exported",
+      `Saved to your Google Drive root as:\n${filename}\n\n` +
+      `Link: ${file.getUrl()}\n\n` +
+      `Rows exported: ${fixture.bankStatement.rows.length} statement, ` +
+      `${fixture.transactions.length} transactions, ${fixture.installments.length} installments, ` +
+      `${fixture.reconStore.length} store entries.\n` +
+      `All member names, merchant names, card numbers, and custom notes have been anonymized.`,
+      ui.ButtonSet.OK
+    );
+  } catch (err) {
+    ui.alert("Export Failed", String(err && err.message ? err.message : err), ui.ButtonSet.OK);
+  }
+}
+
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("💳 NBE Tracker")
@@ -3715,6 +4155,8 @@ function onOpen() {
     .addSeparator()
     .addItem("⚡ Apply Payment Date to Installments Now", "applyPaymentDateNow")
     .addItem("✅ Verify & Record Bill Payment...", "recordActiveBillPaymentPrompt")
+    .addSeparator()
+    .addItem("🧪 Export Anonymized Test Fixture", "menuExportAnonymizedFixture")
     .addToUi();
 }
 

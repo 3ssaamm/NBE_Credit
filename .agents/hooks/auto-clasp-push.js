@@ -40,6 +40,7 @@ function main() {
     const isAppsScriptFile =
       relPath === "Code.js" ||
       relPath === "appsscript.json" ||
+      /^src\/.+\.(js|gs)$/i.test(relPath) ||
       (!relPath.startsWith("..") && /\.gs$/i.test(relPath));
 
     if (!isAppsScriptFile) {
@@ -47,10 +48,14 @@ function main() {
       return;
     }
 
-    if (relPath === "Code.js" && fs.existsSync(resolvedTarget)) {
+    if ((relPath === "Code.js" || /^src\/.+\.(js|gs)$/i.test(relPath)) && fs.existsSync(resolvedTarget)) {
       execSync(`node -c "${resolvedTarget}"`, { cwd: projectRoot, stdio: "pipe", timeout: 5000 });
     } else if (relPath === "appsscript.json" && fs.existsSync(resolvedTarget)) {
       JSON.parse(fs.readFileSync(resolvedTarget, "utf8"));
+    }
+
+    if (fs.existsSync(path.join(projectRoot, "package.json"))) {
+      execSync("npm test", { cwd: projectRoot, stdio: "pipe", timeout: 25000 });
     }
 
     execSync("clasp push -f", { cwd: projectRoot, stdio: "pipe", timeout: 25000 });

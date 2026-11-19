@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "cycleKey": "2026-11",
+  "cycleLabel": "November 2026",
+  "timeZone": "Africa/Cairo",
+  "defaultFeePayer": "P1",
+  "exportedAt": "2026-11-19T00:00:00.000Z",
+  "bankStatement": {
+    "meta": {
+      "statementDate": "2026-10-31",
+      "dueDate": "2026-11-27",
+      "creditLimit": 100000,
+      "openingBalance": 10000,
+      "closingBalance": 3189.22,
+      "totalDebit": 3239.22,
+      "totalCredit": 10050,
+      "card": "****0000"
+    },
+    "rows": [
+      [1, "2026-10-02", "2026-10-02", "MERCH01", "DEBIT", 1447.8, ""],
+      [2, "2026-10-04", "2026-10-04", "MERCH02", "DEBIT", 80, ""],
+      [3, "2026-10-08", "2026-10-08", "MERCH04", "DEBIT", 833.1, ""],
+      [4, "2026-10-12", "2026-10-12", "UNR_MERCH05", "DEBIT", 80, ""],
+      [5, "2026-10-20", "2026-10-20", "UNR_MERCH05", "DEBIT", 80, ""],
+      [6, "2026-10-23", "2026-10-23", "UNR_MERCH06", "DEBIT", 179.99, ""],
+      [7, "2026-10-23", "2026-10-23", "UNR_MERCH06", "DEBIT", 179.99, ""],
+      [8, "2026-10-31", "2026-10-31", "STAMP TAX", "FEE", 41.01, ""],
+      [9, "2026-10-05", "2026-10-05", "PAYMENT MERCH07", "CREDIT", 10000, ""],
+      [10, "2026-10-12", "2026-10-12", "REFUND MERCH08", "CREDIT", 50, ""],
+      [11, "2026-10-31", "2026-10-31", "MERCH09 10 OF 12", "INSTALLMENT", 123, ""],
+      [12, "2026-10-31", "2026-10-31", "MERCH10 7 OF 9", "INSTALLMENT", 194.33, ""]
+    ]
+  },
+  "transactions": [
+    [1, "2026-09-30", "MERCH12", "P2", 1320],
+    [2, "2026-10-02", "MERCH01", "P2", 1447.8],
+    [3, "2026-10-04", "MERCH03", "P3", 80],
+    [4, "2026-10-08", "MERCH04", "P2", 333.1],
+    [5, "2026-10-08", "MERCH04", "P4", 200],
+    [6, "2026-10-08", "MERCH04", "P5", 200],
+    [7, "2026-10-08", "MERCH04", "P3", 100],
+    [8, "2026-10-29", "MERCH13", "P5", 150]
+  ],
+  "installments": [
+    [1, "2025-11-07", "MERCH09", 738, 12, 0, 0, 61.5, "P1", 9, "Ongoing"],
+    [2, "2025-11-07", "MERCH09", 738, 12, 0, 0, 61.5, "P2", 9, "Ongoing"],
+    [3, "2026-02-03", "MERCH10", 1748.97, 9, 0, 0, 194.33, "P2", 6, "Ongoing"],
+    [4, "2026-09-01", "MERCH11", 2835.84, 6, 0, 0, 472.64, "P1", 0, "Ongoing"]
+  ],
+  "reconStore": [
+    ["TABLE2_ASSIGNMENT", "2026-10-12_80.00_unr_merch05_#1", "2026-10-12", "UNR_MERCH05", 80, "P1", "", false, false, "2026-11-19"],
+    ["TABLE2_ASSIGNMENT", "2026-10-20_80.00_unr_merch05_#1", "2026-10-20", "UNR_MERCH05", 80, "P2", "", false, false, "2026-11-19"],
+    ["TABLE2_ASSIGNMENT", "2026-10-23_179.99_unr_merch06_#1", "2026-10-23", "UNR_MERCH06", 179.99, "P2", "", false, false, "2026-11-19"],
+    ["TABLE2_ASSIGNMENT", "2026-10-23_179.99_unr_merch06_#2", "2026-10-23", "UNR_MERCH06", 179.99, "P3", "", false, false, "2026-11-19"],
+    ["TABLE2_ASSIGNMENT", "2026-10-12_50.00_refund merch08_#1", "2026-10-12", "REFUND MERCH08", 50, "P2", "", false, false, "2026-11-19"],
+    ["TABLE3_NEGLECTED", "2026-09-30_1320.00_merch12_#1", "", "", 0, "", "", false, true, "2026-11-19"]
+  ],
+  "paymentDate": "",
+  "expectedTotals": {
+    "closingBill": 3189.22,
+    "purchasesTotal": 2510.9,
+    "installmentsTotal": 317.33,
+    "feesTotal": 41.01,
+    "unrecordedTotal": 519.98,
+    "refundsTotal": 50,
+    "familySharesTotal": 3339.22,
+    "auditDifference": 150
+  },
+  "expectedShares": {
+    "P1": { "purchases": 0, "installments": 61.5, "fees": 41.01, "unrecorded": 80, "refunds": 0, "netTotal": 182.51 },
+    "P2": { "purchases": 1780.9, "installments": 255.83, "fees": 0, "unrecorded": 259.99, "refunds": 50, "netTotal": 2246.72 },
+    "P3": { "purchases": 180, "installments": 0, "fees": 0, "unrecorded": 179.99, "refunds": 0, "netTotal": 359.99 },
+    "P4": { "purchases": 200, "installments": 0, "fees": 0, "unrecorded": 0, "refunds": 0, "netTotal": 200 },
+    "P5": { "purchases": 350, "installments": 0, "fees": 0, "unrecorded": 0, "refunds": 0, "netTotal": 350 }
+  }
+}
