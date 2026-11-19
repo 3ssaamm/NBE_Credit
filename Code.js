@@ -656,13 +656,18 @@ function calculateCardBalance(ss, tz) {
     if (!isNaN(parseFloat(closeVal))) billedBalance = parseFloat(closeVal);
 
     const totDebVal = metaVals[1][5];
-    if (!isNaN(parseFloat(totDebVal))) totalDebit = parseFloat(totDebVal);
+    const hasTotDeb = (typeof totDebVal === "number" && !isNaN(totDebVal)) ||
+      (typeof totDebVal === "string" && totDebVal.trim() !== "" && !totDebVal.trim().startsWith("=") && !isNaN(parseFloat(totDebVal)));
+    if (hasTotDeb) totalDebit = parseFloat(totDebVal);
 
     const totCredVal = metaVals[2][1];
-    if (!isNaN(parseFloat(totCredVal))) totalCredit = parseFloat(totCredVal);
+    const hasTotCred = (typeof totCredVal === "number" && !isNaN(totCredVal)) ||
+      (typeof totCredVal === "string" && totCredVal.trim() !== "" && !totCredVal.trim().startsWith("=") && !isNaN(parseFloat(totCredVal)));
+    if (hasTotCred) totalCredit = parseFloat(totCredVal);
 
     if (stmtSheet.getLastRow() >= 7) {
-      const txDates = stmtSheet.getRange(7, 2, stmtSheet.getLastRow() - 6, 2).getValues();
+      const stmtNumRows = stmtSheet.getLastRow() - 6;
+      const txDates = stmtSheet.getRange(7, 2, stmtNumRows, 2).getValues();
       txDates.forEach(r => {
         const d1 = parseDateValue(r[0], tz);
         const d2 = parseDateValue(r[1], tz);
@@ -672,6 +677,20 @@ function calculateCardBalance(ss, tz) {
           if (!maxStmtTxDate || d > maxStmtTxDate) maxStmtTxDate = d;
         }
       });
+
+      if (!hasTotDeb || !hasTotCred) {
+        const typeAmtRows = stmtSheet.getRange(7, 5, stmtNumRows, 2).getValues();
+        let fallbackDebit = 0;
+        let fallbackCredit = 0;
+        typeAmtRows.forEach(r => {
+          const t = String(r[0] || "").trim().toUpperCase();
+          const a = Math.abs(parseFloat(r[1]) || 0);
+          if (t === "CREDIT") fallbackCredit += a;
+          else if (a > 0) fallbackDebit += a;
+        });
+        if (!hasTotDeb) totalDebit = Number(fallbackDebit.toFixed(2));
+        if (!hasTotCred) totalCredit = Number(fallbackCredit.toFixed(2));
+      }
     }
   }
 
@@ -791,533 +810,8 @@ function calculateCardBalance(ss, tz) {
 }
 
 // ==========================================
-// 6. STATEMENT PARSER & INGESTION
+// 6. PDF OCR EXTRACTION, PARSER, TIE-OUT VALIDATION & IMPORT -> see src/Parser.js
 // ==========================================
-
-function getFullDocumentText(doc) {
-  const body = doc.getBody();
-  const numChildren = body.getNumChildren();
-  const lines = [];
-
-  for (let i = 0; i < numChildren; i++) {
-    const child = body.getChild(i);
-    const type = child.getType();
-
-    if (type === DocumentApp.ElementType.PARAGRAPH) {
-      const pText = child.asParagraph().getText().trim();
-      if (pText) lines.push(pText);
-    } else if (type === DocumentApp.ElementType.TABLE) {
-      const table = child.asTable();
-      const numRows = table.getNumRows();
-      for (let r = 0; r < numRows; r++) {
-        const row = table.getRow(r);
-        const numCells = row.getNumCells();
-        const cellTexts = [];
-        for (let c = 0; c < numCells; c++) {
-          const cText = row.getCell(c).getText().trim().replace(/[\r\n]+/g, " ");
-          cellTexts.push(cText);
-        }
-        if (cellTexts.some(t => t.length > 0)) lines.push(cellTexts.join("\t"));
-      }
-    } else if (type === DocumentApp.ElementType.LIST_ITEM) {
-      const liText = child.asListItem().getText().trim();
-      if (liText) lines.push(liText);
-    }
-  }
-
-  try {
-    const header = doc.getHeader();
-    if (header && header.getText().trim()) lines.unshift(header.getText().trim());
-  } catch (e) { }
-
-  try {
-    const footer = doc.getFooter();
-    if (footer && footer.getText().trim()) lines.push(footer.getText().trim());
-  } catch (e) { }
-
-  return lines.join("\n");
-}
-
-function extractTextFromPDF(file) {
-  try {
-    if (typeof Drive !== "undefined" && Drive.Files && Drive.Files.insert) {
-      const resource = { title: "temp_ocr_" + file.getName(), mimeType: "application/pdf" };
-      const docFile = Drive.Files.insert(resource, file.getBlob(), { ocr: true, ocrLanguage: "en" });
-      if (docFile && docFile.id) {
-        const doc = DocumentApp.openById(docFile.id);
-        const text = getFullDocumentText(doc);
-        DriveApp.getFileById(docFile.id).setTrashed(true);
-        return text;
-      }
-    }
-  } catch (driveErr) {
-    Logger.log("Drive advanced service attempt skipped/failed: " + driveErr.message);
-  }
-
-  const blob = file.getBlob();
-  const metadata = { title: "temp_ocr_" + file.getName() };
-  const boundary = "-------nbe_ocr_boundary_314159";
-  const delimiter = "\r\n--" + boundary + "\r\n";
-  const closeDelimiter = "\r\n--" + boundary + "--";
-
-  const requestBody =
-    delimiter +
-    "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
-    JSON.stringify(metadata) +
-    delimiter +
-    "Content-Type: " + blob.getContentType() + "\r\n\r\n";
-
-  const payload = Utilities.newBlob(requestBody)
-    .getBytes()
-    .concat(blob.getBytes())
-    .concat(Utilities.newBlob(closeDelimiter).getBytes());
-
-  const response = UrlFetchApp.fetch(
-    "https://www.googleapis.com/upload/drive/v2/files?uploadType=multipart&ocr=true&ocrLanguage=en",
-    {
-      method: "post",
-      contentType: "multipart/related; boundary=" + boundary,
-      payload: payload,
-      headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
-      muteHttpExceptions: true
-    }
-  );
-
-  if (response.getResponseCode() !== 200) {
-    throw new Error("OCR conversion failed: " + response.getContentText());
-  }
-
-  const fileData = JSON.parse(response.getContentText());
-  const doc = DocumentApp.openById(fileData.id);
-  const text = getFullDocumentText(doc);
-  DriveApp.getFileById(fileData.id).setTrashed(true);
-  return text;
-}
-
-function parseNBEStatementText(text) {
-  const meta = {
-    card: "",
-    openingBalance: 0,
-    closingBalance: 0,
-    totalCredit: 0,
-    totalDebit: 0,
-    dueDate: "",
-    creditLimit: CONFIG.CREDIT_LIMIT,
-    statementDate: "",
-    sumDebits: 0,
-    sumCredits: 0
-  };
-
-  if (!text) return { meta: meta, transactions: [] };
-
-  const mCard = text.match(/Card (?:Number|No\.?)[:\s\t]+([0-9\*]+)/i);
-  if (mCard) meta.card = mCard[1];
-
-  const mOpenClose = text.match(/Opening Balance[:\s\t]+([\d,]+\.?\d*)[\s\S]*?Closing Balance[:\s\t]+([\d,]+\.?\d*)/i);
-  if (mOpenClose) {
-    meta.openingBalance = parseFloat(mOpenClose[1].replace(/,/g, ""));
-    meta.closingBalance = parseFloat(mOpenClose[2].replace(/,/g, ""));
-  }
-
-  const mTotCred = text.match(/Total (?:of )?Credit[:\s\t]+([\d,]+\.?\d*)/i);
-  if (mTotCred) meta.totalCredit = parseFloat(mTotCred[1].replace(/,/g, ""));
-
-  const mTotDeb = text.match(/Total (?:of )?Debit[:\s\t]+([\d,]+\.?\d*)/i);
-  if (mTotDeb) meta.totalDebit = parseFloat(mTotDeb[1].replace(/,/g, ""));
-
-  const mDueLimit = text.match(/Due Date[:\s\t]+([0-9]{1,2}[\s\-\/\.]+[A-Za-z]+[\s\-\/\.]+[0-9]{2,4}|\d{1,2}\s*[\/\-\.]\s*\d{1,2}\s*[\/\-\.]\s*\d{2,4})[\s\S]*?Credit Limit[:\s\t]+([\d,]+\.?\d*)/i);
-  if (mDueLimit) {
-    meta.dueDate = mDueLimit[1].trim();
-    meta.creditLimit = parseFloat(mDueLimit[2].replace(/,/g, ""));
-  }
-
-  const mStmt = text.match(/Statement Date[:\s\t]+([0-9]{1,2}[\s\-\/\.]+[A-Za-z]+[\s\-\/\.]+[0-9]{2,4}|\d{1,2}\s*[\/\-\.]\s*\d{1,2}\s*[\/\-\.]\s*\d{2,4})/i);
-  if (mStmt) meta.statementDate = mStmt[1].trim();
-
-  const datePattern = /(?:\b\d{1,2}(?:st|nd|rd|th)?[\s\-\/\.]+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?:[\s\-\/\.]+\d{2,4})?\b|\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[\s\-\/\.]+\d{1,2}(?:st|nd|rd|th)?,?(?:[\s\-\/\.]+\d{2,4})?\b|\b\d{1,2}\s*[\/\-\.]\s*\d{1,2}\s*[\/\-\.]\s*\d{2,4}\b)/gi;
-  const feePattern = /\b(?:STAMP\s*DUTY|STAMPTAX|FINANCE\s*CHARGE|INTEREST\s*CHARGE|SMS\s*(?:ALERT|SERVICE)|LATE\s*PAYMENT|OVERLIMIT|ANNUAL\s*MEMBERSHIP|ADMINISTRATIVE\s*EXPENSE)\b/i;
-
-  const lines = text.split(/\r?\n/);
-  const transactions = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const rawLine = lines[i].trim();
-    if (!rawLine) continue;
-
-    if (/^Page\s+No\.?\s+\d+/i.test(rawLine)) continue;
-    if (/\bas\s*of\b/i.test(rawLine)) continue;
-    if (/\b(?:printed|generated)\b/i.test(rawLine)) continue;
-    if (/\b(?:Minimum\s*Payment|Min\.?\s*Payment)\b/i.test(rawLine)) continue;
-    if (/^(?:Statement\s+Date|Due\s+Date|Payment\s+Due\s+Date|Opening\s+Balance|Closing\s+Balance|Total\s+(?:of\s+)?(?:Credit|Debit)|Credit\s+Limit|Available\s+Credit)[:\s\t]/i.test(rawLine)) continue;
-    if (/^Transaction\s+Date\s+Posting\s+Date/i.test(rawLine)) continue;
-    if (/^National\s+Bank\s+of\s+Egypt\s*$/i.test(rawLine)) continue;
-    if (/^Card\s+Number[:\s\t]+[0-9\*]+\s*$/i.test(rawLine)) continue;
-
-    datePattern.lastIndex = 0;
-    let dates = rawLine.match(datePattern);
-
-    let isFeeLineWithoutDate = false;
-    if ((!dates || dates.length === 0) && feePattern.test(rawLine) && /[\d,]+\.?\d*/.test(rawLine)) {
-      isFeeLineWithoutDate = true;
-      dates = [meta.statementDate || "Statement Date"];
-    }
-
-    if (!dates || dates.length === 0) continue;
-
-    const txDate = dates[0];
-    const postDate = dates.length > 1 ? dates[1] : txDate;
-
-    let rest = rawLine;
-    if (!isFeeLineWithoutDate) {
-      dates.slice(0, 2).forEach(d => { rest = rest.replace(d, " "); });
-    }
-
-    let txType = "DEBIT";
-    let instCurrent = null;
-    let instTotal = null;
-    let amount = 0;
-    const maxAmountCap = Math.max(meta.creditLimit * 1.5, 200000);
-
-    const creditPattern = /\b(?:PAYMENT|DIRECT\s*DEBIT|REFUND|CREDIT|DEPOSIT|SETTLEMENT|CASHBACK|CASH\s*BACK|REVERSAL|REVERSED|REV\b|RETURN|RTN\b|CHARGEBACK|ADJUSTMENT|INSTAPAY|IPN\b|ACH\b|TRSF\b|TRANSFER|FAWRY\s*PAY|سداد|استرداد|إيداع|مرتجع|تسوية)\b|\bCR\b|[\d,]+\.?\d*\s*CR\b|[\d,]+\.?\d*-\b|-\s*[\d,]+\.?\d*\b|\([\d,]+\.?\d*\)/i;
-
-    // 1. Column-aware parsing for tab-delimited tables (Debit in col 4, Credit in col 5)
-    let hasTableColumns = false;
-    let tableDebit = 0;
-    let tableCredit = 0;
-    let tableDesc = "";
-
-    if (rawLine.includes("\t")) {
-      const parts = rawLine.split("\t");
-      if (parts.length >= 5) {
-        const dClean = String(parts[3] || "").replace(/,/g, "").trim();
-        const cClean = String(parts[4] || "").replace(/,/g, "").trim();
-        const dNum = parseFloat(dClean);
-        const cNum = parseFloat(cClean);
-        if (!isNaN(dNum) && dNum > 0 && dNum <= maxAmountCap) tableDebit = dNum;
-        if (!isNaN(cNum) && cNum > 0 && cNum <= maxAmountCap) tableCredit = cNum;
-        if (tableDebit > 0 || tableCredit > 0) {
-          hasTableColumns = true;
-          tableDesc = (parts[2] || "").trim();
-        }
-      }
-    }
-
-    if (hasTableColumns) {
-      if (tableCredit > 0 && tableDebit === 0) {
-        txType = "CREDIT";
-        amount = tableCredit;
-      } else if (tableDebit > 0) {
-        amount = tableDebit;
-        const mInst = rest.match(/(\d+)\s+(?:OF|\/)\s+(\d+)/i);
-        if (mInst) {
-          txType = "INSTALLMENT";
-          instCurrent = parseInt(mInst[1], 10);
-          instTotal = parseInt(mInst[2], 10);
-        } else if (feePattern.test(rawLine) || feePattern.test(rest)) {
-          txType = "FEE";
-        } else {
-          txType = "DEBIT";
-        }
-      }
-    } else {
-      const isKnownStatementCredit = (rawLine.toUpperCase().includes("NOON") && /2835(?:\.83)?/.test(rawLine)) ||
-                                    (rawLine.toUpperCase().includes("AMAZON") && /814(?:\.00)?/.test(rawLine));
-
-      const mInst = rest.match(/(\d+)\s+(?:OF|\/)\s+(\d+)/i);
-      if (mInst) {
-        txType = "INSTALLMENT";
-        instCurrent = parseInt(mInst[1], 10);
-        instTotal = parseInt(mInst[2], 10);
-      } else if (feePattern.test(rawLine) || feePattern.test(rest)) {
-        txType = "FEE";
-      } else if (creditPattern.test(rawLine) || creditPattern.test(rest) || isKnownStatementCredit) {
-        txType = "CREDIT";
-      }
-
-      const mFx = rest.match(/([\d,]+\.?\d*)\s*(?:USD|EUR|GBP|SAR|AED)\s+([\d,]+\.?\d*)\s*(?:EGP)?/i);
-      if (mFx) {
-        const parsedFx = parseFloat(mFx[2].replace(/,/g, ""));
-        if (!isNaN(parsedFx) && parsedFx > 0 && parsedFx <= maxAmountCap) amount = parsedFx;
-      }
-
-      if (amount <= 0) {
-        const mCr = rest.match(/([\d,]+(?:\.\d+)?)\s*CR\b/i);
-        if (mCr) {
-          const parsedCr = parseFloat(mCr[1].replace(/,/g, ""));
-          if (!isNaN(parsedCr) && parsedCr > 0 && parsedCr <= maxAmountCap) amount = parsedCr;
-        }
-      }
-
-      if (amount <= 0) {
-        const mEgp = rest.match(/([\d,]+(?:\.\d+)?)\s*(?:EGP|LE|L\.E\.)\b/i) || rest.match(/\b(?:EGP|LE|L\.E\.)\s*([\d,]+(?:\.\d+)?)/i);
-        if (mEgp) {
-          const parsedEgp = parseFloat(mEgp[1].replace(/,/g, ""));
-          if (!isNaN(parsedEgp) && parsedEgp > 0 && parsedEgp <= maxAmountCap) amount = parsedEgp;
-        }
-      }
-
-      if (amount <= 0) {
-        const allDecimals = (rest.match(/[\d,]+\.\d+/g) || [])
-          .map(s => parseFloat(s.replace(/,/g, "")))
-          .filter(n => !isNaN(n) && n > 0 && n <= maxAmountCap);
-        if (allDecimals.length > 0) amount = allDecimals[allDecimals.length - 1];
-      }
-
-      if (amount <= 0) {
-        const cleanRestForInt = rest.replace(/\b\d{3}[-\s]*\d{7,8}\b/g, " ").replace(/\b\d{10,20}\b/g, " ");
-        const intCandidates = (cleanRestForInt.match(/\b\d{1,7}\b/g) || [])
-          .map(s => parseFloat(s))
-          .filter(n => !isNaN(n) && n > 0 && n <= maxAmountCap);
-        if (intCandidates.length > 0) {
-          if (intCandidates.length >= 2 && String(intCandidates[intCandidates.length - 1]).length === 6) {
-            amount = intCandidates[intCandidates.length - 2];
-          } else {
-            amount = intCandidates[intCandidates.length - 1];
-          }
-        }
-      }
-    }
-
-    if (isNaN(amount) || amount <= 0) continue;
-
-    let desc = tableDesc;
-    if (!desc) {
-      desc = rest
-        .replace(new RegExp("\\b" + amount.toFixed(2) + "\\b", "g"), " ")
-        .replace(new RegExp("\\b" + amount + "\\b", "g"), " ")
-        .replace(/[\d,]+\.\d+/g, " ")
-        .replace(/\b\d{3}[-\s]*\d{7,8}\b/g, " ")
-        .replace(/\b\d{5,8}\b/g, " ")
-        .replace(/\b\d{10,20}\b/g, " ")
-        .replace(/\b(?:EGP|USD|EUR|GBP|SAR|AED|LE|L\.E\.|CR)\b/gi, " ")
-        .replace(/\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b\s*[,]?/gi, " ")
-        .replace(/\b\d{4}\s+[\*xX]{4}\s+[\*xX]{4}\s+\d{4}\b/g, " ")
-        .replace(/\b\d{4}\s*\*{4,}\s*\d{4}\b/g, " ")
-        .replace(/[0-9\*]{12,19}/g, " ")
-        .replace(/[\t\|\*]+/g, " ");
-    }
-
-    desc = desc.replace(/\s+/g, " ").replace(/^[\s,;:\-\|]+/, "").trim();
-    if (!desc) desc = "Bank Statement Charge";
-
-    if (/\bas\s*of\b/i.test(desc) || /\b(?:Minimum\s*Payment|Min\.?\s*Payment)\b/i.test(desc) || /\b(?:printed|generated)\b/i.test(desc)) {
-      continue;
-    }
-
-    transactions.push({
-      txDate: txDate,
-      postDate: postDate,
-      desc: desc,
-      amount: amount,
-      type: txType,
-      instCurrent: instCurrent,
-      instTotal: instTotal
-    });
-  }
-
-  const sumDebits = transactions.filter(t => t.type === "DEBIT" || t.type === "INSTALLMENT" || t.type === "FEE").reduce((s, t) => s + t.amount, 0);
-  const sumCredits = transactions.filter(t => t.type === "CREDIT").reduce((s, t) => s + t.amount, 0);
-  meta.sumDebits = sumDebits;
-  meta.sumCredits = sumCredits;
-
-  return { meta: meta, transactions: transactions };
-}
-
-function writeStatementToSheet(ss, meta, transactions) {
-  const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
-  const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.BANK_STATEMENT);
-
-  // Snapshot existing S-IDs if re-importing the same statement date
-  const preservedIdsByKey = {};
-  const newStmtDateStr = makeNormDateStr(parseDateValue(meta.statementDate, tz), tz);
-  if (sheet.getLastRow() >= 7 && newStmtDateStr) {
-    const oldStmtDateStr = makeNormDateStr(parseDateValue(sheet.getRange(2, 2).getValue(), tz), tz);
-    const oldIdCol = findExistingIdColumn(sheet, 6);
-    if (oldStmtDateStr && oldStmtDateStr === newStmtDateStr && oldIdCol > 0) {
-      const oldCount = sheet.getLastRow() - 6;
-      const oldRows = sheet.getRange(7, 1, oldCount, 7).getValues();
-      const oldIds = sheet.getRange(7, oldIdCol, oldCount, 1).getValues();
-      for (let i = 0; i < oldCount; i++) {
-        const oid = String(oldIds[i][0] || "").trim();
-        if (!parseRowIdNum(oid, "S")) continue;
-        const k = makeReconKey(oldRows[i][1], parseFloat(oldRows[i][5]) || 0, oldRows[i][3], tz);
-        if (!preservedIdsByKey[k]) preservedIdsByKey[k] = [];
-        preservedIdsByKey[k].push(oid);
-      }
-    }
-  }
-
-  sheet.clear();
-
-  sheet.getRange("A1:G1").merge()
-    .setValue("NBE Credit Card Statement — " + (meta.statementDate || "Latest"))
-    .setFontWeight("bold")
-    .setFontSize(14)
-    .setBackground(CONFIG.COLORS.PRIMARY)
-    .setFontColor("#ffffff");
-
-  const totalDebitFormula = transactions.length > 0 ? "=SUMIF(E7:E, \"<>CREDIT\", F7:F)" : (meta.totalDebit || 0);
-  const totalCreditFormula = transactions.length > 0 ? "=SUMIF(E7:E, \"CREDIT\", F7:F)" : (meta.totalCredit || 0);
-  const netCalculatedFormula = transactions.length > 0 ? "=B3+F3-B4" : "";
-
-  const metaRows = [
-    ["Statement Date:", meta.statementDate, "Due Date:", meta.dueDate, "Credit Limit:", meta.creditLimit],
-    ["Opening Balance:", meta.openingBalance, "Closing Balance:", meta.closingBalance, "Total Debit:", totalDebitFormula],
-    ["Total Credit:", totalCreditFormula, "Card Number:", meta.card, "Net Calculated Balance:", netCalculatedFormula]
-  ];
-
-  sheet.getRange(2, 1, metaRows.length, 6).setValues(metaRows).setFontSize(10);
-  sheet.getRange("A2:A4").setFontWeight("bold");
-  sheet.getRange("C2:C4").setFontWeight("bold");
-  sheet.getRange("E2:E4").setFontWeight("bold");
-  sheet.getRange("B3:B4").setNumberFormat("#,##0.00");
-  sheet.getRange("D3:D4").setNumberFormat("#,##0.00");
-  sheet.getRange("F2:F4").setNumberFormat("#,##0.00");
-  sheet.getRange("2:4").setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
-
-  const startRow = 6;
-  const headers = ["#", "Tx Date", "Posting Date", "Description", "Type", "Amount (EGP)", "Assigned Payer / Status"];
-  sheet.getRange(startRow, 1, 1, headers.length).setValues([headers])
-    .setFontWeight("bold")
-    .setBackground(CONFIG.COLORS.HEADER)
-    .setBorder(true, true, true, true, false, false);
-  sheet.getRange(startRow, 8).setValue(ROW_ID_HEADER);
-
-  if (transactions.length > 0) {
-    const idColVals = [];
-    const rows = transactions.map((t, idx) => {
-      const txD = parseDateValue(t.txDate, tz);
-      const postD = parseDateValue(t.postDate, tz);
-      let initStatus = "⏳ Checking...";
-      if (t.type === "CREDIT") initStatus = "💳 Payment / Refund";
-      else if (t.type === "FEE") initStatus = "🏛️ Bank Fee (Mai)";
-
-      const k = makeReconKey(txD || t.txDate, Math.abs(parseFloat(t.amount) || 0), t.desc, tz);
-      const preserved = preservedIdsByKey[k] && preservedIdsByKey[k].length > 0 ? preservedIdsByKey[k].shift() : "";
-      idColVals.push([preserved]);
-
-      return [
-        idx + 1,
-        txD || t.txDate,
-        postD || t.postDate,
-        t.desc,
-        t.type,
-        t.amount,
-        initStatus
-      ];
-    });
-
-    sheet.getRange(startRow + 1, 1, rows.length, headers.length).setValues(rows);
-    sheet.getRange(startRow + 1, 8, idColVals.length, 1).setValues(idColVals);
-    sheet.getRange(startRow + 1, 2, rows.length, 2).setNumberFormat("dddd, MMMM d, yyyy");
-    sheet.getRange(startRow + 1, 6, rows.length, 1).setNumberFormat("#,##0.00");
-
-    const typeValidation = SpreadsheetApp.newDataValidation()
-      .requireValueInList(["DEBIT", "CREDIT", "INSTALLMENT", "FEE"], true)
-      .setAllowInvalid(false)
-      .build();
-    sheet.getRange(startRow + 1, 5, rows.length, 1).setDataValidation(typeValidation);
-
-    for (let i = 0; i < transactions.length; i++) {
-      const type = transactions[i].type;
-      const rowNum = startRow + 1 + i;
-      if (type === "CREDIT") {
-        sheet.getRange(rowNum, 1, 1, headers.length).setBackground(CONFIG.COLORS.PAID);
-      } else if (type === "INSTALLMENT") {
-        sheet.getRange(rowNum, 1, 1, headers.length).setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
-      } else if (type === "FEE") {
-        sheet.getRange(rowNum, 1, 1, headers.length).setBackground("#fffde7");
-      }
-    }
-  }
-
-  const decisions = loadDecisions(ss);
-  ensureSheetRowIds(
-    ss,
-    CONFIG.SHEETS.BANK_STATEMENT,
-    6,
-    8,
-    "S",
-    decisions,
-    r => Boolean(String(r[3] || "").trim() || (!isNaN(parseFloat(r[5])) && parseFloat(r[5]) !== 0))
-  );
-  if (decisions._dirty) saveDecisions(ss, decisions);
-  try { sheet.hideColumns(8); } catch (e) { }
-
-  applySheetLayoutFitting(sheet, {
-    bannerRow: 1,
-    bannerHeight: 30,
-    customRowHeights: { 2: 22, 3: 22, 4: 22, 6: 26 },
-    explicitColWidths: { 1: 45, 2: 105, 3: 105, 4: 240, 5: 90, 6: 115, 7: 170 }
-  });
-}
-
-function getOrCreateFolder(parent, name) {
-  const root = parent || DriveApp.getRootFolder();
-  const folders = root.getFoldersByName(name);
-  return folders.hasNext() ? folders.next() : root.createFolder(name);
-}
-
-function checkAndProcessNewStatements() {
-  const rootFolder = getOrCreateFolder(null, CONFIG.FOLDER_NAME);
-  const processedFolder = getOrCreateFolder(rootFolder, CONFIG.PROCESSED_SUBFOLDER);
-
-  const files = rootFolder.getFiles();
-  const pdfFiles = [];
-  while (files.hasNext()) {
-    const file = files.next();
-    if (file.getMimeType() === MimeType.PDF) pdfFiles.push(file);
-  }
-
-  let isFromProcessed = false;
-  if (pdfFiles.length === 0) {
-    const procFiles = processedFolder.getFiles();
-    let latestFile = null;
-    let latestTime = 0;
-    while (procFiles.hasNext()) {
-      const f = procFiles.next();
-      if (f.getMimeType() === MimeType.PDF) {
-        const t = f.getLastUpdated().getTime();
-        if (t > latestTime) {
-          latestTime = t;
-          latestFile = f;
-        }
-      }
-    }
-    if (latestFile) {
-      pdfFiles.push(latestFile);
-      isFromProcessed = true;
-    }
-  }
-
-  const result = { processedCount: 0, processedFiles: [] };
-  if (pdfFiles.length === 0) return result;
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  pdfFiles.forEach(file => {
-    const text = extractTextFromPDF(file);
-    const parsed = parseNBEStatementText(text);
-
-    if (parsed.transactions.length > 0 || parsed.meta.statementDate) {
-      writeStatementToSheet(ss, parsed.meta, parsed.transactions);
-      result.processedCount++;
-      result.processedFiles.push(file.getName());
-      if (!isFromProcessed) file.moveTo(processedFolder);
-    }
-  });
-
-  return result;
-}
-
-function manualProcessStatements() {
-  const res = checkAndProcessNewStatements();
-  if (res.processedCount > 0) {
-    SpreadsheetApp.getUi().alert("Statement Processed", `Successfully parsed: ${res.processedFiles.join(", ")}`, SpreadsheetApp.getUi().ButtonSet.OK);
-    updateLiveDashboard();
-  } else {
-    SpreadsheetApp.getUi().alert("No Statements Found", "No PDF statements found in Google Drive.", SpreadsheetApp.getUi().ButtonSet.OK);
-  }
-}
 
 // ==========================================
 // 7. ACTIVE RECONCILIATION & WATERFALL ENGINE
@@ -1335,8 +829,9 @@ function reconcileActiveStatement(ss, tz) {
   }
 
   const idInfo = ensureAllSheetRowIds(ss, decisions);
+  const parseHealth = evaluateBankStatementHealth(ss, tz, decisions);
 
-  // 1. Read Statement Rows
+  // 1. Read Statement Rows (respect explicit Col E Type — no hardcoded amount/merchant flips)
   const stmtLastRow = stmtSheet.getLastRow();
   const stmtData = stmtSheet.getRange(7, 1, stmtLastRow - 6, 7).getValues();
 
@@ -1347,7 +842,7 @@ function reconcileActiveStatement(ss, tz) {
   let minStmtTxDate = null;
   let maxStmtTxDate = null;
 
-  const creditPattern = /\b(?:PAYMENT|DIRECT\s*DEBIT|REFUND|CREDIT|DEPOSIT|SETTLEMENT|CASHBACK|CASH\s*BACK|REVERSAL|REVERSED|REV\b|RETURN|RTN\b|CHARGEBACK|ADJUSTMENT|INSTAPAY|IPN\b|ACH\b|TRSF\b|TRANSFER|FAWRY\s*PAY|سداد|استرداد|إيداع|مرتجع|تسوية)\b|\bCR\b|[\d,]+\.?\d*\s*CR\b/i;
+  const validStmtTypes = ["DEBIT", "CREDIT", "INSTALLMENT", "FEE"];
 
   stmtData.forEach((row, idx) => {
     const pDate = parseDateValue(row[1], tz);
@@ -1360,19 +855,8 @@ function reconcileActiveStatement(ss, tz) {
     const desc = String(row[3] || "").trim();
     const amt = parseFloat(row[5]) || 0;
 
-    const isKnownCredit = (desc.toUpperCase().includes("NOON") && Math.abs(amt - 2835.83) < 0.05) ||
-                          (desc.toUpperCase().includes("AMAZON") && Math.abs(amt - 814.00) < 0.05);
-
-    if (type !== "INSTALLMENT" && type !== "FEE") {
-      if (type === "CREDIT" || isKnownCredit || creditPattern.test(desc) || amt < 0 || /\bCR\b/i.test(desc)) {
-        type = "CREDIT";
-        if (row[4] !== "CREDIT") {
-          try {
-            stmtSheet.getRange(idx + 7, 5).setValue("CREDIT");
-            stmtSheet.getRange(idx + 7, 1, 1, 7).setBackground(CONFIG.COLORS.PAID);
-          } catch (e) { }
-        }
-      }
+    if (!validStmtTypes.includes(type)) {
+      type = amt < 0 ? "CREDIT" : "DEBIT";
     }
 
     const item = {
@@ -1778,6 +1262,7 @@ function reconcileActiveStatement(ss, tz) {
     expandedUnmatched,
     pendingNextItems,
     cardBal,
+    parseHealth,
     decisions,
     reconStore: decisions,
     tz
@@ -3312,15 +2797,41 @@ function onEdit(e) {
   }
 
   if (sheetName === CONFIG.SHEETS.BANK_STATEMENT && row >= 7) {
+    let stmtId = "";
     if (col >= 1 && col <= 7) {
-      try { ensureSingleRowId(ss, sheet, 6, 8, row, "S"); } catch (err) { }
+      try { stmtId = ensureSingleRowId(ss, sheet, 6, 8, row, "S"); } catch (err) { }
     }
     if (col === 5) {
       const val = String(e.range.getValue() || "").trim().toUpperCase();
+      if (["DEBIT", "CREDIT", "INSTALLMENT", "FEE"].includes(val) && stmtId) {
+        const decisions = loadDecisions(ss);
+        setStmtTypeConfirm(decisions, stmtId, val, "Confirmed by user on Bank Statement");
+        const tzEdit = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+        const stmtDateCell = sheet.getRange(2, 2).getValue();
+        const stmtDateKey = makeNormDateStr(parseDateValue(stmtDateCell, tzEdit) || stmtDateCell, tzEdit) || String(stmtDateCell || "").trim() || "ACTIVE";
+        const imp = decisions.importMeta && (decisions.importMeta[stmtDateKey] || decisions.importMeta["ACTIVE"]);
+        if (imp && Array.isArray(imp.ambiguousIds)) {
+          imp.ambiguousIds = imp.ambiguousIds.filter(id => id !== stmtId);
+          setImportMeta(decisions, imp.statementDate || stmtDateKey, imp);
+        }
+        if (decisions._dirty) saveDecisions(ss, decisions);
+      }
+
       let bg = "#ffffff";
-      if (val === "CREDIT") bg = CONFIG.COLORS.PAID;
-      else if (val === "INSTALLMENT") bg = CONFIG.COLORS.PRIMARY_LIGHT;
-      else if (val === "FEE") bg = "#fffde7";
+      let statusLabel = "⏳ Checking...";
+      if (val === "CREDIT") {
+        bg = CONFIG.COLORS.PAID;
+        statusLabel = "💳 Payment / Refund";
+      } else if (val === "INSTALLMENT") {
+        bg = CONFIG.COLORS.PRIMARY_LIGHT;
+        statusLabel = "✅ Type Confirmed";
+      } else if (val === "FEE") {
+        bg = "#fffde7";
+        statusLabel = "🏛️ Bank Fee";
+      } else if (val === "DEBIT") {
+        statusLabel = "✅ Type Confirmed";
+      }
+      sheet.getRange(row, 7).setValue(statusLabel);
       sheet.getRange(row, 1, 1, 7).setBackground(bg);
       updateLiveDashboard({ skipPDF: true });
     }
@@ -3341,6 +2852,13 @@ function updateLiveDashboard(options) {
   sanitizeTransactionDates(ss);
   syncActiveReconSheetToDecisions(ss, tz);
 
+  const parseHealth = evaluateBankStatementHealth(ss, tz);
+  const enforceGate = Boolean((options && options.enforceParseGate) || (parseHealth && parseHealth.hasImportMeta));
+  if (enforceGate && parseHealth && !parseHealth.passed) {
+    renderStatementParseErrorSheet(ss, tz, parseHealth);
+    return { blocked: true, parseHealth };
+  }
+
   // Check active payment state from Active Bill & Reconciliation cell H6
   let isBillPaid = false;
   const reconSheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
@@ -3356,7 +2874,7 @@ function updateLiveDashboard(options) {
   const recon = reconcileActiveStatement(ss, tz);
   if (recon.error) {
     Logger.log(recon.error);
-    return;
+    return { blocked: false, parseHealth, error: recon.error };
   }
 
   const ledger = buildDebtLedger(ss, tz, recon);
@@ -3364,6 +2882,8 @@ function updateLiveDashboard(options) {
   renderActiveReconciliationSheet(ss, tz, ledger, recon);
   renderMonthlyHistoryForecastSheet(ss, tz, ledger);
   renderMemberBreakdownSheet(ss, tz, ledger, recon);
+
+  return { blocked: false, parseHealth, recon, ledger };
 }
 
 function navToMemberBreakdown() {
@@ -3731,8 +3251,29 @@ function buildAnonymizedFixture(ss, tz) {
     const locked = r[5] === true || String(r[5]).toUpperCase() === "TRUE";
     const updatedAt = String(r[6] || "").trim();
 
-    if (type === "META_MIGRATION" || type === "META_COUNTER" || type === "INST_PROGRESS") {
+    if (type === "META_MIGRATION" || type === "META_COUNTER" || type === "INST_PROGRESS" || type === "STMT_TYPE_CONFIRM") {
       return [type, subjId, target, "", source, locked, updatedAt];
+    }
+    if (type === "META_IMPORT") {
+      let metaObj = {};
+      try {
+        if (target) metaObj = JSON.parse(target);
+      } catch (e) { }
+      const cleanMeta = {
+        statementDate: metaObj.statementDate || subjId || "",
+        printedOpening: round2_(metaObj.printedOpening),
+        printedClosing: round2_(metaObj.printedClosing),
+        printedTotalDebit: round2_(metaObj.printedTotalDebit),
+        printedTotalCredit: round2_(metaObj.printedTotalCredit),
+        counts: metaObj.counts || { DEBIT: 0, INSTALLMENT: 0, FEE: 0, CREDIT: 0, total: 0, ambiguous: 0 },
+        tieOutPassed: Boolean(metaObj.tieOutPassed),
+        mathPassed: Boolean(metaObj.mathPassed),
+        closingDiff: round2_(metaObj.closingDiff),
+        debitDiff: round2_(metaObj.debitDiff),
+        creditDiff: round2_(metaObj.creditDiff),
+        ambiguousIds: Array.isArray(metaObj.ambiguousIds) ? metaObj.ambiguousIds : []
+      };
+      return [type, subjId, JSON.stringify(cleanMeta), "", source, locked, updatedAt];
     }
     if (type === "CYCLE_PAYMENT") {
       return [type, subjId, target, "[]", source, locked, updatedAt];

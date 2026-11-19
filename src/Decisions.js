@@ -44,6 +44,8 @@ function loadDecisions(ss) {
     instLinks: {},
     stmtInstLink: {},
     instProgress: {},
+    importMeta: {},
+    stmtTypeConfirm: {},
     merchantAliases: {},
     paymentRecords: {},
     counters: { S: 0, T: 0, I: 0 },
@@ -186,6 +188,27 @@ function loadDecisions(ss) {
           locked,
           updatedAt
         };
+      } else if (type === "META_IMPORT" && subjectId) {
+        let meta = {};
+        try {
+          if (target) meta = JSON.parse(target);
+        } catch (e) { }
+        store.importMeta[subjectId] = Object.assign(
+          { statementDate: subjectId, ambiguousIds: [], reasons: [] },
+          meta,
+          { note, source, locked, updatedAt }
+        );
+      } else if (type === "STMT_TYPE_CONFIRM" && subjectId && target) {
+        const id = subjectId.toUpperCase();
+        const txType = target.toUpperCase();
+        store.stmtTypeConfirm[id] = {
+          subjectId: id,
+          target: txType,
+          note,
+          source,
+          locked: true,
+          updatedAt
+        };
       }
     });
   } catch (err) {
@@ -280,6 +303,19 @@ function saveDecisions(ss, decisions) {
         completed: p.completed === true
       });
       rows.push(["INST_PROGRESS", instId, payload, p.note || "", p.source || "system", p.locked !== false, p.updatedAt || nowStr]);
+    });
+
+    Object.keys(decisions.stmtTypeConfirm || {}).sort().forEach(subjectId => {
+      const c = decisions.stmtTypeConfirm[subjectId];
+      if (!c || !c.target) return;
+      rows.push(["STMT_TYPE_CONFIRM", subjectId, c.target, c.note || "", c.source || "user", true, c.updatedAt || nowStr]);
+    });
+
+    Object.keys(decisions.importMeta || {}).sort().forEach(stmtDateKey => {
+      const m = decisions.importMeta[stmtDateKey];
+      if (!m) return;
+      const payload = JSON.stringify(buildImportMetaPayload_(m, stmtDateKey));
+      rows.push(["META_IMPORT", stmtDateKey, payload, m.note || "", m.source || "parser", m.tieOutPassed === true, m.updatedAt || nowStr]);
     });
 
     const lastRow = sheet.getLastRow();
@@ -509,6 +545,72 @@ function setInstProgress(decisions, instId, entry) {
     note: entry.note || "",
     source: entry.source || "system",
     locked: entry.locked !== false,
+    updatedAt: nowCairoTimestamp_()
+  };
+  decisions._dirty = true;
+}
+
+function buildImportMetaPayload_(m, statementDateKey) {
+  return {
+    statementDate: String((m && m.statementDate) || statementDateKey || "").trim(),
+    printedOpening: Number((Number(m && m.printedOpening) || 0).toFixed(2)),
+    printedClosing: Number((Number(m && m.printedClosing) || 0).toFixed(2)),
+    printedTotalDebit: Number((Number(m && m.printedTotalDebit) || 0).toFixed(2)),
+    printedTotalCredit: Number((Number(m && m.printedTotalCredit) || 0).toFixed(2)),
+    counts: (m && m.counts) || { DEBIT: 0, INSTALLMENT: 0, FEE: 0, CREDIT: 0, total: 0, ambiguous: 0 },
+    tieOutPassed: Boolean(m && m.tieOutPassed),
+    mathPassed: Boolean(m && m.mathPassed),
+    closingDiff: Number((Number(m && m.closingDiff) || 0).toFixed(2)),
+    debitDiff: Number((Number(m && m.debitDiff) || 0).toFixed(2)),
+    creditDiff: Number((Number(m && m.creditDiff) || 0).toFixed(2)),
+    ambiguousIds: Array.isArray(m && m.ambiguousIds) ? m.ambiguousIds.map(id => String(id || "").trim().toUpperCase()).filter(Boolean) : [],
+    reasons: Array.isArray(m && m.reasons) ? m.reasons.map(r => String(r || "")) : [],
+    sourceFile: String((m && m.sourceFile) || "").trim()
+  };
+}
+
+function setImportMeta(decisions, statementDateKey, metaObj) {
+  const key = String(statementDateKey || "").trim();
+  if (!decisions || !key || !metaObj) return;
+  if (!decisions.importMeta) decisions.importMeta = {};
+
+  const nextPayload = buildImportMetaPayload_(metaObj, key);
+  const existing = decisions.importMeta[key];
+  if (existing) {
+    const prevPayload = buildImportMetaPayload_(existing, key);
+    if (JSON.stringify(prevPayload) === JSON.stringify(nextPayload)) {
+      return;
+    }
+  }
+
+  decisions.importMeta[key] = Object.assign({}, nextPayload, {
+    note: metaObj.note || (nextPayload.tieOutPassed ? "PASSED" : "FAILED"),
+    source: metaObj.source || "parser",
+    locked: nextPayload.tieOutPassed === true,
+    updatedAt: nowCairoTimestamp_()
+  });
+  decisions._dirty = true;
+}
+
+function setStmtTypeConfirm(decisions, stmtId, txType, note) {
+  const id = String(stmtId || "").trim().toUpperCase();
+  const cleanType = String(txType || "").trim().toUpperCase();
+  if (!decisions || !id) return;
+  if (!["DEBIT", "CREDIT", "INSTALLMENT", "FEE"].includes(cleanType)) return;
+  if (!decisions.stmtTypeConfirm) decisions.stmtTypeConfirm = {};
+
+  const existing = decisions.stmtTypeConfirm[id];
+  const cleanNote = String(note || "");
+  if (existing && existing.target === cleanType && existing.note === cleanNote) {
+    return;
+  }
+
+  decisions.stmtTypeConfirm[id] = {
+    subjectId: id,
+    target: cleanType,
+    note: cleanNote,
+    source: "user",
+    locked: true,
     updatedAt: nowCairoTimestamp_()
   };
   decisions._dirty = true;
