@@ -626,120 +626,7 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
   return null;
 }
 
-function matchStatementInstallments(statementInstallments, sheetInstallmentRows) {
-  const matchedStmt = new Set();
-  const matchedSheet = new Set();
-  const results = [];
-
-  // Prioritize active/ongoing installment rows before completed ones while preserving relative order
-  const orderedSheetRows = sheetInstallmentRows.slice().sort((a, b) => {
-    const aComp = a.isCompleted ? 1 : 0;
-    const bComp = b.isCompleted ? 1 : 0;
-    return aComp - bComp;
-  });
-
-  const descGroups = {};
-  orderedSheetRows.forEach(sh => {
-    const key = (sh.desc || "").toLowerCase().trim() + "_" + (sh.duration || 0);
-    if (!descGroups[key]) descGroups[key] = [];
-    descGroups[key].push(sh);
-  });
-
-  function runOneToOnePass(strictGroupGuard) {
-    statementInstallments.forEach((st, sIdx) => {
-      if (matchedStmt.has(sIdx)) return;
-      const cand = orderedSheetRows.find(sh => {
-        if (matchedSheet.has(sh.index)) return false;
-        if (Math.abs(st.amount - sh.emi) > 0.50) return false;
-        if (st.instTotal && sh.duration && Math.abs(st.instTotal - sh.duration) > 1) return false;
-        if (strictGroupGuard) {
-          const key = (sh.desc || "").toLowerCase().trim() + "_" + (sh.duration || 0);
-          const groupLen = descGroups[key] ? descGroups[key].length : 1;
-          const isExactAmt = Math.abs(st.amount - sh.emi) <= 0.05;
-          const isDescMatch = hasMerchantKeywordOverlap(st.desc, sh.desc);
-          if (groupLen > 1 && !isExactAmt && !isDescMatch) return false;
-        }
-        return true;
-      });
-
-      if (cand) {
-        matchedStmt.add(sIdx);
-        matchedSheet.add(cand.index);
-        results.push({
-          stmtIdx: sIdx,
-          stmt: st,
-          sheetRows: [cand],
-          payerLabel: cand.payer,
-          type: "1-to-1"
-        });
-      }
-    });
-  }
-
-  // Pass 1a: 1-to-1 matches that do not steal rows from multi-row split groups unless exact EMI or desc overlaps
-  runOneToOnePass(true);
-
-  // Pass 2: Multi-row split groups with identical description & duration
-  statementInstallments.forEach((st, sIdx) => {
-    if (matchedStmt.has(sIdx)) return;
-    for (const key in descGroups) {
-      const group = descGroups[key];
-      if (!group || group.length < 2) continue;
-      if (!group.every(it => !matchedSheet.has(it.index))) continue;
-      if (st.instTotal && group[0].duration && Math.abs(group[0].duration - st.instTotal) > 1) continue;
-      const groupSum = group.reduce((sum, it) => sum + it.emi, 0);
-      if (Math.abs(groupSum - st.amount) <= 0.60) {
-        matchedStmt.add(sIdx);
-        group.forEach(it => matchedSheet.add(it.index));
-        const uniquePayers = [...new Set(group.map(it => it.payer))];
-        results.push({
-          stmtIdx: sIdx,
-          stmt: st,
-          sheetRows: group,
-          payerLabel: uniquePayers.join(" + "),
-          type: "SPLIT_SAME_DESC"
-        });
-        delete descGroups[key];
-        break;
-      }
-    }
-  });
-
-  // Pass 3: Fallback 1-to-1 within 0.50 for any remaining unmatched items
-  runOneToOnePass(false);
-
-  // Pass 4: Subset combination split matching across remaining rows
-  statementInstallments.forEach((st, sIdx) => {
-    if (matchedStmt.has(sIdx)) return;
-    const available = orderedSheetRows.filter(sh => {
-      if (matchedSheet.has(sh.index)) return false;
-      if (st.instTotal && sh.duration && Math.abs(sh.duration - st.instTotal) > 1) return false;
-      return true;
-    });
-    if (available.length < 2) return;
-
-    const combo = findSubsetCombination(
-      available.map(a => ({ ...a, amount: a.emi })),
-      st.amount,
-      6,
-      0.60
-    );
-    if (combo) {
-      matchedStmt.add(sIdx);
-      combo.forEach(c => matchedSheet.add(c.index));
-      const uniquePayers = [...new Set(combo.map(c => c.payer))];
-      results.push({
-        stmtIdx: sIdx,
-        stmt: st,
-        sheetRows: combo,
-        payerLabel: uniquePayers.join(" + "),
-        type: "SPLIT_CART"
-      });
-    }
-  });
-
-  return results;
-}
+// Installment link matching & progress moved to src/Installments.js
 
 // ==========================================
 // 5. CARD BALANCE & STATEMENT INFO
@@ -800,15 +687,82 @@ function calculateCardBalance(ss, tz) {
   let totalBlockedInstallments = 0;
   const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
   if (instSheet && instSheet.getLastRow() >= 2) {
-    const instData = instSheet.getRange(2, 1, instSheet.getLastRow() - 1, 11).getValues();
-    instData.forEach(row => {
+    const numInstRows = instSheet.getLastRow() - 1;
+    const instData = instSheet.getRange(2, 1, numInstRows, 11).getValues();
+    const instIdCol = findExistingIdColumn(instSheet, 1);
+    const instIds = instIdCol ? instSheet.getRange(2, instIdCol, numInstRows, 1).getValues() : null;
+
+    const sheetInstList = [];
+    instData.forEach((row, idx) => {
       const duration = parseInt(row[4], 10);
       const emi = parseFloat(row[7]);
       const paymentsMade = parseInt(row[9], 10) || 0;
-      const status = String(row[10] || "").toLowerCase();
-      if (!isNaN(duration) && !isNaN(emi) && emi > 0 && status !== "completed") {
-        const remainingMonths = Math.max(0, duration - paymentsMade);
-        totalBlockedInstallments += (remainingMonths * emi);
+      const status = String(row[10] || "").trim();
+      const payer = String(row[8] || "").replace(/[\u00A0\s]+/g, " ").trim();
+      if (!isNaN(duration) && !isNaN(emi) && emi > 0) {
+        sheetInstList.push({
+          index: idx,
+          instId: instIds ? String(instIds[idx][0] || "").trim() : "",
+          desc: String(row[2] || "").trim(),
+          duration,
+          emi,
+          payer,
+          paymentsMade,
+          status,
+          isCompleted: status.toLowerCase() === "completed" && duration > 0 && paymentsMade >= duration
+        });
+      }
+    });
+
+    const cardStmtInstallments = [];
+    if (stmtSheet && stmtSheet.getLastRow() >= 7) {
+      const stmtLastRow = stmtSheet.getLastRow();
+      const stmtRows = stmtSheet.getRange(7, 1, stmtLastRow - 6, 7).getValues();
+      const stmtIdCol = findExistingIdColumn(stmtSheet, 6);
+      const stmtIds = stmtIdCol ? stmtSheet.getRange(7, stmtIdCol, stmtLastRow - 6, 1).getValues() : null;
+      stmtRows.forEach((row, idx) => {
+        const type = String(row[4] || "").trim().toUpperCase();
+        const desc = String(row[3] || "").trim();
+        const amt = parseFloat(row[5]) || 0;
+        if (type === "INSTALLMENT") {
+          const parsed = parseInstallmentProgressText(desc);
+          cardStmtInstallments.push({
+            stmtId: stmtIds ? String(stmtIds[idx][0] || "").trim() : "",
+            stmtRowIndex: idx,
+            desc,
+            amount: Math.abs(amt),
+            instCurrent: parsed.instCurrent,
+            instTotal: parsed.instTotal
+          });
+        }
+      });
+    }
+
+    let isBillPaid = false;
+    const arSheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+    if (arSheet) {
+      const h6Date = parseDateValue(arSheet.getRange(6, 8).getValue(), tz);
+      if (h6Date && !isNaN(h6Date.getTime())) isBillPaid = true;
+    }
+    const decisions = loadDecisions(ss);
+    if (!isBillPaid && decisions.paymentRecords && decisions.paymentRecords[activeCycleKey] && decisions.paymentRecords[activeCycleKey].dateStr) {
+      isBillPaid = true;
+    }
+
+    const progressMap = (cardStmtInstallments.length > 0 && sheetInstList.length > 0)
+      ? computeBankDerivedInstallmentProgress(
+          matchStatementInstallmentsByLink(cardStmtInstallments, sheetInstList, decisions).matches,
+          sheetInstList,
+          isBillPaid
+        )
+      : {};
+
+    sheetInstList.forEach(sh => {
+      const prog = progressMap[sh.index];
+      if (prog && prog.onStatement) {
+        if (!prog.isCompleted) totalBlockedInstallments += (prog.remainingMonths * sh.emi);
+      } else if (sh.status.toLowerCase() !== "completed") {
+        totalBlockedInstallments += Math.max(0, sh.duration - sh.paymentsMade) * sh.emi;
       }
     });
   }
@@ -1550,38 +1504,38 @@ function reconcileActiveStatement(ss, tz) {
   // Stage 1 one-time migration from legacy _Recon_Store (pre-matching: payment records + confirmed matches)
   const legacyMigrationCtx = migrateLegacyPreMatch(ss, tz, decisions, { stmtDebits, txDebits });
 
-  // 4. Match Installments & Build Table 4 Reconciliation Items
-  const instMatches = matchStatementInstallments(stmtInstallments, sheetInstallmentRows);
+  // 4. Match Installments by Link & Build Table 4 Reconciliation Items
+  const instMatchResult = matchStatementInstallmentsByLink(stmtInstallments, sheetInstallmentRows, decisions);
+  const instMatches = instMatchResult.matches;
   const instMatchMap = {};
-  const matchedStmtIdxSet = new Set();
-  const matchedSheetIdxSet = new Set();
+  const matchedStmtIdxSet = instMatchResult.matchedStmtIdxSet;
+  const matchedSheetIdxSet = instMatchResult.matchedSheetIdxSet;
   instMatches.forEach(m => {
     instMatchMap[m.stmtIdx] = m.payerLabel;
-    matchedStmtIdxSet.add(m.stmtIdx);
-    m.sheetRows.forEach(sh => matchedSheetIdxSet.add(sh.index));
     stmtInstallments[m.stmtIdx].matched = true;
     stmtInstallments[m.stmtIdx].assignedPayer = m.payerLabel;
   });
 
-  const unmatchedStmtItems = [];
+  // Prune Table 2 assignment overrides only for linked/matched statement installment IDs
   stmtInstallments.forEach((st, sIdx) => {
-    if (matchedStmtIdxSet.has(sIdx)) return;
-    unmatchedStmtItems.push({
-      subjectId: buildInstSubjectId(st.stmtId, null, cardBal.activeCycleKey, null, 1),
-      date: st.date || st.dateStr || "",
-      desc: st.desc,
-      amount: st.amount,
-      sourceCategory: "⚠️ Statement Only",
-      defaultPayer: "",
-      defaultAction: "",
-      defaultNote: "On Bank Statement but missing in Installments sheet — assign payer"
-    });
+    if (matchedStmtIdxSet.has(sIdx) && st.stmtId && decisions.stmtAssign && decisions.stmtAssign[st.stmtId]) {
+      clearStmtAssign(decisions, st.stmtId);
+    }
   });
 
+  // Unlinked statement installments move to Needs Pairing (suggestions first, preserving row order)
+  const rawUnlinkedStmtInst = instMatchResult.unmatchedStmtInstallments || [];
+  const unlinkedStmtInstallments = [
+    ...rawUnlinkedStmtInst.filter(st => st.suggestedInstLinks && st.suggestedInstLinks.length > 0),
+    ...rawUnlinkedStmtInst.filter(st => !st.suggestedInstLinks || st.suggestedInstLinks.length === 0)
+  ];
+
+  const unmatchedSheetInstallments = sheetInstallmentRows.filter(
+    sh => !matchedSheetIdxSet.has(sh.index) && !sh.isCompleted && sh.status.toLowerCase() !== "completed"
+  );
+
   const unmatchedSheetItems = [];
-  sheetInstallmentRows.forEach(sh => {
-    if (matchedSheetIdxSet.has(sh.index)) return;
-    if (sh.status.toLowerCase() === "completed") return;
+  unmatchedSheetInstallments.forEach(sh => {
     const payers = splitPayerNames(sh.payer);
     const targetPayers = payers.length > 0 ? payers : [sh.payer];
     const shareEmi = sh.emi / targetPayers.length;
@@ -1601,6 +1555,7 @@ function reconcileActiveStatement(ss, tz) {
 
   const matchedInstItems = [];
   instMatches.forEach(m => {
+    const isLockedLink = m.tier === "locked" || m.tier === "locked-plan";
     const entries = [];
     m.sheetRows.forEach(sh => {
       const payers = splitPayerNames(sh.payer);
@@ -1609,6 +1564,10 @@ function reconcileActiveStatement(ss, tz) {
       const progressStr = (m.stmt.instCurrent && m.stmt.instTotal)
         ? `${m.stmt.instCurrent} of ${m.stmt.instTotal}`
         : (sh.duration ? `${sh.paymentsMade + 1} of ${sh.duration}` : "Active");
+      const isSplit = m.sheetRows.length > 1 || targetPayers.length > 1;
+      const sourceCategory = isLockedLink
+        ? (isSplit ? "✅ Linked Split" : "✅ Linked Plan")
+        : (isSplit ? "✅ Matched Split" : "✅ Matched Statement");
       const rowEntries = [];
       targetPayers.forEach(p => {
         rowEntries.push({
@@ -1617,10 +1576,10 @@ function reconcileActiveStatement(ss, tz) {
           desc: `${sh.desc} (${progressStr})`,
           rawEmi: shareEmi,
           amount: Number(shareEmi.toFixed(2)),
-          sourceCategory: (m.sheetRows.length === 1 && targetPayers.length === 1) ? "✅ Matched Statement" : "✅ Matched Split",
+          sourceCategory: sourceCategory,
           defaultPayer: p,
           defaultAction: `✅ Billed to ${p}`,
-          defaultNote: `Matched Stmt: ${m.stmt.desc}`
+          defaultNote: `${isLockedLink ? "Linked" : "Matched"} Stmt: ${m.stmt.desc}`
         });
       });
 
@@ -1654,7 +1613,7 @@ function reconcileActiveStatement(ss, tz) {
     }
   });
 
-  const installmentReconItems = [...unmatchedStmtItems, ...unmatchedSheetItems, ...matchedInstItems];
+  const installmentReconItems = [...unmatchedSheetItems, ...matchedInstItems];
 
   // 5. Confidence-Tiered Matching for Purchases (DEBIT)
   const matchResult = matchStatementDebits(stmtDebits, txDebits, decisions, tz);
@@ -1807,12 +1766,17 @@ function reconcileActiveStatement(ss, tz) {
     defaultNote: () => "Bank Fee / Tax"
   });
 
-  // 7. Missing in sheet purchases (or restored from _Decisions)
+  // 7. Unlinked Statement Installments (or restored from _Decisions)
+  applyTable2Decisions(unlinkedStmtInstallments, {
+    defaultNote: () => "On bank statement — link to plan or assign payer"
+  });
+
+  // 8. Missing in sheet purchases (or restored from _Decisions)
   applyTable2Decisions(missingInSheet, {
     defaultNote: m => cleanMerchantName(m.desc)
   });
 
-  // 8. Refunds / Credits (payment credits neglected by default unless user assigns payer)
+  // 9. Refunds / Credits (payment credits neglected by default unless user assigns payer)
   applyTable2Decisions(stmtCredits, {
     defaultPayer: cr => isPaymentCreditDesc(cr.desc) ? "🚫 Neglect / Ignore" : CONFIG.DEFAULT_FEE_PAYER,
     defaultNote: cr => isPaymentCreditDesc(cr.desc)
@@ -1833,6 +1797,9 @@ function reconcileActiveStatement(ss, tz) {
   return {
     stmtDebits,
     stmtInstallments,
+    instMatches,
+    unlinkedStmtInstallments,
+    unmatchedSheetInstallments,
     installmentReconItems,
     stmtFees,
     stmtCredits,
@@ -1931,9 +1898,12 @@ function buildDebtLedger(ss, tz, recon) {
   // Note (Q5c/Q13): In-period unpaired Orphan Logs are NOT billed on top of the bank statement;
   // purchases only count once paired with a statement line or assigned in Needs Pairing.
 
-  // 2. Attributed Installments (From Table 4 Installment Reconciliation Items)
+  // 2. Attributed Installments (From Table 4 Items + Assigned Unlinked Installments in Needs Pairing)
   let unresolvedInstCount = 0;
   let unresolvedInstTotal = 0;
+  let neglectedTotal = 0;
+  let neglectedCount = 0;
+
   (recon.installmentReconItems || []).forEach(inst => {
     const act = String(inst.action || "").trim();
     if (!act) {
@@ -1948,9 +1918,19 @@ function buildDebtLedger(ss, tz, recon) {
     }
   });
 
+  (recon.unlinkedStmtInstallments || []).forEach(u => {
+    if (isNeglectedPayer(u.assignedPayer)) {
+      neglectedTotal += u.amount;
+      neglectedCount++;
+    } else if (u.assignedPayer) {
+      addShare(u.assignedPayer, u.amount, "Installment");
+    } else {
+      unresolvedInstCount++;
+      unresolvedInstTotal += (parseFloat(u.amount) || 0);
+    }
+  });
+
   // 3. Attributed Fees (Default: Mai or overridden)
-  let neglectedTotal = 0;
-  let neglectedCount = 0;
   let unassignedTotal = 0;
   let unassignedCount = 0;
   let unresolvedFeesCount = 0;
@@ -2098,7 +2078,8 @@ function getReconTableBounds(ledger, recon) {
   const totShareRow = endShareRow + 1;
 
   const creditsCount = recon.stmtCredits ? recon.stmtCredits.length : 0;
-  const numExceptions = (recon.stmtFees ? recon.stmtFees.length : 0) + creditsCount + (recon.missingInSheet ? recon.missingInSheet.length : 0);
+  const unlinkedInstCount = recon.unlinkedStmtInstallments ? recon.unlinkedStmtInstallments.length : 0;
+  const numExceptions = (recon.stmtFees ? recon.stmtFees.length : 0) + creditsCount + unlinkedInstCount + (recon.missingInSheet ? recon.missingInSheet.length : 0);
   const startExHeaderRow = totShareRow + 3;
   const startExRow = startExHeaderRow + 2;
   const endExRow = startExRow + Math.max(1, numExceptions) - 1;
@@ -2188,7 +2169,28 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       category: isPay ? "Bill Payment (Credit)" : "Refund / Credit",
       assignedPayer: c.assignedPayer || "",
       suggestedPairs: [],
+      suggestedInstLinks: [],
       note: c.note || (isPay ? "Bill Payment / Settlement (Neglected by default)" : "Merchant Refund (Reduces Debt)")
+    });
+  });
+
+  (recon.unlinkedStmtInstallments || []).forEach((u, idx) => {
+    const sugs = u.suggestedInstLinks || [];
+    const hasUnresolvedSugs = sugs.length > 0 && !u.assignedPayer;
+    const topSug = sugs[0];
+    exceptionItems.push({
+      id: `I-${idx + 1}`,
+      subjectId: u.stmtId || "",
+      date: u.date || u.dateStr,
+      desc: u.desc,
+      amount: u.amount,
+      category: hasUnresolvedSugs ? "Installment (💡 Link)" : "Installment (Unlinked)",
+      assignedPayer: u.assignedPayer || "",
+      suggestedPairs: [],
+      suggestedInstLinks: sugs,
+      note: hasUnresolvedSugs
+        ? `💡 ${topSug.reason} → ${topSug.dropdownLabel}`
+        : (u.note || "On bank statement — link to plan or assign payer")
     });
   });
 
@@ -2205,6 +2207,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       category: hasUnresolvedSugs ? "Missing Purchase (💡)" : "Missing Purchase",
       assignedPayer: m.assignedPayer || "",
       suggestedPairs: sugs,
+      suggestedInstLinks: [],
       note: hasUnresolvedSugs
         ? `💡 ${topSug.reason} → ${topSug.dropdownLabel}`
         : (m.note || cleanMerchantName(m.desc))
@@ -2356,9 +2359,16 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     const shareRows = sharePeople.map((ps, idx) => {
       const r = startShareRow + idx;
       const purchFormula = `=${ps.matchedPurchases.toFixed(2)}`;
-      const instFormula = hasTable4
-        ? `=SUMIFS($D$${startInstRow}:$D$${endInstRow}, $F$${startInstRow}:$F$${endInstRow}, "*" & TRIM($B${r}) & "*", $F$${startInstRow}:$F$${endInstRow}, "<>🚫*")`
-        : `=${ps.installments.toFixed(2)}`;
+      let instFormula;
+      if (hasTable4 && numExceptions > 0) {
+        instFormula = `=SUMIFS($D$${startInstRow}:$D$${endInstRow}, $F$${startInstRow}:$F$${endInstRow}, "*" & TRIM($B${r}) & "*", $F$${startInstRow}:$F$${endInstRow}, "<>🚫*") + SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Installment*")`;
+      } else if (hasTable4) {
+        instFormula = `=SUMIFS($D$${startInstRow}:$D$${endInstRow}, $F$${startInstRow}:$F$${endInstRow}, "*" & TRIM($B${r}) & "*", $F$${startInstRow}:$F$${endInstRow}, "<>🚫*")`;
+      } else if (numExceptions > 0) {
+        instFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Installment*")`;
+      } else {
+        instFormula = `=${ps.installments.toFixed(2)}`;
+      }
       const feesFormula = numExceptions > 0
         ? `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Bank Fee / Tax")`
         : "=0";
@@ -2424,7 +2434,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   if (numExceptions > 0) {
     const exRows = exceptionItems.map((ex, idx) => {
       const r = startExRow + idx;
-      const statusFormula = `=IF(ISBLANK(F${r}), IF(ISNUMBER(SEARCH("💡", E${r})), "💡 Confirm Pair or Assign", "⚠️ Needs Action"), IF(LEFT(F${r}, 1)="🚫", "🚫 Neglected", IF(LEFT(F${r}, 1)="🔗", "🔗 Pairing...", "✅ Assigned")))`;
+      const statusFormula = `=IF(ISBLANK(F${r}), IF(ISNUMBER(SEARCH("💡", E${r})), "💡 Confirm Link/Pair or Assign", "⚠️ Needs Action"), IF(ISNUMBER(SEARCH("🚫", F${r})), "🚫 Neglected", IF(ISNUMBER(SEARCH("🔗", F${r})), "🔗 Linking...", "✅ Assigned")))`;
       return [
         ex.id,
         ex.date,
@@ -2462,11 +2472,33 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       }
     });
 
+    const activeUnmatchedSheetInsts = (recon.unmatchedSheetInstallments || []).filter(sh => sh.instId);
+
     for (let i = 0; i < exceptionItems.length; i++) {
       const ex = exceptionItems[i];
       const r = startExRow + i;
 
-      if (ex.suggestedPairs && ex.suggestedPairs.length > 0) {
+      if (ex.suggestedInstLinks && ex.suggestedInstLinks.length > 0) {
+        const sugLabels = ex.suggestedInstLinks.map(sl => sl.dropdownLabel);
+        const rowVal = SpreadsheetApp.newDataValidation()
+          .requireValueInList([...sugLabels, ...standardOptions], true)
+          .setAllowInvalid(true)
+          .build();
+        sheet.getRange(r, 6).setDataValidation(rowVal);
+      } else if (/^I-/.test(ex.id) && !ex.assignedPayer && activeUnmatchedSheetInsts.length > 0) {
+        const closest = activeUnmatchedSheetInsts
+          .slice()
+          .sort((a, b) => Math.abs(a.emi - ex.amount) - Math.abs(b.emi - ex.amount))
+          .slice(0, 3)
+          .map(sh => formatInstLinkDropdownLabel([sh]));
+        if (closest.length > 0) {
+          const rowVal = SpreadsheetApp.newDataValidation()
+            .requireValueInList([...standardOptions, ...closest], true)
+            .setAllowInvalid(true)
+            .build();
+          sheet.getRange(r, 6).setDataValidation(rowVal);
+        }
+      } else if (ex.suggestedPairs && ex.suggestedPairs.length > 0) {
         const sugLabels = ex.suggestedPairs.map(sp => sp.dropdownLabel);
         const rowVal = SpreadsheetApp.newDataValidation()
           .requireValueInList([...sugLabels, ...standardOptions], true)
@@ -2490,7 +2522,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
 
       const cat = ex.category;
       const payer = ex.assignedPayer;
-      const hasSugs = ex.suggestedPairs && ex.suggestedPairs.length > 0;
+      const hasSugs = (ex.suggestedPairs && ex.suggestedPairs.length > 0) || (ex.suggestedInstLinks && ex.suggestedInstLinks.length > 0);
       if (isNeglectedPayer(payer)) {
         sheet.getRange(r, 1, 1, 8).setBackground("#eeeeee");
       } else if (cat.includes("Credit")) {
@@ -2499,6 +2531,8 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
         sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
       } else if (hasSugs) {
         sheet.getRange(r, 1, 1, 8).setBackground("#e8f0fe");
+      } else if (/^I-/.test(ex.id)) {
+        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.DUE_SOON);
       } else {
         sheet.getRange(r, 1, 1, 8).setBackground("#ffffff");
       }
@@ -2519,7 +2553,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
 
     const orphanRows = orphanList.map((tx, idx) => {
       const r = startOrphanRow + idx;
-      const statusFormula = `=IF(LEFT(F${r}, 1)="🚫", "🚫 Dismissed", IF(LEFT(F${r}, 1)="🔗", "🔗 Pairing...", "🔎 Unpaired (Not Billed)"))`;
+      const statusFormula = `=IF(ISNUMBER(SEARCH("🚫", F${r})), "🚫 Dismissed", IF(ISNUMBER(SEARCH("🔗", F${r})), "🔗 Pairing...", "🔎 Unpaired (Not Billed)"))`;
       const defaultAction = tx.isNeglected ? "🚫 Dismiss / Duplicate Log" : "⏳ Not on Statement Yet (Ignored)";
       const hintNote = (tx.suggestedStmts && tx.suggestedStmts.length > 0)
         ? `💡 ${tx.suggestedStmts[0].reason} → ${tx.suggestedStmts[0].stmtId} (${tx.suggestedStmts[0].stmt.amount.toFixed(2)})`
@@ -2584,7 +2618,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
 
     const instRows = instReconList.map((inst, idx) => {
       const r = startInstRow + idx;
-      const statusFormula = `=IF(ISBLANK(F${r}), "⚠️ Needs Payer", IF(LEFT(F${r}, 1)="🚫", "🚫 Skipped This Cycle", IF(LEFT(F${r}, 1)="✅", F${r}, "✅ Billed to " & F${r})))`;
+      const statusFormula = `=IF(ISBLANK(F${r}), "⚠️ Needs Payer", IF(ISNUMBER(SEARCH("🚫", F${r})), "🚫 Skipped This Cycle", IF(ISNUMBER(SEARCH("✅", F${r})), F${r}, "✅ Billed to " & F${r})))`;
       return [
         inst.id,
         inst.date,
@@ -2666,6 +2700,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   }
 
   try { sheet.hideColumns(9); } catch (e) { }
+  try { renderInstallmentProgressFormulas(ss, bounds); } catch (e) { }
 
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
@@ -2978,7 +3013,7 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
   let exFilterPart;
   if (bounds.numExceptions > 0) {
     const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, IF(ISNUMBER(SEARCH("Credit", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow})), -1, 1) * ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}, ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}})`;
-    const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (LEFT(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, 1)<>"🚫") * (LEFT(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, 1)<>"🔗") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
+    const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (ISERROR(SEARCH("🚫", ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))) * (ISERROR(SEARCH("🔗", ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))) * (ISERROR(SEARCH("Installment", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}))) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
     exFilterPart = `IFERROR(FILTER(${exColsExpr}, ${exFilterCond}), {"—", "—", "No unrecorded statement items, fees, or refunds", 0, "—", "—"})`;
   } else {
     exFilterPart = `{"—", "—", "No statement adjustments for this cycle", 0, "—", "—"}`;
@@ -3008,13 +3043,22 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
     .setFontSize(10)
     .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
 
-  const instHeaders = ["#", "Start Date", "Item Description", "Total Price (EGP)", "Months", "Monthly EMI (EGP)", "Payer", "Payments Made", "Status"];
+  const instHeaders = ["#", "Start Date", "Item Description", "Total Price (EGP)", "Months", "Monthly EMI (EGP)", "Payer", "Bank Progress", "Status"];
   sheet.getRange(9, 8, 1, instHeaders.length).setValues([instHeaders])
     .setFontWeight("bold")
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
 
-  const instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$K})`;
+  let instColsExpr;
+  const instSheetObj = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  const instColsInfo = instSheetObj ? getOrCreateInstallmentProgressCols(instSheetObj) : null;
+  if (instColsInfo && instColsInfo.progressCol > 11 && instColsInfo.statusCol > 11) {
+    const progLet = getColumnLetter(instColsInfo.progressCol);
+    const statLet = getColumnLetter(instColsInfo.statusCol);
+    instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$I, ${instRef}!$${progLet}$2:$${progLet}, ${instRef}!$${statLet}$2:$${statLet}})`;
+  } else {
+    instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$K})`;
+  }
   const instFilterCond = bounds.hasTable4
     ? `(${instRef}!$A$2:$A<>"") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1)) * MAP(${instRef}!$C$2:$C, ${instRef}!$I$2:$I, LAMBDA(d, p, IF(d="", FALSE, COUNTIFS(${arRef}!$C$${bounds.startInstRow}:$C$${bounds.endInstRow}, d & " (*", ${arRef}!$F$${bounds.startInstRow}:$F$${bounds.endInstRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", p)), "✅*", "✅*" & TRIM(p) & "*"), "✅*" & TRIM($B$3) & "*"))>0)))`
     : `(${instRef}!$A$2:$A<>"") * (${instRef}!$K$2:$K<>"Completed") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1))`;
@@ -3057,129 +3101,93 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
 function syncInstallmentsFromStatement(ss, tz, isBillPaid) {
   const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
   const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
-  if (!instSheet || instSheet.getLastRow() < 2) return;
-  if (!stmtSheet || stmtSheet.getLastRow() < 7) return;
+  if (!instSheet || instSheet.getLastRow() < 2) return null;
+  if (!stmtSheet || stmtSheet.getLastRow() < 7) return null;
 
-  // 1. Read Statement Installments
+  const decisions = loadDecisions(ss);
+  const idInfo = ensureAllSheetRowIds(ss, decisions);
+
+  // 1. Read Statement Installments (read-only)
   const stmtLastRow = stmtSheet.getLastRow();
   const stmtData = stmtSheet.getRange(7, 1, stmtLastRow - 6, 7).getValues();
   const stmtInstallments = [];
 
   stmtData.forEach((row, idx) => {
-    let type = String(row[4] || "").trim().toUpperCase();
+    const type = String(row[4] || "").trim().toUpperCase();
     const desc = String(row[3] || "").trim();
     const amt = parseFloat(row[5]) || 0;
 
-    const mInst = desc.match(/(\d+)\s+(?:OF|\/)\s+(\d+)/i);
-    if (mInst || type === "INSTALLMENT") {
-      let instCurrent = null, instTotal = null;
-      if (mInst) {
-        instCurrent = parseInt(mInst[1], 10);
-        instTotal = parseInt(mInst[2], 10);
-      }
+    const parsed = parseInstallmentProgressText(desc);
+    if (parsed.instCurrent || type === "INSTALLMENT") {
       stmtInstallments.push({
         id: idx + 1,
+        stmtId: (idInfo.stmt.ids && idInfo.stmt.ids[idx]) || "",
         stmtRowIndex: idx,
         desc: desc,
         amount: Math.abs(amt),
-        instCurrent: instCurrent,
-        instTotal: instTotal
+        instCurrent: parsed.instCurrent,
+        instTotal: parsed.instTotal
       });
     }
   });
 
-  if (stmtInstallments.length === 0) return;
+  if (stmtInstallments.length === 0) return null;
 
-  // 2. Read Installments Sheet
+  // 2. Read Installments Sheet (Cols A:K are strictly read-only — never overwrite user Payments Made)
   const numRows = instSheet.getLastRow() - 1;
   const instData = instSheet.getRange(2, 1, numRows, 11).getValues();
-  const paymentsCol = instSheet.getRange(2, 10, numRows, 1).getValues();
-  const statusCol = instSheet.getRange(2, 11, numRows, 1).getValues();
-
   const sheetInstallmentRows = [];
   instData.forEach((row, idx) => {
     const emi = parseFloat(row[7]);
     const payer = String(row[8] || "").replace(/[\u00A0\s]+/g, " ").trim();
     const desc = String(row[2] || "").trim();
     const duration = parseInt(row[4], 10);
+    const paymentsMade = parseInt(row[9], 10) || 0;
+    const status = String(row[10] || "").trim();
+    const isCompleted = status.toLowerCase() === "completed" && duration > 0 && paymentsMade >= duration;
     if (!isNaN(emi) && emi > 0 && payer) {
       sheetInstallmentRows.push({
         index: idx,
+        instId: (idInfo.inst.ids && idInfo.inst.ids[idx]) || "",
         emi: emi,
         payer: payer,
         desc: desc,
-        duration: duration
+        duration: duration,
+        paymentsMade: paymentsMade,
+        status: status,
+        isCompleted: isCompleted
       });
     }
   });
 
-  // 3. Match Statement Installments to Sheet Rows
-  const matches = matchStatementInstallments(stmtInstallments, sheetInstallmentRows);
+  // 3. Match by Link & compute bank-derived progress without mutating columns A:K
+  const matchResult = matchStatementInstallmentsByLink(stmtInstallments, sheetInstallmentRows, decisions);
+  const progressMap = computeBankDerivedInstallmentProgress(matchResult.matches, sheetInstallmentRows, isBillPaid);
 
-  const matchedSheetIndices = new Set();
-  const completedRows = [];
-  const ongoingRows = [];
-
-  matches.forEach(m => {
-    const instCurrent = m.stmt.instCurrent;
-    if (!instCurrent) return;
-
-    // Ground Truth target payments: instCurrent if bill is paid, instCurrent - 1 if pending
-    const targetPayments = isBillPaid ? instCurrent : Math.max(0, instCurrent - 1);
-
-    m.sheetRows.forEach(sh => {
-      const idx = sh.index;
-      matchedSheetIndices.add(idx);
-      const duration = sh.duration || parseInt(instData[idx][4], 10) || 0;
-      const isCompleted = (duration > 0 && targetPayments >= duration);
-      const newStatus = isCompleted ? "Completed" : "Ongoing";
-
-      paymentsCol[idx][0] = targetPayments;
-      statusCol[idx][0] = newStatus;
-
-      const rowNum = idx + 2;
-      if (isCompleted) {
-        completedRows.push(rowNum);
-      } else {
-        ongoingRows.push(rowNum);
-      }
-    });
-  });
-
-  // 4. Handle unmatched items (e.g. Cosmatics Sep 1, 2026 which has not started billing)
-  instData.forEach((row, idx) => {
-    if (!matchedSheetIndices.has(idx)) {
-      const desc = String(row[2] || "").trim().toLowerCase();
-      const months = parseInt(row[4], 10);
-      const curPayments = parseInt(row[9], 10) || 0;
-      const curStatus = String(row[10] || "").trim();
-
-      // If genuine completed (like Noon 2 of 6)
-      if (curStatus.toLowerCase() === "completed" && curPayments >= months && months > 0) {
-        completedRows.push(idx + 2);
-        return;
-      }
-
-      // If inflated future item (e.g. Cosmatics 2026-09-01)
-      if (desc.includes("cosmatic") && curPayments === 1) {
-        paymentsCol[idx][0] = 0;
-        statusCol[idx][0] = "Ongoing";
-        ongoingRows.push(idx + 2);
+  // 4. Keep Bank Progress / Bank Status formula columns synced to active Table 4 rows
+  let arBounds = null;
+  const arSheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+  if (arSheet && arSheet.getLastRow() >= 12) {
+    let startInstRow = -1;
+    let endInstRow = -1;
+    const colA = arSheet.getRange(1, 1, arSheet.getLastRow(), 1).getValues();
+    for (let r = 12; r <= colA.length; r++) {
+      if (/^INST-\d+/i.test(String(colA[r - 1][0] || "").trim())) {
+        if (startInstRow === -1) startInstRow = r;
+        endInstRow = r;
       }
     }
-  });
+    if (startInstRow > 0) {
+      arBounds = { hasTable4: true, startInstRow, endInstRow };
+    }
+  }
+  renderInstallmentProgressFormulas(ss, arBounds);
 
-  // 5. Batch update Columns J and K
-  instSheet.getRange(2, 10, numRows, 1).setValues(paymentsCol);
-  instSheet.getRange(2, 11, numRows, 1).setValues(statusCol);
+  if (decisions._dirty) {
+    saveDecisions(ss, decisions);
+  }
 
-  // 6. Update formatting: Clear accidental highlights and set PAID for genuinely completed
-  completedRows.forEach(r => {
-    try { instSheet.getRange(r, 1, 1, 11).setBackground(CONFIG.COLORS.PAID); } catch (e) { }
-  });
-  ongoingRows.forEach(r => {
-    try { instSheet.getRange(r, 1, 1, 11).setBackground(null); } catch (e) { }
-  });
+  return { matches: matchResult.matches, progressMap };
 }
 
 function handlePaymentDateEdit(sheet, range, tz, forceReapply) {
@@ -3203,7 +3211,7 @@ function handlePaymentDateEdit(sheet, range, tz, forceReapply) {
     range.setBackground("#fffde7").setFontColor("#333333").setFontWeight("normal");
     sheet.getRange(7, 8).setBackground(CONFIG.COLORS.DUE_SOON).setFontColor("#7f6000");
 
-    ss.toast("Payment date cleared. Synchronized installments to pending state.", "💳 NBE Tracker", 4);
+    ss.toast("Payment date cleared. Installment Bank Progress formulas updated to pending state.", "💳 NBE Tracker", 4);
     return;
   }
 
@@ -3234,7 +3242,7 @@ function handlePaymentDateEdit(sheet, range, tz, forceReapply) {
   });
   saveDecisions(ss, decisions);
 
-  ss.toast("Payment recorded (" + dateStr + ")! Synchronized active installments to paid state.", "💳 NBE Tracker", 4);
+  ss.toast("Payment recorded (" + dateStr + ")! Installment Bank Progress formulas updated to paid state.", "💳 NBE Tracker", 4);
 }
 
 function handleActiveReconEdit(e) {
@@ -3760,8 +3768,13 @@ function buildAnonymizedFixture(ss, tz) {
     if (type === "CYCLE_PAYMENT") {
       return [type, subjId, target, "[]", source, locked, updatedAt];
     }
-    if (type === "STMT_MATCH") {
+    if (type === "STMT_MATCH" || type === "STMT_INST_LINK") {
       return [type, subjId, target, "", source, locked, updatedAt];
+    }
+    if (type === "INST_LINK") {
+      const parts = subjId.split("|");
+      const anonBase = parts[0] ? makeNormDesc(anonymizeDesc(parts[0])) : "inst";
+      return [type, [anonBase, ...parts.slice(1)].join("|"), target, "", source, locked, updatedAt];
     }
     if (type === "MERCHANT_ALIAS") {
       return [type, makeNormDesc(anonymizeDesc(subjId)), makeNormDesc(anonymizeDesc(target)), "", source, locked, updatedAt];

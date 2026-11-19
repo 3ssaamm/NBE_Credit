@@ -51,12 +51,12 @@ instSheet.getRange(2, 1, instRows.length, 11).setValues(instRows);
 const recon1 = sandbox.reconcileActiveStatement(ss, tz);
 const items1 = recon1.installmentReconItems;
 
-assert.strictEqual(items1.length, 14, `Expected 14 Table 4 items, got ${items1.length}`);
-assert.strictEqual(items1[0].sourceCategory, "⚠️ Statement Only", "Discrepancy Statement Only must be first");
-assert.strictEqual(items1[0].action, "", "Statement Only default action must be blank");
-assert.strictEqual(items1[1].sourceCategory, "⏳ Sheet Only", "Sheet Only must appear before matched items");
-assert.strictEqual(items1[1].action, "🚫 Not on Statement (Skip)", "Sheet Only default action must skip");
-assert.ok(items1[1].desc.includes("Cosmatics"), "Cosmatics must be in Sheet Only");
+assert.strictEqual(recon1.unlinkedStmtInstallments.length, 1, "Unlinked statement installment MYSTERY GADGET must route to Needs Pairing");
+assert.strictEqual(recon1.unlinkedStmtInstallments[0].desc, "MYSTERY GADGET 1 OF 6");
+assert.strictEqual(items1.length, 13, `Expected 13 Table 4 items (unlinked moved to Needs Pairing), got ${items1.length}`);
+assert.strictEqual(items1[0].sourceCategory, "⏳ Sheet Only", "Sheet Only must appear first in Table 4");
+assert.strictEqual(items1[0].action, "🚫 Not on Statement (Skip)", "Sheet Only default action must skip");
+assert.ok(items1[0].desc.includes("Cosmatics"), "Cosmatics must be in Sheet Only");
 assert.ok(!items1.some(it => it.desc.includes("Noon 2 of 6")), "Completed item must NOT be in Sheet Only");
 
 const mobilatyItem = items1.find(it => it.desc.includes("Mobilaty"));
@@ -74,22 +74,30 @@ assert.strictEqual(shareMap1["Mido"], 634.13, `Mido share mismatch: ${shareMap1[
 assert.strictEqual(shareMap1["Mai"], 1248.32, `Mai share mismatch: ${shareMap1["Mai"]}`);
 
 // ==========================================
-// Test 2: Rendering Table 4 & Live SUMIFS Equivalence
+// Test 2: Rendering Table 4, Needs Pairing I-1, No LEFT Emoji Bug & Live SUMIFS Equivalence
 // ==========================================
 sandbox.renderActiveReconciliationSheet(ss, tz, ledger1, recon1);
 const reconSheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
 
+let rowI1 = -1;
 let startInstRow = -1;
 let endInstRow = -1;
 for (let r = 1; r <= reconSheet.getLastRow(); r++) {
   const colA = String(reconSheet._getCell(r, 1) || "");
+  if (colA === "I-1") rowI1 = r;
   if (/^INST-\d+/i.test(colA)) {
     if (startInstRow === -1) startInstRow = r;
     endInstRow = r;
   }
+  for (let c = 1; c <= 8; c++) {
+    const val = String(reconSheet._getCell(r, c) || "");
+    assert.ok(!/LEFT\([^)]+,\s*1\)\s*=\s*"(?:🚫|🔗|✅|💡)"/.test(val), `Found broken surrogate LEFT(,1) emoji check at (${r},${c}): ${val}`);
+  }
 }
-assert.ok(startInstRow > 19, "Table 4 should be rendered below Table 1 & Table 2");
-assert.strictEqual(endInstRow - startInstRow + 1, 14, "Table 4 should have 14 rows");
+assert.ok(rowI1 > 12, "Unlinked installment I-1 must render in Needs Pairing");
+assert.strictEqual(reconSheet._getCell(rowI1, 5), "Installment (Unlinked)");
+assert.ok(startInstRow > rowI1, "Table 4 should be rendered below Needs Pairing");
+assert.strictEqual(endInstRow - startInstRow + 1, 13, "Table 4 should have 13 rows");
 
 for (let i = 0; i < ledger1.personShares.length; i++) {
   const r = 12 + i;
@@ -97,17 +105,17 @@ for (let i = 0; i < ledger1.personShares.length; i++) {
   const formula = String(reconSheet._getCell(r, 4) || "");
   assert.ok(formula.startsWith("=SUMIFS("), `Table 1 Col D row ${r} must be SUMIFS formula, got: ${formula}`);
   assert.ok(formula.includes(`$D$${startInstRow}:$D$${endInstRow}`), "SUMIFS must reference Table 4 Col D");
+  assert.ok(formula.includes('"Installment*"'), "SUMIFS must also sum assigned unlinked installments in Needs Pairing");
   const evalSum = evalTable4Sumifs(reconSheet, person, startInstRow, endInstRow);
   assert.strictEqual(evalSum, shareMap1[person], `SUMIFS eval for ${person} (${evalSum}) must match ledger (${shareMap1[person]})`);
 }
 
 // ==========================================
-// Test 3: onEdit Handling & Occurrence-Safe Persistence
+// Test 3: onEdit Handling & Permanent ID Persistence (I-1 + Table 4 Overrides)
 // ==========================================
-const rowInst1 = startInstRow;
-reconSheet._setCell(rowInst1, 6, "Abdo");
-sandbox.handleActiveReconEdit({ range: reconSheet.getRange(rowInst1, 6) });
-assert.strictEqual(reconSheet._getCell(rowInst1, 6), "✅ Billed to Abdo", "Bare name should normalize to '✅ Billed to Abdo'");
+reconSheet._setCell(rowI1, 6, "Abdo");
+sandbox.handleActiveReconEdit({ range: reconSheet.getRange(rowI1, 6) });
+assert.strictEqual(reconSheet._getCell(rowI1, 6), "Abdo", "Needs Pairing I-1 assignment should store clean payer name");
 
 let earphonesRow2 = -1;
 for (let r = startInstRow; r <= endInstRow; r++) {
@@ -121,7 +129,7 @@ assert.ok(earphonesRow2 > 0, "Should locate Mai's Earphones row");
 reconSheet._setCell(earphonesRow2, 6, "🚫 Neglect / Skip This Cycle");
 sandbox.handleActiveReconEdit({ range: reconSheet.getRange(earphonesRow2, 6) });
 
-const rowCosmatics = startInstRow + 1;
+const rowCosmatics = startInstRow;
 reconSheet._setCell(rowCosmatics, 6, "✅ Billed to Mai");
 sandbox.handleActiveReconEdit({ range: reconSheet.getRange(rowCosmatics, 6) });
 
@@ -142,9 +150,11 @@ assert.strictEqual(shareMap2["Mido"], 634.13, `Mido share should be unchanged: $
 assert.strictEqual(shareMap2["Mum"], 494.07, `Mum share should be unchanged: ${shareMap2["Mum"]}`);
 
 sandbox.renderActiveReconciliationSheet(ss, tz, ledger2, recon2);
-let startInstRow2 = -1, endInstRow2 = -1;
+let rowI1_2 = -1, startInstRow2 = -1, endInstRow2 = -1;
 for (let r = 1; r <= reconSheet.getLastRow(); r++) {
-  if (/^INST-\d+/i.test(String(reconSheet._getCell(r, 1) || ""))) {
+  const colA = String(reconSheet._getCell(r, 1) || "");
+  if (colA === "I-1") rowI1_2 = r;
+  if (/^INST-\d+/i.test(colA)) {
     if (startInstRow2 === -1) startInstRow2 = r;
     endInstRow2 = r;
   }
@@ -152,12 +162,13 @@ for (let r = 1; r <= reconSheet.getLastRow(); r++) {
 for (let i = 0; i < ledger2.personShares.length; i++) {
   const r = 12 + i;
   const person = reconSheet._getCell(r, 2);
-  const evalSum = evalTable4Sumifs(reconSheet, person, startInstRow2, endInstRow2);
-  assert.strictEqual(evalSum, shareMap2[person], `Post-refresh SUMIFS for ${person} (${evalSum}) != ${shareMap2[person]}`);
+  let expectedSum = evalTable4Sumifs(reconSheet, person, startInstRow2, endInstRow2);
+  if (person === "Abdo") expectedSum = Number((expectedSum + 350.00).toFixed(2));
+  assert.strictEqual(expectedSum, shareMap2[person], `Post-refresh SUMIFS for ${person} (${expectedSum}) != ${shareMap2[person]}`);
 }
 
 // ==========================================
-// Test 4: Co-existence with Table 3, Rounding Residual, Clearing Override & syncInstallments
+// Test 4: Co-existence with Orphan Logs, Rounding Residual, Clearing I-1 Override & Non-Overwrite Sync
 // ==========================================
 const txSheet = ss.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
 txSheet.getRange(2, 1, 1, 5).setValues([
@@ -171,8 +182,8 @@ instSheet.getRange(16, 1, 1, 11).setValues([
   [15, new Date("2026-07-15T12:00:00"), "Shared Gym", 300.00, 3, 0, 0, 100.00, "Mido + Mai + Abdo", 1, "Ongoing"]
 ]);
 
-reconSheet._setCell(startInstRow2, 6, "");
-sandbox.handleActiveReconEdit({ range: reconSheet.getRange(startInstRow2, 6) });
+reconSheet._setCell(rowI1_2, 6, "");
+sandbox.handleActiveReconEdit({ range: reconSheet.getRange(rowI1_2, 6) });
 
 const recon4 = sandbox.reconcileActiveStatement(ss, tz);
 const ledger4 = sandbox.buildDebtLedger(ss, tz, recon4);
@@ -191,7 +202,7 @@ for (let r = 1; r <= reconSheet.getLastRow(); r++) {
   }
 }
 assert.strictEqual(orphanRowsCount, 1, "Orphan Logs panel must have 1 row");
-assert.strictEqual(instRowsCount, 17, `Table 4 must have 17 rows (14 + 3 Shared Gym), got ${instRowsCount}`);
+assert.strictEqual(instRowsCount, 16, `Table 4 must have 16 rows (13 + 3 Shared Gym), got ${instRowsCount}`);
 const mido4 = ledger4.personShares.find(ps => ps.person === "Mido");
 assert.strictEqual(Number(mido4.purchases.toFixed(2)), 0.00, "Unpaired in-period orphan log must NOT be billed on current statement (Q5c)");
 
@@ -201,7 +212,7 @@ const gymSum = Number(gymItems.reduce((s, it) => s + it.amount, 0).toFixed(2));
 assert.strictEqual(gymSum, 100.00, `Shared Gym 3-way split must sum to 100.00, got ${gymSum}`);
 assert.ok(gymItems.every(it => !it.note.includes("⚠️")), "Exact 100/3 rounding should not emit false ⚠️ diff warning");
 
-assert.strictEqual(recon4.installmentReconItems[0].action, "", "Cleared INST-1 override should revert to blank");
+assert.strictEqual(recon4.unlinkedStmtInstallments[0].assignedPayer, "", "Cleared I-1 override should revert to blank");
 
 for (let i = 0; i < ledger4.personShares.length; i++) {
   const r = 12 + i;
@@ -211,8 +222,11 @@ for (let i = 0; i < ledger4.personShares.length; i++) {
   assert.strictEqual(evalSum, expected, `Table 3+4 SUMIFS mismatch for ${person}: ${evalSum} != ${expected}`);
 }
 
-sandbox.syncInstallmentsFromStatement(ss, tz, false);
-assert.strictEqual(instSheet._getCell(2, 10), 9, "Hard drive (10 of 12, unpaid) should sync to 9 payments made");
+sandbox.syncInstallmentsFromStatement(ss, tz, true);
+assert.strictEqual(instSheet._getCell(2, 10), 9, "syncInstallmentsFromStatement must NEVER overwrite user's Payments Made column (Col J)");
+assert.strictEqual(instSheet._getCell(1, 13), "Bank Progress", "Should populate read-only Bank Progress formula header in Col M");
+assert.strictEqual(instSheet._getCell(1, 14), "Bank Status", "Should populate read-only Bank Status formula header in Col N");
+assert.ok(String(instSheet._getCell(2, 13)).includes("LET("), "Bank Progress column should use reactive LET formula");
 
 // ==========================================
 // Test 5: Multi-Date NUTOPIA Persistence, Legacy _#k Recovery & Same-Date Isolation

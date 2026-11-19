@@ -5696,6 +5696,15 @@
       "user",
       true,
       "2026-11-19 23:15:00"
+    ],
+    [
+      "INST_LINK",
+      "merch01|12|261",
+      "I-00003,I-00004,I-00005,I-00006,I-00007",
+      "Confirmed bundled cart split",
+      "user",
+      true,
+      "2026-11-19 23:55:00"
     ]
   ],
   "reconStore": [],

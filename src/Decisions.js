@@ -41,6 +41,8 @@ function loadDecisions(ss) {
     stmtMatch: {},
     txNeglect: {},
     instOverride: {},
+    instLinks: {},
+    stmtInstLink: {},
     merchantAliases: {},
     paymentRecords: {},
     counters: { S: 0, T: 0, I: 0 },
@@ -109,6 +111,29 @@ function loadDecisions(ss) {
           source,
           locked,
           isNeglected: isNeglectedPayer(target),
+          updatedAt
+        };
+      } else if (type === "INST_LINK" && subjectId && target) {
+        const planKey = subjectId.toLowerCase();
+        const instIds = target.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+        store.instLinks[planKey] = {
+          planKey,
+          instIds,
+          target: instIds.join(","),
+          note,
+          source,
+          locked: locked || true,
+          updatedAt
+        };
+      } else if (type === "STMT_INST_LINK" && subjectId && target) {
+        const targetIds = target.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+        store.stmtInstLink[subjectId] = {
+          subjectId,
+          targetIds,
+          target: targetIds.join(","),
+          note,
+          source,
+          locked: locked || true,
           updatedAt
         };
       } else if (type === "MERCHANT_ALIAS" && subjectId && target) {
@@ -196,6 +221,18 @@ function saveDecisions(ss, decisions) {
       const o = decisions.instOverride[subjectId];
       if (!o || !o.target) return;
       rows.push(["INST_OVERRIDE", subjectId, o.target, o.note || "", o.source || "user", Boolean(o.locked), o.updatedAt || nowStr]);
+    });
+
+    Object.keys(decisions.stmtInstLink || {}).sort().forEach(subjectId => {
+      const l = decisions.stmtInstLink[subjectId];
+      if (!l || !l.targetIds || l.targetIds.length === 0) return;
+      rows.push(["STMT_INST_LINK", subjectId, l.targetIds.join(","), l.note || "", l.source || "user", l.locked !== false, l.updatedAt || nowStr]);
+    });
+
+    Object.keys(decisions.instLinks || {}).sort().forEach(planKey => {
+      const l = decisions.instLinks[planKey];
+      if (!l || !l.instIds || l.instIds.length === 0) return;
+      rows.push(["INST_LINK", l.planKey || planKey, l.instIds.join(","), l.note || "", l.source || "user", l.locked !== false, l.updatedAt || nowStr]);
     });
 
     Object.keys(decisions.merchantAliases || {}).sort().forEach(key => {
@@ -340,6 +377,57 @@ function clearMerchantAlias(decisions, stmtKey, txKey) {
   const mapKey = `${k1}::${k2}`;
   if (decisions.merchantAliases[mapKey]) {
     delete decisions.merchantAliases[mapKey];
+    decisions._dirty = true;
+  }
+}
+
+function setInstLink(decisions, planKey, instIds, note, source) {
+  if (!decisions) return;
+  if (!decisions.instLinks) decisions.instLinks = {};
+  const pk = String(planKey || "").toLowerCase().trim();
+  const cleanIds = (instIds || []).map(id => String(id || "").trim().toUpperCase()).filter(Boolean);
+  if (!pk || cleanIds.length === 0) return;
+  decisions.instLinks[pk] = {
+    planKey: pk,
+    instIds: cleanIds,
+    target: cleanIds.join(","),
+    note: note || "",
+    source: source || "user",
+    locked: true,
+    updatedAt: nowCairoTimestamp_()
+  };
+  decisions._dirty = true;
+}
+
+function clearInstLink(decisions, planKey) {
+  if (!decisions || !decisions.instLinks) return;
+  const pk = String(planKey || "").toLowerCase().trim();
+  if (decisions.instLinks[pk]) {
+    delete decisions.instLinks[pk];
+    decisions._dirty = true;
+  }
+}
+
+function setStmtInstLink(decisions, stmtId, instIds, note, source) {
+  if (!decisions || !stmtId) return;
+  if (!decisions.stmtInstLink) decisions.stmtInstLink = {};
+  const cleanIds = (instIds || []).map(id => String(id || "").trim().toUpperCase()).filter(Boolean);
+  if (cleanIds.length === 0) return;
+  decisions.stmtInstLink[stmtId] = {
+    subjectId: stmtId,
+    targetIds: cleanIds,
+    target: cleanIds.join(","),
+    note: note || "",
+    source: source || "user",
+    locked: true,
+    updatedAt: nowCairoTimestamp_()
+  };
+  decisions._dirty = true;
+}
+
+function clearStmtInstLink(decisions, stmtId) {
+  if (decisions && decisions.stmtInstLink && decisions.stmtInstLink[stmtId]) {
+    delete decisions.stmtInstLink[stmtId];
     decisions._dirty = true;
   }
 }
@@ -655,8 +743,8 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
   const subjectId = String(rowVals[8] || "").trim();
   if (!subjectId) return noChange;
 
-  // Case 1: Edit in Table 2 Needs Pairing (F-*, C-*, M-*)
-  if (/^[FCM]-\d+/i.test(firstCol)) {
+  // Case 1: Edit in Table 2 Needs Pairing (F-*, C-*, I-*, M-*)
+  if (/^[FCMI]-\d+/i.test(firstCol)) {
     const prefix = firstCol.charAt(0).toUpperCase();
     const origDesc = String(rowVals[2] || "").trim();
     const amt = parseFloat(rowVals[3]);
@@ -714,6 +802,45 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
         needsRefresh: true,
         toastMsg: "🔗 Paired " + subjectId + " ↔ " + txIds.join("+") +
           (learned && learned.learned ? " (learned alias: " + learned.stmtKey + " ↔ " + learned.txKey + ")" : "")
+      };
+    }
+
+    // Handle 1-click installment link selection ("🔗 Link: I-00003+I-00004 (...)")
+    const linkMatch = payer.match(/^🔗\s*Link:\s*((?:I-\d+)(?:\s*\+\s*I-\d+)*)/i);
+    if (linkMatch) {
+      const instIds = linkMatch[1].split("+").map(s => s.trim().toUpperCase()).filter(Boolean);
+      if (instIds.length === 0) return noChange;
+
+      const sortedNew = instIds.slice().sort().join(",");
+      const existingLink = decisions.stmtInstLink && decisions.stmtInstLink[subjectId];
+      const existingSorted = existingLink && existingLink.targetIds
+        ? existingLink.targetIds.slice().sort().join(",")
+        : "";
+      if (!forceStyle && existingSorted === sortedNew) {
+        return noChange;
+      }
+
+      Object.keys(decisions.stmtInstLink || {}).forEach(otherStmtId => {
+        if (otherStmtId === subjectId) return;
+        const other = decisions.stmtInstLink[otherStmtId];
+        if (other && other.targetIds && other.targetIds.some(id => instIds.includes(id))) {
+          delete decisions.stmtInstLink[otherStmtId];
+          decisions._dirty = true;
+        }
+      });
+
+      setStmtInstLink(decisions, subjectId, instIds, note || "Linked by user", "user");
+      const planKey = buildInstPlanKey({ desc: origDesc, amount: amt });
+      setInstLink(decisions, planKey, instIds, "Plan link from " + subjectId, "user");
+      clearStmtAssign(decisions, subjectId);
+
+      if (forceStyle) {
+        try { sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID); } catch (e) { }
+      }
+      return {
+        changed: true,
+        needsRefresh: true,
+        toastMsg: "🔗 Linked " + subjectId + " ↔ " + instIds.join("+") + " (saved for future months)"
       };
     }
 
