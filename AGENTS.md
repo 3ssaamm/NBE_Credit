@@ -6,7 +6,7 @@ Whenever you create, edit, or modify `Code.js`, any `.gs` file, or `appsscript.j
 
 1. Validate JavaScript syntax before deploying:
    ```powershell
-   node -c Code.js
+   node -c Code.js; Get-ChildItem src/*.js | ForEach-Object { node -c $_.FullName }
    ```
 2. Run the project test suite before deploying (`npm test` must pass):
    ```powershell

@@ -172,6 +172,7 @@ class MockSheet {
     this.maxCol = 12;
     this.colWidths = {};
     this.hidden = false;
+    this.hiddenCols = new Set();
   }
   getName() { return this.name; }
   getParent() { return this.ss; }
@@ -210,6 +211,7 @@ class MockSheet {
   }
   getMaxColumns() { return this.maxCol; }
   getMaxRows() { return Math.max(this.getLastRow(), 50); }
+  insertColumnsAfter(afterPos, howMany) { this.maxCol += (howMany || 1); }
   clear() {
     this.grid = {};
     this.backgrounds = {};
@@ -226,8 +228,14 @@ class MockSheet {
   setColumnWidths() {}
   getColumnWidth(c) { return this.colWidths[c] || 100; }
   autoResizeColumns() {}
-  hideColumns() {}
-  showColumns() {}
+  hideColumns(col, num) {
+    const count = num || 1;
+    for (let i = 0; i < count; i++) this.hiddenCols.add(col + i);
+  }
+  showColumns(col, num) {
+    const count = num || 1;
+    for (let i = 0; i < count; i++) this.hiddenCols.delete(col + i);
+  }
   setConditionalFormatRules(rules) { this.cfRules = rules || []; }
   getConditionalFormatRules() { return this.cfRules; }
   getRange(rOrA1, c, nr, nc) {
@@ -385,6 +393,13 @@ function populateSpreadsheetFromFixture(ss, fixture, CONFIG) {
     if (rows.length > 0) {
       stmtSheet.getRange(7, 1, rows.length, 7).setValues(rows);
     }
+    if (fixture.statementIds && fixture.statementIds.length > 0) {
+      stmtSheet.getRange(6, 8).setValue("_Row_ID");
+      stmtSheet.getRange(7, 8, fixture.statementIds.length, 1).setValues(
+        fixture.statementIds.map(id => [id])
+      );
+      stmtSheet.hideColumns(8);
+    }
   }
 
   if (fixture.transactions && fixture.transactions.length > 0) {
@@ -392,6 +407,13 @@ function populateSpreadsheetFromFixture(ss, fixture, CONFIG) {
     txSheet.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
     const rows = fixture.transactions.map(r => [r[0], makeLocalNoonDate(r[1]), r[2], r[3], r[4]]);
     txSheet.getRange(2, 1, rows.length, 5).setValues(rows);
+    if (fixture.transactionIds && fixture.transactionIds.length > 0) {
+      txSheet.getRange(1, 6).setValue("_Row_ID");
+      txSheet.getRange(2, 6, fixture.transactionIds.length, 1).setValues(
+        fixture.transactionIds.map(id => [id])
+      );
+      txSheet.hideColumns(6);
+    }
   }
 
   if (fixture.installments && fixture.installments.length > 0) {
@@ -403,6 +425,13 @@ function populateSpreadsheetFromFixture(ss, fixture, CONFIG) {
       r[0], makeLocalNoonDate(r[1]), r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]
     ]);
     instSheet.getRange(2, 1, rows.length, 11).setValues(rows);
+    if (fixture.installmentIds && fixture.installmentIds.length > 0) {
+      instSheet.getRange(1, 12).setValue("_Row_ID");
+      instSheet.getRange(2, 12, fixture.installmentIds.length, 1).setValues(
+        fixture.installmentIds.map(id => [id])
+      );
+      instSheet.hideColumns(12);
+    }
   }
 
   if (fixture.reconStore && fixture.reconStore.length > 0) {
@@ -411,6 +440,15 @@ function populateSpreadsheetFromFixture(ss, fixture, CONFIG) {
       ["Type", "Primary_Key", "Date_Str", "Desc", "Amount", "Payer", "Note", "Confirmed", "Neglected", "Updated_At"]
     ]);
     storeSheet.getRange(2, 1, fixture.reconStore.length, 10).setValues(fixture.reconStore);
+  }
+
+  if (fixture.decisions && fixture.decisions.length > 0) {
+    const decSheet = ss.insertSheet(CONFIG.SHEETS.DECISIONS);
+    decSheet.getRange(1, 1, 1, 7).setValues([
+      ["Type", "SubjectId", "Target", "Note", "Source", "Locked", "UpdatedAt"]
+    ]);
+    decSheet.getRange(2, 1, fixture.decisions.length, 7).setValues(fixture.decisions);
+    decSheet.hideSheet();
   }
 
   if (fixture.paymentDate) {

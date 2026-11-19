@@ -15,7 +15,9 @@ const CONFIG = {
     ACTIVE_RECON: "Active Bill & Reconciliation",
     HISTORY_FORECAST: "Monthly History & Forecast",
     MEMBER_BREAKDOWN: "Member Breakdown",
-    RECON_STORE: "_Recon_Store"
+    RECON_STORE: "_Recon_Store",
+    DECISIONS: "_Decisions",
+    MIGRATION_REPORT: "Migration Report"
   },
   COLORS: {
     PRIMARY: "#1b5e20",       // NBE dark green
@@ -577,21 +579,8 @@ function getStatementPeriod(stmtDate, minStmtTxDate, maxStmtTxDate) {
 }
 
 // ==========================================
-// 3. PERSISTENT RECONCILIATION STORE (_Recon_Store)
+// 3. LEGACY RECONCILIATION KEY UTILITY
 // ==========================================
-
-function getReconStoreSheet(ss) {
-  const name = CONFIG.SHEETS.RECON_STORE;
-  let sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
-    try { sheet.hideSheet(); } catch (e) { }
-    const headers = ["Type", "Primary_Key", "Date_Str", "Desc", "Amount", "Payer", "Note", "Confirmed", "Neglected", "Updated_At"];
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight("bold");
-    sheet.setFrozenRows(1);
-  }
-  return sheet;
-}
 
 function makeReconKey(dateVal, amountVal, descVal, tz, occurrenceIndex) {
   const dStr = makeNormDateStr(dateVal, tz);
@@ -600,203 +589,6 @@ function makeReconKey(dateVal, amountVal, descVal, tz, occurrenceIndex) {
   const dClean = makeNormDesc(descVal).substring(0, 30);
   const occStr = (occurrenceIndex !== undefined && occurrenceIndex !== null) ? `_#${occurrenceIndex}` : "";
   return `${dStr}_${aStr}_${dClean}${occStr}`;
-}
-
-function loadAllReconStore(ss, tz) {
-  const store = {
-    table2Map: {},
-    table2ByBaseKey: {},
-    table2List: [],
-    confirmedMatches: new Set(),
-    neglectedTx: new Set(),
-    paymentRecords: {},
-    installmentOverrides: {}
-  };
-
-  try {
-    const sheet = getReconStoreSheet(ss);
-    const lastRow = sheet.getLastRow();
-    if (lastRow >= 2) {
-      const data = sheet.getRange(2, 1, lastRow - 1, 10).getValues();
-      data.forEach(r => {
-        const type = String(r[0] || "").trim();
-        const pKey = String(r[1] || "").trim();
-        const dStr = String(r[2] || "").trim();
-        const desc = String(r[3] || "").trim();
-        const amt = parseFloat(r[4]) || 0;
-        const payer = String(r[5] || "").trim();
-        const note = String(r[6] || "").trim();
-        const isConfirmed = r[7] === true || String(r[7]).toUpperCase() === "TRUE";
-        const isNeglected = r[8] === true || String(r[8]).toUpperCase() === "TRUE";
-
-        if (!pKey && !desc && amt === 0) return;
-
-        if (type === "CYCLE_PAYMENT") {
-          let audit = [];
-          try {
-            if (note) audit = JSON.parse(note);
-          } catch (e) { }
-          store.paymentRecords[pKey] = {
-            cycleKey: pKey,
-            dateStr: dStr,
-            cycleLabel: desc,
-            amount: amt,
-            status: payer,
-            audit: audit,
-            isApplied: isConfirmed
-          };
-        } else if (type === "TABLE2_ASSIGNMENT" || (!type && payer)) {
-          if (payer) {
-            const isNeg = (payer === "NEGLECT" || payer === "🚫 Neglect / Ignore" || payer.toLowerCase().includes("neglect"));
-            const rec = {
-              primaryKey: pKey,
-              dateStr: dStr,
-              desc: desc,
-              amount: amt,
-              payer: isNeg ? "NEGLECT" : payer,
-              note: note,
-              isNeglected: isNeg
-            };
-            store.table2Map[pKey] = rec;
-            const strippedBaseKey = pKey.replace(/_#\d+$/, "");
-            if (strippedBaseKey) {
-              if (!store.table2ByBaseKey[strippedBaseKey]) store.table2ByBaseKey[strippedBaseKey] = [];
-              store.table2ByBaseKey[strippedBaseKey].push(rec);
-            }
-            const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(desc).substring(0, 30)}`;
-            if (!store.table2Map[amtDescKey]) store.table2Map[amtDescKey] = rec;
-            store.table2List.push(rec);
-          }
-        } else if (type === "TABLE4_INSTALLMENT") {
-          if (pKey) {
-            const rec = {
-              primaryKey: pKey,
-              dateStr: dStr,
-              desc: desc,
-              amount: amt,
-              action: payer,
-              note: note,
-              isNeglected: isNeglected || isNeglectedPayer(payer)
-            };
-            store.installmentOverrides[pKey] = rec;
-            const amtDescKey = `${amt.toFixed(2)}_${makeNormDesc(desc).substring(0, 30)}`;
-            const occMatch = pKey.match(/_#(\d+)$/);
-            if (occMatch) {
-              const occAmtDescKey = `${amtDescKey}_#${occMatch[1]}`;
-              if (!store.installmentOverrides[occAmtDescKey]) store.installmentOverrides[occAmtDescKey] = rec;
-              if (occMatch[1] === "1" && !store.installmentOverrides[amtDescKey]) {
-                store.installmentOverrides[amtDescKey] = rec;
-              }
-            } else if (!store.installmentOverrides[amtDescKey]) {
-              store.installmentOverrides[amtDescKey] = rec;
-            }
-          }
-        } else if (type === "TABLE1_CONFIRMED" || isConfirmed) {
-          if (pKey) store.confirmedMatches.add(pKey);
-        } else if (type === "TABLE3_NEGLECTED" || isNeglected) {
-          if (pKey) store.neglectedTx.add(pKey);
-        }
-      });
-    }
-  } catch (err) {
-    Logger.log("[loadAllReconStore] Error reading store: " + err);
-  }
-
-  return store;
-}
-
-function saveAllReconStore(ss, store) {
-  try {
-    const sheet = getReconStoreSheet(ss);
-    const rows = [];
-    const nowStr = Utilities.formatDate(new Date(), "Africa/Cairo", "yyyy-MM-dd HH:mm:ss");
-
-    const seenPKeys = new Set();
-    if (store.table2Map) {
-      Object.keys(store.table2Map).forEach(k => {
-        const item = store.table2Map[k];
-        if (item && item.payer && item.primaryKey && !seenPKeys.has(item.primaryKey)) {
-          seenPKeys.add(item.primaryKey);
-          rows.push([
-            "TABLE2_ASSIGNMENT",
-            item.primaryKey,
-            item.dateStr || "",
-            item.desc || "",
-            item.amount || 0,
-            item.payer,
-            item.note || "",
-            false,
-            (item.payer === "NEGLECT" || item.isNeglected === true),
-            nowStr
-          ]);
-        }
-      });
-    }
-
-    if (store.confirmedMatches) {
-      store.confirmedMatches.forEach(k => {
-        if (k) rows.push(["TABLE1_CONFIRMED", k, "", "", 0, "", "", true, false, nowStr]);
-      });
-    }
-
-    if (store.neglectedTx) {
-      store.neglectedTx.forEach(k => {
-        if (k) rows.push(["TABLE3_NEGLECTED", k, "", "", 0, "", "", false, true, nowStr]);
-      });
-    }
-
-    if (store.paymentRecords) {
-      Object.keys(store.paymentRecords).forEach(cycleKey => {
-        const pr = store.paymentRecords[cycleKey];
-        if (pr && pr.dateStr) {
-          rows.push([
-            "CYCLE_PAYMENT",
-            cycleKey,
-            pr.dateStr || "",
-            pr.cycleLabel || "",
-            pr.amount || 0,
-            pr.status || "Settled",
-            pr.audit ? JSON.stringify(pr.audit) : (pr.auditJson || ""),
-            pr.isApplied === true,
-            false,
-            nowStr
-          ]);
-        }
-      });
-    }
-
-    const seenInstKeys = new Set();
-    if (store.installmentOverrides) {
-      Object.keys(store.installmentOverrides).forEach(k => {
-        const item = store.installmentOverrides[k];
-        if (item && item.primaryKey && !seenInstKeys.has(item.primaryKey)) {
-          seenInstKeys.add(item.primaryKey);
-          rows.push([
-            "TABLE4_INSTALLMENT",
-            item.primaryKey,
-            item.dateStr || "",
-            item.desc || "",
-            item.amount || 0,
-            item.action || "",
-            item.note || "",
-            false,
-            item.isNeglected === true || isNeglectedPayer(item.action),
-            nowStr
-          ]);
-        }
-      });
-    }
-
-    const lastRow = sheet.getLastRow();
-    if (lastRow > 1) {
-      sheet.getRange(2, 1, lastRow - 1, 10).clearContent();
-    }
-    if (rows.length > 0) {
-      sheet.getRange(2, 1, rows.length, 10).setValues(rows);
-    }
-  } catch (err) {
-    Logger.log("[saveAllReconStore] Error writing store: " + err);
-  }
 }
 
 // ==========================================
@@ -1397,7 +1189,29 @@ function parseNBEStatementText(text) {
 }
 
 function writeStatementToSheet(ss, meta, transactions) {
+  const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.BANK_STATEMENT);
+
+  // Snapshot existing S-IDs if re-importing the same statement date
+  const preservedIdsByKey = {};
+  const newStmtDateStr = makeNormDateStr(parseDateValue(meta.statementDate, tz), tz);
+  if (sheet.getLastRow() >= 7 && newStmtDateStr) {
+    const oldStmtDateStr = makeNormDateStr(parseDateValue(sheet.getRange(2, 2).getValue(), tz), tz);
+    const oldIdCol = findExistingIdColumn(sheet, 6);
+    if (oldStmtDateStr && oldStmtDateStr === newStmtDateStr && oldIdCol > 0) {
+      const oldCount = sheet.getLastRow() - 6;
+      const oldRows = sheet.getRange(7, 1, oldCount, 7).getValues();
+      const oldIds = sheet.getRange(7, oldIdCol, oldCount, 1).getValues();
+      for (let i = 0; i < oldCount; i++) {
+        const oid = String(oldIds[i][0] || "").trim();
+        if (!parseRowIdNum(oid, "S")) continue;
+        const k = makeReconKey(oldRows[i][1], parseFloat(oldRows[i][5]) || 0, oldRows[i][3], tz);
+        if (!preservedIdsByKey[k]) preservedIdsByKey[k] = [];
+        preservedIdsByKey[k].push(oid);
+      }
+    }
+  }
+
   sheet.clear();
 
   sheet.getRange("A1:G1").merge()
@@ -1432,14 +1246,21 @@ function writeStatementToSheet(ss, meta, transactions) {
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.HEADER)
     .setBorder(true, true, true, true, false, false);
+  sheet.getRange(startRow, 8).setValue(ROW_ID_HEADER);
 
   if (transactions.length > 0) {
+    const idColVals = [];
     const rows = transactions.map((t, idx) => {
-      const txD = parseDateValue(t.txDate);
-      const postD = parseDateValue(t.postDate);
+      const txD = parseDateValue(t.txDate, tz);
+      const postD = parseDateValue(t.postDate, tz);
       let initStatus = "⏳ Checking...";
       if (t.type === "CREDIT") initStatus = "💳 Payment / Refund";
       else if (t.type === "FEE") initStatus = "🏛️ Bank Fee (Mai)";
+
+      const k = makeReconKey(txD || t.txDate, Math.abs(parseFloat(t.amount) || 0), t.desc, tz);
+      const preserved = preservedIdsByKey[k] && preservedIdsByKey[k].length > 0 ? preservedIdsByKey[k].shift() : "";
+      idColVals.push([preserved]);
+
       return [
         idx + 1,
         txD || t.txDate,
@@ -1452,6 +1273,7 @@ function writeStatementToSheet(ss, meta, transactions) {
     });
 
     sheet.getRange(startRow + 1, 1, rows.length, headers.length).setValues(rows);
+    sheet.getRange(startRow + 1, 8, idColVals.length, 1).setValues(idColVals);
     sheet.getRange(startRow + 1, 2, rows.length, 2).setNumberFormat("dddd, MMMM d, yyyy");
     sheet.getRange(startRow + 1, 6, rows.length, 1).setNumberFormat("#,##0.00");
 
@@ -1473,6 +1295,19 @@ function writeStatementToSheet(ss, meta, transactions) {
       }
     }
   }
+
+  const decisions = loadDecisions(ss);
+  ensureSheetRowIds(
+    ss,
+    CONFIG.SHEETS.BANK_STATEMENT,
+    6,
+    8,
+    "S",
+    decisions,
+    r => Boolean(String(r[3] || "").trim() || (!isNaN(parseFloat(r[5])) && parseFloat(r[5]) !== 0))
+  );
+  if (decisions._dirty) saveDecisions(ss, decisions);
+  try { sheet.hideColumns(8); } catch (e) { }
 
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
@@ -1558,11 +1393,13 @@ function reconcileActiveStatement(ss, tz) {
   const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
   const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
 
-  const reconStore = loadAllReconStore(ss, tz);
+  const decisions = loadDecisions(ss);
 
   if (!stmtSheet || stmtSheet.getLastRow() < 7) {
     return { error: "Please upload and process a bank statement to view active bill reconciliation." };
   }
+
+  const idInfo = ensureAllSheetRowIds(ss, decisions);
 
   // 1. Read Statement Rows
   const stmtLastRow = stmtSheet.getLastRow();
@@ -1605,6 +1442,7 @@ function reconcileActiveStatement(ss, tz) {
 
     const item = {
       id: idx + 1,
+      stmtId: (idInfo.stmt.ids && idInfo.stmt.ids[idx]) || "",
       stmtRowIndex: idx,
       dateStr: String(row[1]),
       date: pDate,
@@ -1651,6 +1489,7 @@ function reconcileActiveStatement(ss, tz) {
         if (!belongsToCycle) return;
 
         txDebits.push({
+          txId: (idInfo.tx.ids && idInfo.tx.ids[idx]) || "",
           rowNum: idx + 2,
           date: pDate,
           desc: desc,
@@ -1679,6 +1518,7 @@ function reconcileActiveStatement(ss, tz) {
       if (!isNaN(emi) && emi > 0 && payer) {
         sheetInstallmentRows.push({
           index: idx,
+          instId: (idInfo.inst.ids && idInfo.inst.ids[idx]) || "",
           rowNum: idx + 2,
           startDate: startDate,
           dateStr: startDate ? makeNormDateStr(startDate, tz) : String(row[1] || ""),
@@ -1694,6 +1534,9 @@ function reconcileActiveStatement(ss, tz) {
       }
     });
   }
+
+  // Stage 1 one-time migration from legacy _Recon_Store (pre-matching: payment records + confirmed matches)
+  const legacyMigrationCtx = migrateLegacyPreMatch(ss, tz, decisions, { stmtDebits, txDebits });
 
   // 4. Match Installments & Build Table 4 Reconciliation Items
   const instMatches = matchStatementInstallments(stmtInstallments, sheetInstallmentRows);
@@ -1712,6 +1555,7 @@ function reconcileActiveStatement(ss, tz) {
   stmtInstallments.forEach((st, sIdx) => {
     if (matchedStmtIdxSet.has(sIdx)) return;
     unmatchedStmtItems.push({
+      subjectId: buildInstSubjectId(st.stmtId, null, cardBal.activeCycleKey, null, 1),
       date: st.date || st.dateStr || "",
       desc: st.desc,
       amount: st.amount,
@@ -1731,6 +1575,7 @@ function reconcileActiveStatement(ss, tz) {
     const shareEmi = sh.emi / targetPayers.length;
     targetPayers.forEach(p => {
       unmatchedSheetItems.push({
+        subjectId: buildInstSubjectId(null, sh.instId, cardBal.activeCycleKey, p, targetPayers.length),
         date: sh.startDate || sh.dateStr || "",
         desc: `${sh.desc} (${sh.paymentsMade}/${sh.duration || "?"} Paid)`,
         amount: Number(shareEmi.toFixed(2)),
@@ -1755,6 +1600,7 @@ function reconcileActiveStatement(ss, tz) {
       const rowEntries = [];
       targetPayers.forEach(p => {
         rowEntries.push({
+          subjectId: buildInstSubjectId(m.stmt.stmtId, sh.instId, cardBal.activeCycleKey, p, targetPayers.length),
           date: m.stmt.date || sh.startDate || m.stmt.dateStr || "",
           desc: `${sh.desc} (${progressStr})`,
           rawEmi: shareEmi,
@@ -1797,32 +1643,6 @@ function reconcileActiveStatement(ss, tz) {
   });
 
   const installmentReconItems = [...unmatchedStmtItems, ...unmatchedSheetItems, ...matchedInstItems];
-  const instOccTracker = {};
-  installmentReconItems.forEach((item, idx) => {
-    item.id = `INST-${idx + 1}`;
-    const baseKey = makeReconKey(item.date, item.amount, item.desc, tz);
-    instOccTracker[baseKey] = (instOccTracker[baseKey] || 0) + 1;
-    const occ = instOccTracker[baseKey];
-    const pKeyWithOcc = `${baseKey}_#${occ}`;
-    const amtDescKey = `${item.amount.toFixed(2)}_${makeNormDesc(item.desc).substring(0, 30)}`;
-    const amtDescKeyWithOcc = `${amtDescKey}_#${occ}`;
-
-    const saved = (reconStore.installmentOverrides && (
-      reconStore.installmentOverrides[pKeyWithOcc] ||
-      reconStore.installmentOverrides[amtDescKeyWithOcc] ||
-      (occ === 1 ? (reconStore.installmentOverrides[baseKey] || reconStore.installmentOverrides[amtDescKey]) : null)
-    )) || null;
-
-    if (saved && saved.action !== undefined) {
-      item.action = saved.action;
-      item.note = saved.note || item.defaultNote;
-    } else {
-      item.action = item.defaultAction;
-      item.note = item.defaultNote;
-    }
-    item.primaryKey = pKeyWithOcc;
-    item.isNeglected = isNeglectedPayer(item.action);
-  });
 
   // 5. Multi-Pass Matching for Purchases (DEBIT)
   function daysBetween(d1, d2) {
@@ -1859,15 +1679,16 @@ function reconcileActiveStatement(ss, tz) {
     });
   }
 
-  // Pass 0: Confirmed Matches from Store
+  // Pass 0: Locked Explicit Matches by ID from _Decisions
   stmtDebits.forEach(st => {
-    const pKey = makeReconKey(st.date || st.dateStr, st.amount, st.desc, tz);
-    const amtDescKey = `${st.amount.toFixed(2)}_${makeNormDesc(st.desc).substring(0, 20)}`;
-    if (reconStore.confirmedMatches.has(pKey) || reconStore.confirmedMatches.has(amtDescKey)) {
-      const match = txDebits.find(tx => !tx.matched && Math.abs(tx.amount - st.amount) <= 0.05);
-      if (match) {
-        markStatementMatched(st, [match]);
-      }
+    if (st.matched || !st.stmtId) return;
+    const savedMatch = decisions.stmtMatch && decisions.stmtMatch[st.stmtId];
+    if (!savedMatch || !savedMatch.targetIds || savedMatch.targetIds.length === 0) return;
+    const matchedTxs = savedMatch.targetIds
+      .map(tid => txDebits.find(tx => tx.txId === tid && !tx.matched))
+      .filter(Boolean);
+    if (matchedTxs.length === savedMatch.targetIds.length) {
+      markStatementMatched(st, matchedTxs);
     }
   });
 
@@ -1915,85 +1736,12 @@ function reconcileActiveStatement(ss, tz) {
   const suggestedMatches = [];
   const missingInSheet = stmtDebits.filter(st => !st.matched);
 
-  // Prune matched items from reconStore (only when no unmatched debit shares the same baseKey)
-  const missingBaseKeys = new Set(missingInSheet.map(m => makeReconKey(m.date || m.dateStr, m.amount, m.desc, tz)));
+  // Prune Table 2 assignment overrides only for the exact matched statement ID
   stmtDebits.forEach(st => {
-    if (st.matched) {
-      const pKey = makeReconKey(st.date || st.dateStr, st.amount, st.desc, tz);
-      if (!missingBaseKeys.has(pKey)) {
-        Object.keys(reconStore.table2Map).forEach(k => {
-          const v = reconStore.table2Map[k];
-          if (v && v.primaryKey && v.primaryKey.replace(/_#\d+$/, "") === pKey) {
-            delete reconStore.table2Map[k];
-          }
-        });
-        reconStore.table2List = reconStore.table2List.filter(it => !it.primaryKey || it.primaryKey.replace(/_#\d+$/, "") !== pKey);
-      }
+    if (st.matched && st.stmtId && decisions.stmtAssign[st.stmtId]) {
+      clearStmtAssign(decisions, st.stmtId);
     }
   });
-
-  function restoreTable2Group(items, options) {
-    const totalOccMap = {};
-    items.forEach(it => {
-      const bk = makeReconKey(it.date || it.dateStr, it.amount, it.desc, tz);
-      totalOccMap[bk] = (totalOccMap[bk] || 0) + 1;
-    });
-
-    const occTracker = {};
-    items.forEach(it => {
-      const baseKey = makeReconKey(it.date || it.dateStr, it.amount, it.desc, tz);
-      occTracker[baseKey] = (occTracker[baseKey] || 0) + 1;
-      const occ = occTracker[baseKey];
-      if (options.trackOccIndex) it.occurrenceIndex = occ;
-      const pKeyWithOcc = `${baseKey}_#${occ}`;
-
-      let saved = reconStore.table2Map[pKeyWithOcc] ||
-                  (occ === 1 ? reconStore.table2Map[baseKey] : null);
-      if (!saved && totalOccMap[baseKey] === 1 && reconStore.table2ByBaseKey && reconStore.table2ByBaseKey[baseKey] && reconStore.table2ByBaseKey[baseKey].length === 1) {
-        saved = reconStore.table2ByBaseKey[baseKey][0];
-        if (saved) {
-          delete reconStore.table2Map[saved.primaryKey];
-          saved.primaryKey = pKeyWithOcc;
-          reconStore.table2Map[pKeyWithOcc] = saved;
-          reconStore.table2Map[baseKey] = saved;
-        }
-      }
-
-      if (saved && saved.payer) {
-        it.assignedPayer = (saved.payer === "NEGLECT" || saved.isNeglected)
-          ? "🚫 Neglect / Ignore"
-          : (formatPayerCell(saved.payer) || saved.payer);
-        it.note = saved.note || options.defaultNote(it);
-      } else if (options.defaultPayer !== undefined) {
-        it.assignedPayer = typeof options.defaultPayer === "function"
-          ? options.defaultPayer(it)
-          : options.defaultPayer;
-        it.note = options.defaultNote(it);
-      }
-    });
-  }
-
-  // 6. Fees Default to Mai (or restored from store)
-  restoreTable2Group(stmtFees, {
-    defaultPayer: CONFIG.DEFAULT_FEE_PAYER,
-    defaultNote: () => "Bank Fee / Tax"
-  });
-
-  // 7. Restore missing in sheet assignments with unique occurrence tracking
-  restoreTable2Group(missingInSheet, {
-    trackOccIndex: true,
-    defaultNote: m => cleanMerchantName(m.desc)
-  });
-
-  // 8. Restore refunds / credits assignments
-  restoreTable2Group(stmtCredits, {
-    defaultPayer: cr => isPaymentCreditDesc(cr.desc) ? "🚫 Neglect / Ignore" : CONFIG.DEFAULT_FEE_PAYER,
-    defaultNote: cr => isPaymentCreditDesc(cr.desc)
-      ? "Bill Payment / Settlement (Neglected by default)"
-      : "Merchant Refund (Reduces Debt)"
-  });
-
-  saveAllReconStore(ss, reconStore);
 
   const unmatchedTx = txDebits.filter(tx => !tx.matched);
 
@@ -2009,19 +1757,16 @@ function reconcileActiveStatement(ss, tz) {
       txOccTracker[baseKey] = (txOccTracker[baseKey] || 0) + 1;
       const occ = txOccTracker[baseKey];
       const pKeyWithOcc = `${baseKey}_#${occ}`;
-      const isNeg = reconStore.neglectedTx && (
-        reconStore.neglectedTx.has(pKeyWithOcc) ||
-        (occ === 1 && reconStore.neglectedTx.has(baseKey)) ||
-        reconStore.neglectedTx.has(exId)
-      );
       expandedUnmatched.push({
         id: exId,
-        primaryKey: pKeyWithOcc,
+        subjectId: buildTxSubjectId(tx.txId, p, 1),
+        txId: tx.txId,
         date: tx.date,
         desc: tx.desc,
         amount: tx.amount,
         person: p,
-        isNeglected: isNeg
+        isNeglected: false,
+        _legacyKeys: [pKeyWithOcc, occ === 1 ? baseKey : null, exId].filter(Boolean)
       });
     } else {
       const splitAmt = tx.amount / payers.length;
@@ -2032,24 +1777,93 @@ function reconcileActiveStatement(ss, tz) {
         txOccTracker[baseKey] = (txOccTracker[baseKey] || 0) + 1;
         const occ = txOccTracker[baseKey];
         const pKeyWithOcc = `${baseKey}_#${occ}`;
-        const isNeg = reconStore.neglectedTx && (
-          reconStore.neglectedTx.has(pKeyWithOcc) ||
-          (occ === 1 && reconStore.neglectedTx.has(baseKey)) ||
-          reconStore.neglectedTx.has(`${legacyWholeKey}_#${pIdx + 1}`) ||
-          reconStore.neglectedTx.has(exId)
-        );
         expandedUnmatched.push({
           id: exId,
-          primaryKey: pKeyWithOcc,
+          subjectId: buildTxSubjectId(tx.txId, p, payers.length),
+          txId: tx.txId,
           date: tx.date,
           desc: `${tx.desc} (Split ${pIdx + 1}/${payers.length})`,
           amount: splitAmt,
           person: p,
-          isNeglected: isNeg
+          isNeglected: false,
+          _legacyKeys: [pKeyWithOcc, occ === 1 ? baseKey : null, `${legacyWholeKey}_#${pIdx + 1}`, exId].filter(Boolean)
         });
       });
     }
   });
+
+  // Stage 2 one-time migration from legacy _Recon_Store (Table 2, Table 3, Table 4)
+  if (legacyMigrationCtx && !decisions.isMigrated) {
+    migrateLegacyPostMatch(ss, tz, decisions, legacyMigrationCtx, {
+      stmtFees,
+      missingInSheet,
+      stmtCredits,
+      expandedUnmatched,
+      installmentReconItems
+    });
+  }
+
+  // Apply Table 4 Installment Overrides purely by permanent SubjectId
+  installmentReconItems.forEach((item, idx) => {
+    item.id = `INST-${idx + 1}`;
+    item.primaryKey = item.subjectId;
+    const saved = item.subjectId && decisions.instOverride && decisions.instOverride[item.subjectId];
+    if (saved && saved.target !== undefined) {
+      item.action = saved.target;
+      item.note = saved.note || item.defaultNote;
+    } else {
+      item.action = item.defaultAction;
+      item.note = item.defaultNote;
+    }
+    item.isNeglected = isNeglectedPayer(item.action);
+  });
+
+  // Apply Table 2 Assignments purely by permanent Statement ID
+  function applyTable2Decisions(items, options) {
+    items.forEach(it => {
+      const saved = it.stmtId && decisions.stmtAssign && decisions.stmtAssign[it.stmtId];
+      if (saved && saved.target) {
+        it.assignedPayer = (saved.target === "NEGLECT" || saved.isNeglected)
+          ? "🚫 Neglect / Ignore"
+          : (formatPayerCell(saved.target) || saved.target);
+        it.note = saved.note || options.defaultNote(it);
+      } else if (options.defaultPayer !== undefined) {
+        it.assignedPayer = typeof options.defaultPayer === "function"
+          ? options.defaultPayer(it)
+          : options.defaultPayer;
+        it.note = options.defaultNote(it);
+      }
+    });
+  }
+
+  // 6. Fees Default to Mai (or restored from _Decisions)
+  applyTable2Decisions(stmtFees, {
+    defaultPayer: CONFIG.DEFAULT_FEE_PAYER,
+    defaultNote: () => "Bank Fee / Tax"
+  });
+
+  // 7. Missing in sheet purchases (or restored from _Decisions)
+  applyTable2Decisions(missingInSheet, {
+    defaultNote: m => cleanMerchantName(m.desc)
+  });
+
+  // 8. Refunds / Credits (payment credits neglected by default unless user assigns payer)
+  applyTable2Decisions(stmtCredits, {
+    defaultPayer: cr => isPaymentCreditDesc(cr.desc) ? "🚫 Neglect / Ignore" : CONFIG.DEFAULT_FEE_PAYER,
+    defaultNote: cr => isPaymentCreditDesc(cr.desc)
+      ? "Bill Payment / Settlement (Neglected by default)"
+      : "Merchant Refund (Reduces Debt)"
+  });
+
+  // Apply Table 3 Neglect Decisions purely by permanent SubjectId
+  expandedUnmatched.forEach(tx => {
+    tx.isNeglected = Boolean(tx.subjectId && decisions.txNeglect && decisions.txNeglect[tx.subjectId]);
+    delete tx._legacyKeys;
+  });
+
+  if (decisions._dirty) {
+    saveDecisions(ss, decisions);
+  }
 
   return {
     stmtDebits,
@@ -2063,7 +1877,8 @@ function reconcileActiveStatement(ss, tz) {
     unmatchedTx,
     expandedUnmatched,
     cardBal,
-    reconStore,
+    decisions,
+    reconStore: decisions,
     tz
   };
 }
@@ -2325,6 +2140,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   recon.stmtFees.forEach((f, idx) => {
     exceptionItems.push({
       id: `F-${idx + 1}`,
+      subjectId: f.stmtId || "",
       date: f.date || f.dateStr,
       desc: f.desc,
       amount: f.amount,
@@ -2337,6 +2153,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   recon.stmtCredits.forEach((c, idx) => {
     exceptionItems.push({
       id: `C-${idx + 1}`,
+      subjectId: c.stmtId || "",
       date: c.date || c.dateStr,
       desc: c.desc,
       amount: c.amount,
@@ -2349,6 +2166,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   recon.missingInSheet.forEach((m, idx) => {
     exceptionItems.push({
       id: `M-${idx + 1}`,
+      subjectId: m.stmtId || "",
       date: m.date || m.dateStr,
       desc: m.desc,
       amount: m.amount,
@@ -2403,8 +2221,8 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange("E5:E7").setFontWeight("bold");
   sheet.getRange("A5:H7").setBackground(CONFIG.COLORS.PRIMARY_LIGHT).setBorder(true, true, true, true, true, true);
   const maxCols = sheet.getMaxColumns();
-  if (maxCols > 8) {
-    sheet.getRange(1, 9, Math.min(sheet.getMaxRows(), 30), maxCols - 8).clearFormat();
+  if (maxCols > 9) {
+    sheet.getRange(1, 10, Math.min(sheet.getMaxRows(), 30), maxCols - 9).clearFormat();
   }
   sheet.getRange("F5:H5").merge().setValue(badgeFormula).setFontWeight("bold").setFontSize(9);
 
@@ -2412,8 +2230,8 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const dateCell = sheet.getRange(6, 8);
   const existingVal = dateCell.getValue();
   const existingDate = parseDateValue(existingVal, tz);
-  const reconStore = (recon && recon.reconStore) ? recon.reconStore : loadAllReconStore(ss, tz);
-  const cycleRecord = (reconStore.paymentRecords && reconStore.paymentRecords[ledger.activeCycleKey]) || null;
+  const decisionsStore = (recon && (recon.decisions || recon.reconStore)) ? (recon.decisions || recon.reconStore) : loadDecisions(ss);
+  const cycleRecord = (decisionsStore.paymentRecords && decisionsStore.paymentRecords[ledger.activeCycleKey]) || null;
 
   let paymentDateVal = "";
   if (existingDate && !isNaN(existingDate.getTime())) {
@@ -2537,11 +2355,9 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     t2BannerRange.setValue("⚠️ Actionable Statement Charges & Exceptions (0 Items)");
   }
 
-  const exHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Category", "Assign Payer", "Custom Note", "Status"];
-  sheet.getRange(startExHeaderRow + 1, 1, 1, exHeaders.length).setValues([exHeaders])
-    .setFontWeight("bold")
-    .setFontSize(9)
-    .setBackground(CONFIG.COLORS.HEADER);
+  const exHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Category", "Assign Payer", "Custom Note", "Status", "_Subject_ID"];
+  sheet.getRange(startExHeaderRow + 1, 1, 1, 8).setFontWeight("bold").setFontSize(9).setBackground(CONFIG.COLORS.HEADER);
+  sheet.getRange(startExHeaderRow + 1, 1, 1, exHeaders.length).setValues([exHeaders]);
 
   if (numExceptions > 0) {
     const exRows = exceptionItems.map((ex, idx) => {
@@ -2555,12 +2371,14 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
         ex.category,
         ex.assignedPayer,
         ex.note,
-        statusFormula
+        statusFormula,
+        ex.subjectId || ""
       ];
     });
 
     const exRange = sheet.getRange(startExRow, 1, exRows.length, exHeaders.length);
-    exRange.setValues(exRows).setFontSize(9);
+    exRange.setValues(exRows);
+    sheet.getRange(startExRow, 1, exRows.length, 8).setFontSize(9);
     sheet.getRange(startExRow, 2, exRows.length, 1).setNumberFormat("yyyy-MM-dd");
     sheet.getRange(startExRow, 4, exRows.length, 1).setNumberFormat("#,##0.00");
 
@@ -2593,11 +2411,9 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       .setFontSize(10)
       .setBackground("#e8eaed");
 
-    const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Person", "Billing Action", "Custom Note", "Status"];
-    sheet.getRange(startTxHeaderRow + 1, 1, 1, unHeaders.length).setValues([unHeaders])
-      .setFontWeight("bold")
-      .setFontSize(9)
-      .setBackground(CONFIG.COLORS.HEADER);
+    const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Person", "Billing Action", "Custom Note", "Status", "_Subject_ID"];
+    sheet.getRange(startTxHeaderRow + 1, 1, 1, 8).setFontWeight("bold").setFontSize(9).setBackground(CONFIG.COLORS.HEADER);
+    sheet.getRange(startTxHeaderRow + 1, 1, 1, unHeaders.length).setValues([unHeaders]);
 
     const txRows = unmatchedList.map((tx, idx) => {
       const r = startTxRow + idx;
@@ -2611,11 +2427,13 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
         tx.person,
         defaultAction,
         "Recorded in Transactions",
-        statusFormula
+        statusFormula,
+        tx.subjectId || ""
       ];
     });
 
-    sheet.getRange(startTxRow, 1, txRows.length, unHeaders.length).setValues(txRows).setFontSize(9);
+    sheet.getRange(startTxRow, 1, txRows.length, unHeaders.length).setValues(txRows);
+    sheet.getRange(startTxRow, 1, txRows.length, 8).setFontSize(9);
     sheet.getRange(startTxRow, 2, txRows.length, 1).setNumberFormat("yyyy-MM-dd");
     sheet.getRange(startTxRow, 4, txRows.length, 1).setNumberFormat("#,##0.00");
 
@@ -2644,11 +2462,9 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       .setFontSize(10)
       .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
 
-    const instHeaders = ["#", "Date", "Installment Description", "Monthly EMI (EGP)", "Match Source", "Billing Action / Payer", "Custom Note", "Status"];
-    sheet.getRange(startInstHeaderRow + 1, 1, 1, instHeaders.length).setValues([instHeaders])
-      .setFontWeight("bold")
-      .setFontSize(9)
-      .setBackground(CONFIG.COLORS.HEADER);
+    const instHeaders = ["#", "Date", "Installment Description", "Monthly EMI (EGP)", "Match Source", "Billing Action / Payer", "Custom Note", "Status", "_Subject_ID"];
+    sheet.getRange(startInstHeaderRow + 1, 1, 1, 8).setFontWeight("bold").setFontSize(9).setBackground(CONFIG.COLORS.HEADER);
+    sheet.getRange(startInstHeaderRow + 1, 1, 1, instHeaders.length).setValues([instHeaders]);
 
     const instRows = instReconList.map((inst, idx) => {
       const r = startInstRow + idx;
@@ -2661,11 +2477,13 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
         inst.sourceCategory,
         inst.action,
         inst.note,
-        statusFormula
+        statusFormula,
+        inst.subjectId || ""
       ];
     });
 
-    sheet.getRange(startInstRow, 1, instRows.length, instHeaders.length).setValues(instRows).setFontSize(9);
+    sheet.getRange(startInstRow, 1, instRows.length, instHeaders.length).setValues(instRows);
+    sheet.getRange(startInstRow, 1, instRows.length, 8).setFontSize(9);
     sheet.getRange(startInstRow, 2, instRows.length, 1).setNumberFormat("yyyy-MM-dd");
     sheet.getRange(startInstRow, 4, instRows.length, 1).setNumberFormat("#,##0.00");
 
@@ -2701,6 +2519,8 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       }
     }
   }
+
+  try { sheet.hideColumns(9); } catch (e) { }
 
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
@@ -3220,7 +3040,7 @@ function syncInstallmentsFromStatement(ss, tz, isBillPaid) {
 function handlePaymentDateEdit(sheet, range, tz, forceReapply) {
   const ss = sheet.getParent();
   const rawVal = range.getValue();
-  const reconStore = loadAllReconStore(ss, tz);
+  const decisions = loadDecisions(ss);
 
   const cardBal = calculateCardBalance(ss, tz);
   const activeCycleKey = cardBal.activeCycleKey;
@@ -3231,10 +3051,8 @@ function handlePaymentDateEdit(sheet, range, tz, forceReapply) {
   if (rawVal === "" || rawVal === null || rawVal === undefined) {
     syncInstallmentsFromStatement(ss, tz, false);
 
-    if (reconStore.paymentRecords) {
-      delete reconStore.paymentRecords[activeCycleKey];
-    }
-    saveAllReconStore(ss, reconStore);
+    clearCyclePayment(decisions, activeCycleKey);
+    saveDecisions(ss, decisions);
 
     // Reset cell styling in Active Bill & Reconciliation
     range.setBackground("#fffde7").setFontColor("#333333").setFontWeight("normal");
@@ -3260,270 +3078,18 @@ function handlePaymentDateEdit(sheet, range, tz, forceReapply) {
   // Synchronize Installments sheet with Ground Truth (isBillPaid = true)
   syncInstallmentsFromStatement(ss, tz, true);
 
-  // Save record in ReconStore
-  if (!reconStore.paymentRecords) reconStore.paymentRecords = {};
-  reconStore.paymentRecords[activeCycleKey] = {
+  // Save record in _Decisions
+  setCyclePayment(decisions, activeCycleKey, {
     cycleKey: activeCycleKey,
     dateStr: dateStr,
     cycleLabel: cycleLabel,
     amount: closingBill,
     status: "Settled",
     isApplied: true
-  };
-  saveAllReconStore(ss, reconStore);
+  });
+  saveDecisions(ss, decisions);
 
   ss.toast("Payment recorded (" + dateStr + ")! Synchronized active installments to paid state.", "💳 NBE Tracker", 4);
-}
-
-function computeRowKeyOccurrence(allRows, row, prefixRegex, prefixChar, extractKeyFields, tz) {
-  const curr = extractKeyFields(allRows[row - 1]);
-  const baseKey = makeReconKey(curr.rawDate, curr.amt, curr.desc, tz);
-  let occ = 1;
-  let totalWithBaseKey = 1;
-  for (let idx = 11; idx < allRows.length; idx++) {
-    if (idx === row - 1) continue;
-    const id = String(allRows[idx][0] || "").trim();
-    if (!prefixRegex.test(id)) continue;
-    if (prefixChar && id.charAt(0).toUpperCase() !== prefixChar) continue;
-    const prev = extractKeyFields(allRows[idx]);
-    const k = makeReconKey(prev.rawDate, prev.amt, prev.desc, tz);
-    if (k === baseKey) {
-      totalWithBaseKey++;
-      if (idx < row - 1) occ++;
-    }
-  }
-  return { curr, baseKey, occ, pKeyWithOcc: `${baseKey}_#${occ}`, totalWithBaseKey };
-}
-
-function deleteReconMapEntriesForRecord(mapObj, pKeyWithOcc, baseKey, occ, totalWithBaseKey, fallbackId) {
-  if (!mapObj) return;
-  Object.keys(mapObj).forEach(k => {
-    const v = mapObj[k];
-    const pk = v && v.primaryKey ? v.primaryKey : "";
-    if (k === fallbackId || k === pKeyWithOcc || (occ === 1 && k === baseKey) ||
-        pk === pKeyWithOcc || (occ === 1 && pk === baseKey) ||
-        (totalWithBaseKey === 1 && pk && pk.replace(/_#\d+$/, "") === baseKey)) {
-      delete mapObj[k];
-    }
-  });
-}
-
-function processActiveReconRowChange(sheet, allRows, row, reconStore, tz, options) {
-  const opts = options || {};
-  const allowDelete = opts.allowDelete === true;
-  const forceStyle = opts.forceStyle === true;
-  const rowVals = allRows[row - 1];
-  const firstCol = String(rowVals[0] || "").trim();
-
-  // Case 1: Edit in Table 2 (F-*, C-*, M-*)
-  if (/^[FCM]-\d+/i.test(firstCol)) {
-    const prefix = firstCol.charAt(0).toUpperCase();
-    const keyInfo = computeRowKeyOccurrence(
-      allRows,
-      row,
-      /^[FCM]-\d+/i,
-      prefix,
-      r => ({ rawDate: r[1], amt: parseFloat(r[3]), desc: String(r[2] || "").trim() }),
-      tz
-    );
-    const { rawDate, amt, desc: origDesc } = keyInfo.curr;
-    if (isNaN(amt) || amt <= 0 || !origDesc) return false;
-
-    let payer = String(rowVals[5] || "").trim();
-    const note = String(rowVals[6] || "").trim();
-
-    if (payer && !isNeglectedPayer(payer)) {
-      const cleanPayer = formatPayerCell(payer);
-      if (cleanPayer && cleanPayer !== payer) {
-        payer = cleanPayer;
-        rowVals[5] = payer;
-        sheet.getRange(row, 6).setValue(payer);
-      }
-    }
-
-    const { baseKey, occ, pKeyWithOcc, totalWithBaseKey } = keyInfo;
-
-    if (!allowDelete) {
-      if (!payer) return false;
-      const existing = reconStore.table2Map[pKeyWithOcc] || (occ === 1 ? reconStore.table2Map[baseKey] : null);
-      if (!existing && (prefix === "F" || prefix === "C") && payer === CONFIG.DEFAULT_FEE_PAYER) {
-        return false;
-      }
-    }
-
-    if (payer) {
-      const isNeg = isNeglectedPayer(payer);
-      const rec = {
-        primaryKey: pKeyWithOcc,
-        exId: firstCol,
-        dateStr: makeNormDateStr(rawDate, tz),
-        desc: origDesc,
-        amount: amt,
-        payer: isNeg ? "NEGLECT" : payer,
-        note: note,
-        isNeglected: isNeg
-      };
-
-      const existing = reconStore.table2Map[pKeyWithOcc];
-      if (!forceStyle && existing && existing.payer === rec.payer && existing.note === rec.note && existing.primaryKey === pKeyWithOcc) {
-        return false;
-      }
-
-      if (totalWithBaseKey === 1) {
-        Object.keys(reconStore.table2Map).forEach(k => {
-          const v = reconStore.table2Map[k];
-          if (v && v.primaryKey && v.primaryKey.replace(/_#\d+$/, "") === baseKey && v.primaryKey !== pKeyWithOcc) {
-            delete reconStore.table2Map[k];
-          }
-        });
-      }
-      reconStore.table2Map[pKeyWithOcc] = rec;
-      if (occ === 1) reconStore.table2Map[baseKey] = rec;
-      if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground(isNeg ? "#eeeeee" : CONFIG.COLORS.PAID);
-      return true;
-    }
-
-    deleteReconMapEntriesForRecord(reconStore.table2Map, pKeyWithOcc, baseKey, occ, totalWithBaseKey, firstCol);
-    if (reconStore.table2List) {
-      reconStore.table2List = reconStore.table2List.filter(it =>
-        it.primaryKey !== pKeyWithOcc &&
-        !(occ === 1 && it.primaryKey === baseKey) &&
-        !(totalWithBaseKey === 1 && it.primaryKey && it.primaryKey.replace(/_#\d+$/, "") === baseKey)
-      );
-    }
-    if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#ffffff");
-    return true;
-  }
-
-  // Case 2: Edit in Table 3 (TX-*)
-  if (/^TX-/i.test(firstCol)) {
-    const keyInfo = computeRowKeyOccurrence(
-      allRows,
-      row,
-      /^TX-/i,
-      null,
-      r => ({
-        rawDate: r[1],
-        amt: parseFloat(r[3]) || 0,
-        desc: String(r[2] || "").replace(/\s*\(Split\s+\d+\/\d+\)$/i, "").trim()
-      }),
-      tz
-    );
-    const { baseKey, occ, pKeyWithOcc } = keyInfo;
-    const actionVal = String(rowVals[5] || "").trim();
-    const isNeg = isNeglectedPayer(actionVal);
-
-    if (isNeg) {
-      if (!forceStyle && reconStore.neglectedTx.has(pKeyWithOcc)) return false;
-      reconStore.neglectedTx.add(pKeyWithOcc);
-      if (occ === 1) reconStore.neglectedTx.add(baseKey);
-      if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
-      return true;
-    }
-
-    if (!allowDelete) return false;
-    reconStore.neglectedTx.delete(pKeyWithOcc);
-    if (occ === 1) reconStore.neglectedTx.delete(baseKey);
-    reconStore.neglectedTx.delete(firstCol);
-    if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#f8f9fa");
-    return true;
-  }
-
-  // Case 3: Edit in Table 4 (INST-*)
-  if (/^INST-\d+/i.test(firstCol)) {
-    const keyInfo = computeRowKeyOccurrence(
-      allRows,
-      row,
-      /^INST-\d+/i,
-      null,
-      r => ({ rawDate: r[1], amt: parseFloat(r[3]), desc: String(r[2] || "").trim() }),
-      tz
-    );
-    const { rawDate, amt, desc: origDesc } = keyInfo.curr;
-    if (isNaN(amt) || amt <= 0 || !origDesc) return false;
-
-    let actionVal = String(rowVals[5] || "").trim();
-    const sourceCat = String(rowVals[4] || "").trim();
-    const note = String(rowVals[6] || "").trim();
-    const { baseKey, occ, pKeyWithOcc, totalWithBaseKey } = keyInfo;
-
-    if (!allowDelete) {
-      if (!actionVal) return false;
-      const existing = reconStore.installmentOverrides &&
-        (reconStore.installmentOverrides[pKeyWithOcc] || (occ === 1 ? reconStore.installmentOverrides[baseKey] : null));
-      if (!existing) {
-        if (sourceCat.includes("Sheet Only") && actionVal === "🚫 Not on Statement (Skip)") return false;
-        if (sourceCat.includes("Matched") && !isNeglectedPayer(actionVal) && /^✅\s*Billed\s+to\s+/i.test(actionVal)) return false;
-      }
-    }
-
-    if (actionVal && !isNeglectedPayer(actionVal) && !/^✅\s*Billed\s+to\s+/i.test(actionVal)) {
-      const cleanName = formatPayerCell(actionVal);
-      if (cleanName) {
-        actionVal = `✅ Billed to ${cleanName}`;
-        rowVals[5] = actionVal;
-        sheet.getRange(row, 6).setValue(actionVal);
-      }
-    }
-
-    const isNeg = isNeglectedPayer(actionVal);
-    if (!reconStore.installmentOverrides) reconStore.installmentOverrides = {};
-
-    if (actionVal) {
-      const rec = {
-        primaryKey: pKeyWithOcc,
-        instId: firstCol,
-        dateStr: makeNormDateStr(rawDate, tz),
-        desc: origDesc,
-        amount: amt,
-        action: actionVal,
-        note: note,
-        isNeglected: isNeg
-      };
-      const existing = reconStore.installmentOverrides[pKeyWithOcc];
-      if (!forceStyle && existing && existing.action === rec.action && existing.note === rec.note && existing.primaryKey === pKeyWithOcc) {
-        return false;
-      }
-      if (totalWithBaseKey === 1) {
-        Object.keys(reconStore.installmentOverrides).forEach(k => {
-          const v = reconStore.installmentOverrides[k];
-          if (v && v.primaryKey && v.primaryKey.replace(/_#\d+$/, "") === baseKey && v.primaryKey !== pKeyWithOcc) {
-            delete reconStore.installmentOverrides[k];
-          }
-        });
-      }
-      reconStore.installmentOverrides[pKeyWithOcc] = rec;
-      if (occ === 1) reconStore.installmentOverrides[baseKey] = rec;
-      if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground(isNeg ? "#eeeeee" : CONFIG.COLORS.PAID);
-      return true;
-    }
-
-    deleteReconMapEntriesForRecord(reconStore.installmentOverrides, pKeyWithOcc, baseKey, occ, totalWithBaseKey, firstCol);
-    if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.DUE_SOON);
-    return true;
-  }
-
-  return false;
-}
-
-function syncActiveReconSheetToStore(ss, tz) {
-  const sheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
-  if (!sheet || sheet.getLastRow() < 12) return;
-
-  const lastR = sheet.getLastRow();
-  const allRows = sheet.getRange(1, 1, lastR, 8).getValues();
-  const reconStore = loadAllReconStore(ss, tz);
-  let changed = false;
-
-  for (let row = 12; row <= lastR; row++) {
-    if (processActiveReconRowChange(sheet, allRows, row, reconStore, tz, { allowDelete: false, forceStyle: false })) {
-      changed = true;
-    }
-  }
-
-  if (changed) {
-    saveAllReconStore(ss, reconStore);
-  }
 }
 
 function handleActiveReconEdit(e) {
@@ -3561,18 +3127,22 @@ function handleActiveReconEdit(e) {
 
   const ss = sheet.getParent();
   const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
-  const reconStore = loadAllReconStore(ss, tz);
-  const allRows = sheet.getRange(1, 1, lastR, 8).getValues();
+  const decisions = loadDecisions(ss);
+  const colsToRead = Math.min(9, Math.max(8, sheet.getLastColumn() || 8));
+  const rawRows = sheet.getRange(1, 1, lastR, colsToRead).getValues();
+  const allRows = colsToRead >= 9
+    ? rawRows
+    : rawRows.map(r => [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], ""]);
   let modified = false;
 
   for (let row = loopStart; row <= loopEnd; row++) {
-    if (processActiveReconRowChange(sheet, allRows, row, reconStore, tz, { allowDelete: true, forceStyle: true })) {
+    if (processActiveReconRowChange(sheet, allRows, row, decisions, tz, { allowDelete: true, forceStyle: true })) {
       modified = true;
     }
   }
 
   if (modified) {
-    saveAllReconStore(ss, reconStore);
+    saveDecisions(ss, decisions);
   }
   // ZERO SCREEN WIPE: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
 }
@@ -3580,44 +3150,60 @@ function handleActiveReconEdit(e) {
 function onEdit(e) {
   if (!e || !e.range) return;
   const sheet = e.range.getSheet();
+  const ss = sheet.getParent();
   const sheetName = sheet.getName();
   const col = e.range.getColumn();
   const row = e.range.getRow();
 
-  if (sheetName === CONFIG.SHEETS.TRANSACTIONS && col === 2 && row >= 2) {
-    const val = e.range.getValue();
-    if (val && !(val instanceof Date)) {
-      const parsed = parseDateValue(val);
-      if (parsed && !isNaN(parsed.getTime())) {
-        e.range.setValue(parsed);
-      }
+  if (sheetName === CONFIG.SHEETS.TRANSACTIONS && row >= 2) {
+    if (col >= 1 && col <= 5) {
+      try { ensureSingleRowId(ss, sheet, 1, 6, row, "T"); } catch (err) { }
     }
-    e.range.setNumberFormat("dddd, MMMM d, yyyy");
+    if (col === 2) {
+      const val = e.range.getValue();
+      if (val && !(val instanceof Date)) {
+        const parsed = parseDateValue(val);
+        if (parsed && !isNaN(parsed.getTime())) {
+          e.range.setValue(parsed);
+        }
+      }
+      e.range.setNumberFormat("dddd, MMMM d, yyyy");
+      return;
+    }
+    if (col === 4) {
+      const val = e.range.getValue();
+      const clean = formatPayerCell(val);
+      if (clean !== val) e.range.setValue(clean);
+      return;
+    }
     return;
   }
 
-  if (sheetName === CONFIG.SHEETS.TRANSACTIONS && col === 4 && row >= 2) {
-    const val = e.range.getValue();
-    const clean = formatPayerCell(val);
-    if (clean !== val) e.range.setValue(clean);
+  if (sheetName === CONFIG.SHEETS.INSTALLMENTS && row >= 2) {
+    if (col >= 1 && col <= 11) {
+      try { ensureSingleRowId(ss, sheet, 1, 12, row, "I"); } catch (err) { }
+    }
+    if (col === 9) {
+      const val = e.range.getValue();
+      const clean = formatPayerCell(val);
+      if (clean !== val) e.range.setValue(clean);
+    }
     return;
   }
 
-  if (sheetName === CONFIG.SHEETS.INSTALLMENTS && col === 9 && row >= 2) {
-    const val = e.range.getValue();
-    const clean = formatPayerCell(val);
-    if (clean !== val) e.range.setValue(clean);
-    return;
-  }
-
-  if (sheetName === CONFIG.SHEETS.BANK_STATEMENT && col === 5 && row >= 7) {
-    const val = String(e.range.getValue() || "").trim().toUpperCase();
-    let bg = "#ffffff";
-    if (val === "CREDIT") bg = CONFIG.COLORS.PAID;
-    else if (val === "INSTALLMENT") bg = CONFIG.COLORS.PRIMARY_LIGHT;
-    else if (val === "FEE") bg = "#fffde7";
-    sheet.getRange(row, 1, 1, 7).setBackground(bg);
-    updateLiveDashboard({ skipPDF: true });
+  if (sheetName === CONFIG.SHEETS.BANK_STATEMENT && row >= 7) {
+    if (col >= 1 && col <= 7) {
+      try { ensureSingleRowId(ss, sheet, 6, 8, row, "S"); } catch (err) { }
+    }
+    if (col === 5) {
+      const val = String(e.range.getValue() || "").trim().toUpperCase();
+      let bg = "#ffffff";
+      if (val === "CREDIT") bg = CONFIG.COLORS.PAID;
+      else if (val === "INSTALLMENT") bg = CONFIG.COLORS.PRIMARY_LIGHT;
+      else if (val === "FEE") bg = "#fffde7";
+      sheet.getRange(row, 1, 1, 7).setBackground(bg);
+      updateLiveDashboard({ skipPDF: true });
+    }
     return;
   }
 
@@ -3633,7 +3219,7 @@ function updateLiveDashboard(options) {
   cleanupDeprecatedSheets(ss);
   sanitizeAllPayerNames(ss);
   sanitizeTransactionDates(ss);
-  syncActiveReconSheetToStore(ss, tz);
+  syncActiveReconSheetToDecisions(ss, tz);
 
   // Check active payment state from Active Bill & Reconciliation cell H6
   let isBillPaid = false;
@@ -3730,7 +3316,7 @@ function buildAnonymizedFixture(ss, tz) {
   const targetTz = tz || ss.getSpreadsheetTimeZone() || "Africa/Cairo";
   const activeReconSheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
   if (activeReconSheet) {
-    syncActiveReconSheetToStore(ss, targetTz);
+    syncActiveReconSheetToDecisions(ss, targetTz);
   }
 
   const recon = reconcileActiveStatement(ss, targetTz);
@@ -3738,11 +3324,12 @@ function buildAnonymizedFixture(ss, tz) {
     throw new Error(recon.error);
   }
   const ledger = buildDebtLedger(ss, targetTz, recon);
+  const idInfo = ensureAllSheetRowIds(ss);
 
   const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
   const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
   const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
-  const storeSheet = getReconStoreSheet(ss);
+  const decSheet = ss.getSheetByName(CONFIG.SHEETS.DECISIONS);
 
   const txRaw = (txSheet && txSheet.getLastRow() >= 2)
     ? txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues()
@@ -3753,8 +3340,8 @@ function buildAnonymizedFixture(ss, tz) {
   const stmtRaw = (stmtSheet && stmtSheet.getLastRow() >= 7)
     ? stmtSheet.getRange(7, 1, stmtSheet.getLastRow() - 6, 7).getValues()
     : [];
-  const storeRaw = (storeSheet && storeSheet.getLastRow() >= 2)
-    ? storeSheet.getRange(2, 1, storeSheet.getLastRow() - 1, 10).getValues()
+  const decRaw = (decSheet && decSheet.getLastRow() >= 2)
+    ? decSheet.getRange(2, 1, decSheet.getLastRow() - 1, 7).getValues()
     : [];
 
   // 1. Deterministic Person Anonymizer (P1..Pn)
@@ -3782,10 +3369,11 @@ function buildAnonymizedFixture(ss, tz) {
   (ledger.personShares || []).forEach(ps => collectPayers(ps.person));
   txRaw.forEach(r => collectDataPayers(r[3]));
   instRaw.forEach(r => collectDataPayers(r[8]));
-  storeRaw.forEach(r => {
-    const f = String(r[5] || "").trim();
-    if (f && !isNeglectedPayer(f)) {
-      collectDataPayers(f.replace(/^✅\s*Billed\s+to\s+/i, ""));
+  decRaw.forEach(r => {
+    const type = String(r[0] || "").trim();
+    const t = String(r[2] || "").trim();
+    if ((type === "STMT_ASSIGN" || type === "INST_OVERRIDE") && t && !isNeglectedPayer(t)) {
+      collectDataPayers(t.replace(/^✅\s*Billed\s+to\s+/i, ""));
     }
   });
   if (activeReconSheet && activeReconSheet.getLastRow() >= 12) {
@@ -3986,78 +3574,42 @@ function buildAnonymizedFixture(ss, tz) {
     String(r[10] || "Ongoing").trim()
   ]);
 
-  const anonStmtByDateAmt = stmtRaw.map((r, idx) => ({
-    dateStr: makeNormDateStr(r[1], targetTz),
-    amt: round2_(parseFloat(r[5]) || 0),
-    origNorm: makeNormDesc(r[3]),
-    anonDesc: bankRows[idx][3]
-  }));
-
-  function anonymizeReconStoreKey(type, pKey, dateStr, amt, origDesc, anonDesc) {
-    if (!pKey) return "";
-    if (/^TX-\d+(?:\.\d+)?$/i.test(pKey)) return pKey;
-    const occMatch = pKey.match(/(_#\d+)$/);
-    const occSuffix = occMatch ? occMatch[1] : "";
-    const strippedKey = occSuffix ? pKey.slice(0, -occSuffix.length) : pKey;
-
-    if (origDesc && (dateStr || amt > 0)) {
-      return makeReconKey(dateStr, amt, anonDesc, targetTz) + occSuffix;
-    }
-
-    const keyParts = strippedKey.match(/^(\d{4}-\d{2}-\d{2})_(-?\d+\.\d{2})_(.*)$/);
-    if (keyParts) {
-      const kDate = keyParts[1];
-      const kAmt = parseFloat(keyParts[2]);
-      const kDescFrag = keyParts[3];
-      const txMatch = anonTxByDateAmt.find(it =>
-        it.dateStr === kDate &&
-        (Math.abs(it.amt - kAmt) <= 0.02 || Math.abs(it.amt / it.splitCount - kAmt) <= 0.02) &&
-        it.origNorm.substring(0, 30) === kDescFrag
-      );
-      if (txMatch) {
-        return makeReconKey(kDate, kAmt, txMatch.anonDesc, targetTz) + occSuffix;
+  function anonymizeDecisionSubjectId(type, subjId) {
+    const s = String(subjId || "").trim();
+    if (type === "TX_NEGLECT") {
+      const idx = s.indexOf(":");
+      if (idx > 0) {
+        return `${s.substring(0, idx)}:${mapPerson(s.substring(idx + 1))}`;
       }
-      const stMatch = anonStmtByDateAmt.find(it =>
-        it.dateStr === kDate && Math.abs(it.amt - kAmt) <= 0.02 && it.origNorm.substring(0, 30) === kDescFrag
-      );
-      if (stMatch) {
-        return makeReconKey(kDate, kAmt, stMatch.anonDesc, targetTz) + occSuffix;
+    } else if (type === "INST_OVERRIDE") {
+      const m = s.match(/^(.+?::[^:]+):([^:]+)$/);
+      if (m) {
+        return `${m[1]}:${mapPerson(m[2])}`;
       }
-      return makeReconKey(kDate, kAmt, anonymizeDesc(kDescFrag), targetTz) + occSuffix;
     }
-
-    const amtKeyParts = strippedKey.match(/^(\d+\.\d{2})_(.*)$/);
-    if (amtKeyParts && type === "TABLE1_CONFIRMED") {
-      const kAmt = parseFloat(amtKeyParts[1]);
-      const kFrag = amtKeyParts[2];
-      const stMatch = anonStmtByDateAmt.find(it =>
-        Math.abs(it.amt - kAmt) <= 0.02 && it.origNorm.substring(0, 20) === kFrag
-      );
-      const repDesc = stMatch ? stMatch.anonDesc : anonymizeDesc(kFrag);
-      return `${kAmt.toFixed(2)}_${makeNormDesc(repDesc).substring(0, 20)}`;
-    }
-
-    return pKey;
+    return s;
   }
 
-  const reconStoreRows = storeRaw.map(r => {
+  const anonDecisions = decRaw.map(r => {
     const type = String(r[0] || "").trim();
-    const origKey = String(r[1] || "").trim();
-    const dStr = String(r[2] || "").trim();
-    const origDesc = String(r[3] || "").trim();
-    const amt = round2_(parseFloat(r[4]) || 0);
-    const payerRaw = String(r[5] || "").trim();
-    const isConfirmed = r[7] === true || String(r[7]).toUpperCase() === "TRUE";
-    const isNeglected = r[8] === true || String(r[8]).toUpperCase() === "TRUE";
-    const updatedAt = String(r[9] || "").trim();
+    const subjId = String(r[1] || "").trim();
+    const target = String(r[2] || "").trim();
+    const source = String(r[4] || "user").trim();
+    const locked = r[5] === true || String(r[5]).toUpperCase() === "TRUE";
+    const updatedAt = String(r[6] || "").trim();
 
-    if (type === "CYCLE_PAYMENT") {
-      return [type, origKey, dStr, origDesc, amt, payerRaw, "[]", isConfirmed, false, updatedAt];
+    if (type === "META_MIGRATION" || type === "META_COUNTER") {
+      return [type, subjId, target, "", source, locked, updatedAt];
     }
-    const anonDesc = anonymizeDesc(origDesc);
-    const anonKey = anonymizeReconStoreKey(type, origKey, dStr, amt, origDesc, anonDesc);
-    const anonPayer = mapPayerField(payerRaw);
-    return [type, anonKey, dStr, anonDesc, amt, anonPayer, "", isConfirmed, isNeglected, updatedAt];
+    if (type === "CYCLE_PAYMENT") {
+      return [type, subjId, target, "[]", source, locked, updatedAt];
+    }
+    if (type === "STMT_MATCH") {
+      return [type, subjId, target, "", source, locked, updatedAt];
+    }
+    const anonSubj = anonymizeDecisionSubjectId(type, subjId);
+    const anonTarget = (type === "TX_NEGLECT") ? target : mapPayerField(target);
+    return [type, anonSubj, anonTarget, "", source, locked, updatedAt];
   });
 
   let paymentDate = "";
@@ -4086,7 +3638,7 @@ function buildAnonymizedFixture(ss, tz) {
   });
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     cycleKey: ledger.activeCycleKey,
     cycleLabel: ledger.activeCycleLabel,
     timeZone: targetTz,
@@ -4105,9 +3657,13 @@ function buildAnonymizedFixture(ss, tz) {
       },
       rows: bankRows
     },
+    statementIds: idInfo.stmt.ids || [],
     transactions: txRows,
+    transactionIds: idInfo.tx.ids || [],
     installments: instRows,
-    reconStore: reconStoreRows,
+    installmentIds: idInfo.inst.ids || [],
+    decisions: anonDecisions,
+    reconStore: [],
     paymentDate: paymentDate,
     expectedTotals: {
       closingBill: round2_(ledger.closingBill),
@@ -4137,7 +3693,7 @@ function menuExportAnonymizedFixture() {
       `Link: ${file.getUrl()}\n\n` +
       `Rows exported: ${fixture.bankStatement.rows.length} statement, ` +
       `${fixture.transactions.length} transactions, ${fixture.installments.length} installments, ` +
-      `${fixture.reconStore.length} store entries.\n` +
+      `${fixture.decisions.length} decision entries.\n` +
       `All member names, merchant names, card numbers, and custom notes have been anonymized.`,
       ui.ButtonSet.OK
     );

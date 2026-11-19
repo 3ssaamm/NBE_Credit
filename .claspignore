@@ -1,3 +1,5 @@
 **/**
 !appsscript.json
 !Code.js
+!src/
+!src/*.js
