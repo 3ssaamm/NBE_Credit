@@ -34,7 +34,7 @@
   "transactions": [
     [1, "2026-09-30", "MERCH12", "P2", 1320],
     [2, "2026-10-02", "MERCH01", "P2", 1447.8],
-    [3, "2026-10-04", "MERCH03", "P3", 80],
+    [3, "2026-10-04", "MERCH02", "P3", 80],
     [4, "2026-10-08", "MERCH04", "P2", 333.1],
     [5, "2026-10-08", "MERCH04", "P4", 200],
     [6, "2026-10-08", "MERCH04", "P5", 200],
@@ -58,19 +58,19 @@
   "paymentDate": "",
   "expectedTotals": {
     "closingBill": 3189.22,
-    "purchasesTotal": 2510.9,
+    "purchasesTotal": 2360.9,
     "installmentsTotal": 317.33,
     "feesTotal": 41.01,
     "unrecordedTotal": 519.98,
     "refundsTotal": 50,
-    "familySharesTotal": 3339.22,
-    "auditDifference": 150
+    "familySharesTotal": 3189.22,
+    "auditDifference": 0
   },
   "expectedShares": {
     "P1": { "purchases": 0, "installments": 61.5, "fees": 41.01, "unrecorded": 80, "refunds": 0, "netTotal": 182.51 },
     "P2": { "purchases": 1780.9, "installments": 255.83, "fees": 0, "unrecorded": 259.99, "refunds": 50, "netTotal": 2246.72 },
     "P3": { "purchases": 180, "installments": 0, "fees": 0, "unrecorded": 179.99, "refunds": 0, "netTotal": 359.99 },
     "P4": { "purchases": 200, "installments": 0, "fees": 0, "unrecorded": 0, "refunds": 0, "netTotal": 200 },
-    "P5": { "purchases": 350, "installments": 0, "fees": 0, "unrecorded": 0, "refunds": 0, "netTotal": 350 }
+    "P5": { "purchases": 200, "installments": 0, "fees": 0, "unrecorded": 0, "refunds": 0, "netTotal": 200 }
   }
 }

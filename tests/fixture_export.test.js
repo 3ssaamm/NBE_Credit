@@ -59,8 +59,18 @@ storeSheet.getRange(2, 1, 7, 10).setValues([
   ["TABLE3_NEGLECTED", "2026-09-30_1320.00_old fawry_#1", "", "", 0, "", "", false, true, "2026-11-17"]
 ]);
 
+const decSheet = sandbox.getDecisionsSheet(ss);
+decSheet.getRange(2, 1, 1, 7).setValues([
+  ["MERCHANT_ALIAS", "bazlykwa", "basilico", "Learned from S-00001", "user", true, "2026-11-19 20:00:00"]
+]);
+
 const fixture = sandbox.buildAnonymizedFixture(ss, tz);
 const serialized = JSON.stringify(fixture);
+
+assert.ok(
+  fixture.decisions.some(d => d[0] === "MERCHANT_ALIAS" && !String(d[1]).includes("bazlykwa") && !String(d[2]).includes("basilico")),
+  "MERCHANT_ALIAS must be anonymized inside exported fixture decisions"
+);
 
 // 1. Strict Privacy / Anonymization Assertions
 const forbiddenTokens = [

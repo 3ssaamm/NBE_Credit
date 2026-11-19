@@ -178,20 +178,22 @@ const recon4 = sandbox.reconcileActiveStatement(ss, tz);
 const ledger4 = sandbox.buildDebtLedger(ss, tz, recon4);
 sandbox.renderActiveReconciliationSheet(ss, tz, ledger4, recon4);
 
-let txRowsCount = 0;
+let orphanRowsCount = 0;
 let instRowsCount = 0;
 let startInst4 = -1, endInst4 = -1;
 for (let r = 1; r <= reconSheet.getLastRow(); r++) {
   const id = String(reconSheet._getCell(r, 1) || "");
-  if (/^TX-/i.test(id)) txRowsCount++;
+  if (/^ORPH-/i.test(id)) orphanRowsCount++;
   if (/^INST-\d+/i.test(id)) {
     if (startInst4 === -1) startInst4 = r;
     endInst4 = r;
     instRowsCount++;
   }
 }
-assert.strictEqual(txRowsCount, 1, "Table 3 must have 1 row");
+assert.strictEqual(orphanRowsCount, 1, "Orphan Logs panel must have 1 row");
 assert.strictEqual(instRowsCount, 17, `Table 4 must have 17 rows (14 + 3 Shared Gym), got ${instRowsCount}`);
+const mido4 = ledger4.personShares.find(ps => ps.person === "Mido");
+assert.strictEqual(Number(mido4.purchases.toFixed(2)), 0.00, "Unpaired in-period orphan log must NOT be billed on current statement (Q5c)");
 
 const gymItems = recon4.installmentReconItems.filter(it => it.desc.includes("Shared Gym"));
 assert.strictEqual(gymItems.length, 3);
@@ -334,7 +336,7 @@ stmt6.getRange(2, 1, 3, 6).setValues([
   ["Opening Balance:", 0, "Closing Balance:", 9000.00, "Total Debit:", 9000.00],
   ["Total Credit:", 0, "Card Number:", "1234", "Net:", 9000.00]
 ]);
-stmt6.getRange(7, 1, 13, 7).setValues([
+stmt6.getRange(7, 1, 23, 7).setValues([
   [1, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "KETTLE 10 OF 12", "INSTALLMENT", 123.00, ""],
   [2, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "HAIR DRYER 10 OF 12", "INSTALLMENT", 45.76, ""],
   [3, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "HAND WREST 10 OF 12", "INSTALLMENT", 8.33, ""],
@@ -347,7 +349,17 @@ stmt6.getRange(7, 1, 13, 7).setValues([
   [10, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "CREATINE 3 OF 6", "INSTALLMENT", 252.45, ""],
   [11, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "POWER BANK 2 OF 6", "INSTALLMENT", 174.07, ""],
   [12, new Date(2026, 9, 30, 12, 0, 0), new Date(2026, 9, 30, 12, 0, 0), "FAN 1 OF 6", "INSTALLMENT", 248.81, ""],
-  [13, new Date(2026, 9, 23, 12, 0, 0), new Date(2026, 9, 23, 12, 0, 0), "Google One 650-2530000 USACA", "DEBIT", 179.99, ""]
+  [13, new Date(2026, 9, 23, 12, 0, 0), new Date(2026, 9, 23, 12, 0, 0), "Google One 650-2530000 USACA", "DEBIT", 179.99, ""],
+  [14, new Date(2026, 8, 30, 12, 0, 0), new Date(2026, 8, 30, 12, 0, 0), "FAWRY ROLLOVER", "DEBIT", 1320.00, ""],
+  [15, new Date(2026, 9, 2, 12, 0, 0), new Date(2026, 9, 2, 12, 0, 0), "FAWRY*BAZLYKWA", "DEBIT", 1447.80, ""],
+  [16, new Date(2026, 9, 3, 12, 0, 0), new Date(2026, 9, 3, 12, 0, 0), "WAVE STORE", "DEBIT", 570.00, ""],
+  [17, new Date(2026, 9, 3, 12, 0, 0), new Date(2026, 9, 3, 12, 0, 0), "FAWRY STORE", "DEBIT", 2316.00, ""],
+  [18, new Date(2026, 9, 6, 12, 0, 0), new Date(2026, 9, 6, 12, 0, 0), "MOSAAB CAFE", "DEBIT", 80.00, ""],
+  [19, new Date(2026, 9, 8, 12, 0, 0), new Date(2026, 9, 8, 12, 0, 0), "AMAZON", "DEBIT", 333.10, ""],
+  [20, new Date(2026, 9, 14, 12, 0, 0), new Date(2026, 9, 14, 12, 0, 0), "WE-FBB INTERNET", "DEBIT", 367.00, ""],
+  [21, new Date(2026, 9, 23, 12, 0, 0), new Date(2026, 9, 23, 12, 0, 0), "AMAZON", "DEBIT", 164.99, ""],
+  [22, new Date(2026, 9, 29, 12, 0, 0), new Date(2026, 9, 29, 12, 0, 0), "EL ABD PASTRY", "DEBIT", 250.00, ""],
+  [23, new Date(2026, 9, 20, 12, 0, 0), new Date(2026, 9, 20, 12, 0, 0), "VIA CAFFE", "DEBIT", 97.00, ""]
 ]);
 
 const inst6 = ss6.insertSheet(CONFIG.SHEETS.INSTALLMENTS);
@@ -382,7 +394,7 @@ inst6.getRange(23, 1, 2, 11).setValues([
 
 const tx6 = ss6.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
 tx6.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
-tx6.getRange(2, 1, 10, 5).setValues([
+tx6.getRange(2, 1, 11, 5).setValues([
   [302, new Date(2026, 8, 30, 0, 0, 0), "Sep 30 Rollover", "Mido", 1320.00],
   [304, new Date(2026, 9, 2, 0, 0, 0), "Basilico", "Mido", 1447.80],
   [305, new Date(2026, 9, 3, 0, 0, 0), "Wave", "Mido", 570.00],
@@ -392,7 +404,8 @@ tx6.getRange(2, 1, 10, 5).setValues([
   [320, new Date(2026, 9, 14, 0, 0, 0), "We Internet", "Mido", 367.00],
   [328, new Date(2026, 9, 23, 0, 0, 0), "Amazon", "Mido", 164.99],
   [330, new Date(2026, 9, 29, 0, 0, 0), "ElAbd", "Mido", 250.00],
-  [332, new Date(2026, 9, 20, 0, 0, 0), "Via caffe", "Mido", 97.00]
+  [332, new Date(2026, 9, 20, 0, 0, 0), "Via caffe", "Mido", 97.00],
+  [399, new Date(2026, 9, 25, 0, 0, 0), "Orphan Snack", "Dad", 50.00]
 ]);
 
 const recon6 = sandbox.reconcileActiveStatement(ss6, tz);
@@ -400,6 +413,8 @@ const ledger6 = sandbox.buildDebtLedger(ss6, tz, recon6);
 const midoShare6 = ledger6.personShares.find(ps => ps.person === "Mido");
 assert.strictEqual(Number(midoShare6.purchases.toFixed(2)), 6945.89, `Mido purchases must equal 6945.89, got ${midoShare6.purchases}`);
 assert.strictEqual(Number(midoShare6.installments.toFixed(2)), 1484.61, `Mido installments must equal exact 1484.61, got ${midoShare6.installments}`);
+assert.strictEqual(recon6.orphanLogs.length, 1, "Dad's unpaired snack must be in orphanLogs with 0 billed");
+assert.strictEqual(Number(ledger6.personShares.find(ps => ps.person === "Dad").purchases.toFixed(2)), 0.00);
 
 const cycleRange6 = sandbox.getCycleDateRange("2026-11", tz);
 const midnightSep30 = new Date(2026, 8, 30, 0, 0, 0);
@@ -415,9 +430,11 @@ assert.ok(
   purchFormula6.startsWith("=VSTACK(") &&
   purchFormula6.includes("ARRAYFORMULA(") &&
   purchFormula6.includes("<($Z$2+1)") &&
+  purchFormula6.includes("COUNTIFS(") &&
+  !purchFormula6.includes('"🚫*"') &&
   purchFormula6.includes("Unrecorded Statement Items, Fees & Refunds") &&
   purchFormula6.includes("Active Bill & Reconciliation"),
-  "A10 must VSTACK Direct Purchases and Active Bill & Reconciliation Table 2 exceptions"
+  "A10 must exclude all Orphan Logs via COUNTIFS without restricting to 🚫* and VSTACK exceptions"
 );
 
 const instFormula6 = String(mbSheet6._getCell(10, 8) || "");
@@ -454,12 +471,31 @@ tx7.getRange(2, 1, 7, 5).setValues([
   [7, new Date(2026, 9, 8, 0, 0, 0), "Amazon", "Muhanad", 100.00]
 ]);
 
-const recon7 = sandbox.reconcileActiveStatement(ss7, tz);
-assert.strictEqual(recon7.missingInSheet.length, 0, `Expected 0 missing in Table 2, got ${recon7.missingInSheet.length}`);
-assert.strictEqual(recon7.expandedUnmatched.length, 0, `Expected 0 unmatched in Table 3, got ${recon7.expandedUnmatched.length}`);
+let recon7 = sandbox.reconcileActiveStatement(ss7, tz);
+// High-confidence pairs auto-match (FAWRY*BAZLYKWA, SAHL, AMAZON split); unknown BASATA PAY <-> rabbit is Suggested only!
+assert.strictEqual(recon7.stmtDebits.filter(st => st.matched).length, 3, "3 merchant-matched statement lines must auto-match");
+assert.strictEqual(recon7.missingInSheet.length, 1, `Expected 1 suggested item in Needs Pairing (BASATA PAY), got ${recon7.missingInSheet.length}`);
+assert.strictEqual(recon7.orphanLogs.length, 1, `Expected 1 unpaired log in Orphan Logs (rabbit 15.00), got ${recon7.orphanLogs.length}`);
+assert.ok(recon7.missingInSheet[0].suggestedPairs && recon7.missingInSheet[0].suggestedPairs.length > 0, "BASATA PAY must surface a suggested pair");
+assert.deepStrictEqual(Array.from(recon7.missingInSheet[0].suggestedPairs[0].txIds), ["T-00003"]);
+
+let ledger7 = sandbox.buildDebtLedger(ss7, tz, recon7);
+sandbox.renderActiveReconciliationSheet(ss7, tz, ledger7, recon7);
+const ar7 = ss7.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+let rM1_7 = -1;
+for (let r = 12; r <= ar7.getLastRow(); r++) {
+  if (ar7._getCell(r, 1) === "M-1") { rM1_7 = r; break; }
+}
+assert.ok(rM1_7 > 0, "Should find M-1 (BASATA PAY) row in Needs Pairing");
+ar7._setCell(rM1_7, 6, recon7.missingInSheet[0].suggestedPairs[0].dropdownLabel);
+sandbox.handleActiveReconEdit({ range: ar7.getRange(rM1_7, 6) });
+
+recon7 = sandbox.reconcileActiveStatement(ss7, tz);
+assert.strictEqual(recon7.missingInSheet.length, 0, "Expected 0 missing in Needs Pairing after 1-click confirmation");
+assert.strictEqual(recon7.orphanLogs.length, 0, "Expected 0 orphans after 1-click confirmation");
 assert.ok(recon7.stmtDebits.every(st => st.matched), "All 4 statement debits must match!");
 
-const ledger7 = sandbox.buildDebtLedger(ss7, tz, recon7);
+ledger7 = sandbox.buildDebtLedger(ss7, tz, recon7);
 const shares7 = {};
 ledger7.personShares.forEach(ps => { shares7[ps.person] = Number(ps.purchases.toFixed(2)); });
 assert.strictEqual(shares7["Mido"], 1780.90, `Mido purchases mismatch: ${shares7["Mido"]}`);
@@ -520,5 +556,7 @@ const maiShare8 = ledger8.personShares.find(ps => ps.person === CONFIG.DEFAULT_F
 assert.strictEqual(Number(midoShare8.refunds.toFixed(2)), 400.00, "Mido should receive C-2 (400.00) credit after refresh");
 assert.strictEqual(Number(maiShare8.refunds.toFixed(2)), 0.00, "Mai should have 0.00 credit after neglecting C-3");
 assert.strictEqual(Number(ledger8.refundsTotal.toFixed(2)), 400.00, "Total refunds should be 400.00");
+assert.strictEqual(Number(ledger8.billPaymentsTotal.toFixed(2)), 1000.00, "Assigned C-2 (400) must NOT double-count in billPaymentsTotal");
+assert.strictEqual(Number(ledger8.carriedOver.toFixed(2)), 0.00, "carriedOver must be Opening (1000) - Neglected payment (1000) = 0.00");
 
 console.log("reconciliation.test.js: all 8 reconciliation assertions passed.");

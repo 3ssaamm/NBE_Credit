@@ -41,6 +41,7 @@ function loadDecisions(ss) {
     stmtMatch: {},
     txNeglect: {},
     instOverride: {},
+    merchantAliases: {},
     paymentRecords: {},
     counters: { S: 0, T: 0, I: 0 },
     isMigrated: false,
@@ -108,6 +109,17 @@ function loadDecisions(ss) {
           source,
           locked,
           isNeglected: isNeglectedPayer(target),
+          updatedAt
+        };
+      } else if (type === "MERCHANT_ALIAS" && subjectId && target) {
+        const stmtKey = subjectId.toLowerCase();
+        const txKey = target.toLowerCase();
+        store.merchantAliases[`${stmtKey}::${txKey}`] = {
+          stmtKey,
+          txKey,
+          note,
+          source,
+          locked: locked || true,
           updatedAt
         };
       } else if (type === "CYCLE_PAYMENT" && subjectId) {
@@ -184,6 +196,12 @@ function saveDecisions(ss, decisions) {
       const o = decisions.instOverride[subjectId];
       if (!o || !o.target) return;
       rows.push(["INST_OVERRIDE", subjectId, o.target, o.note || "", o.source || "user", Boolean(o.locked), o.updatedAt || nowStr]);
+    });
+
+    Object.keys(decisions.merchantAliases || {}).sort().forEach(key => {
+      const a = decisions.merchantAliases[key];
+      if (!a || !a.stmtKey || !a.txKey) return;
+      rows.push(["MERCHANT_ALIAS", a.stmtKey, a.txKey, a.note || "", a.source || "user", a.locked !== false, a.updatedAt || nowStr]);
     });
 
     const lastRow = sheet.getLastRow();
@@ -296,6 +314,69 @@ function clearCyclePayment(decisions, cycleKey) {
     delete decisions.paymentRecords[cycleKey];
     decisions._dirty = true;
   }
+}
+
+function setMerchantAlias(decisions, stmtKey, txKey, note, source) {
+  if (!decisions) return;
+  if (!decisions.merchantAliases) decisions.merchantAliases = {};
+  const k1 = String(stmtKey || "").toLowerCase().trim();
+  const k2 = String(txKey || "").toLowerCase().trim();
+  if (!k1 || !k2 || k1 === k2) return;
+  decisions.merchantAliases[`${k1}::${k2}`] = {
+    stmtKey: k1,
+    txKey: k2,
+    note: note || "",
+    source: source || "user",
+    locked: true,
+    updatedAt: nowCairoTimestamp_()
+  };
+  decisions._dirty = true;
+}
+
+function clearMerchantAlias(decisions, stmtKey, txKey) {
+  if (!decisions || !decisions.merchantAliases) return;
+  const k1 = String(stmtKey || "").toLowerCase().trim();
+  const k2 = String(txKey || "").toLowerCase().trim();
+  const mapKey = `${k1}::${k2}`;
+  if (decisions.merchantAliases[mapKey]) {
+    delete decisions.merchantAliases[mapKey];
+    decisions._dirty = true;
+  }
+}
+
+function lookupTxDescriptionsByIds_(ss, txIds) {
+  if (!ss || !txIds || txIds.length === 0) return [];
+  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+  if (!txSheet || txSheet.getLastRow() < 2) return [];
+  const idCol = findExistingIdColumn(txSheet, 1);
+  if (!idCol) return [];
+  const numRows = txSheet.getLastRow() - 1;
+  const descs = txSheet.getRange(2, 3, numRows, 1).getValues();
+  const ids = txSheet.getRange(2, idCol, numRows, 1).getValues();
+  const byId = {};
+  for (let i = 0; i < numRows; i++) {
+    const id = String(ids[i][0] || "").trim().toUpperCase();
+    if (id) byId[id] = String(descs[i][0] || "").trim();
+  }
+  return txIds.map(tid => byId[String(tid || "").trim().toUpperCase()] || "").filter(Boolean);
+}
+
+function lookupStmtDescriptionById_(ss, stmtId) {
+  if (!ss || !stmtId) return "";
+  const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
+  if (!stmtSheet || stmtSheet.getLastRow() < 7) return "";
+  const idCol = findExistingIdColumn(stmtSheet, 6);
+  if (!idCol) return "";
+  const numRows = stmtSheet.getLastRow() - 6;
+  const descs = stmtSheet.getRange(7, 4, numRows, 1).getValues();
+  const ids = stmtSheet.getRange(7, idCol, numRows, 1).getValues();
+  const targetId = String(stmtId || "").trim().toUpperCase();
+  for (let i = 0; i < numRows; i++) {
+    if (String(ids[i][0] || "").trim().toUpperCase() === targetId) {
+      return String(descs[i][0] || "").trim();
+    }
+  }
+  return "";
 }
 
 function readLegacyReconStoreRaw_(ss) {
@@ -565,23 +646,76 @@ function migrateLegacyPostMatch(ss, tz, decisions, legacy, ctx) {
 }
 
 function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options) {
+  const noChange = { changed: false, needsRefresh: false, toastMsg: "" };
   const opts = options || {};
   const allowDelete = opts.allowDelete === true;
   const forceStyle = opts.forceStyle === true;
   const rowVals = allRows[row - 1];
   const firstCol = String(rowVals[0] || "").trim();
   const subjectId = String(rowVals[8] || "").trim();
-  if (!subjectId) return false;
+  if (!subjectId) return noChange;
 
-  // Case 1: Edit in Table 2 (F-*, C-*, M-*)
+  // Case 1: Edit in Table 2 Needs Pairing (F-*, C-*, M-*)
   if (/^[FCM]-\d+/i.test(firstCol)) {
     const prefix = firstCol.charAt(0).toUpperCase();
     const origDesc = String(rowVals[2] || "").trim();
     const amt = parseFloat(rowVals[3]);
-    if (isNaN(amt) || amt <= 0 || !origDesc) return false;
+    if (isNaN(amt) || amt <= 0 || !origDesc) return noChange;
 
     let payer = String(rowVals[5] || "").trim();
     const note = String(rowVals[6] || "").trim();
+
+    // Handle 1-click pairing selection ("🔗 Pair: T-00332+T-00333 (...)")
+    const pairMatch = payer.match(/^🔗\s*Pair:\s*((?:T-\d+)(?:\s*\+\s*T-\d+)*)/i);
+    if (pairMatch) {
+      const txIds = pairMatch[1].split("+").map(s => s.trim().toUpperCase()).filter(Boolean);
+      if (txIds.length === 0) return noChange;
+
+      const sortedNew = txIds.slice().sort().join(",");
+      const existingMatch = decisions.stmtMatch && decisions.stmtMatch[subjectId];
+      const existingSorted = existingMatch && existingMatch.targetIds
+        ? existingMatch.targetIds.slice().sort().join(",")
+        : "";
+      if (!forceStyle && existingSorted === sortedNew) {
+        return noChange;
+      }
+
+      // Remove any conflicting STMT_MATCH on another statement line claiming any of these txIds
+      Object.keys(decisions.stmtMatch || {}).forEach(otherStmtId => {
+        if (otherStmtId === subjectId) return;
+        const other = decisions.stmtMatch[otherStmtId];
+        if (other && other.targetIds && other.targetIds.some(tid => txIds.includes(tid))) {
+          delete decisions.stmtMatch[otherStmtId];
+          decisions._dirty = true;
+        }
+      });
+
+      setStmtMatch(decisions, subjectId, txIds, note || "Paired by user", "user");
+      clearStmtAssign(decisions, subjectId);
+      Object.keys(decisions.txNeglect || {}).forEach(negSubj => {
+        if (txIds.some(tid => negSubj === tid || negSubj.startsWith(tid + ":"))) {
+          clearTxNeglect(decisions, negSubj);
+        }
+      });
+
+      const ss = sheet.getParent();
+      const txDescs = lookupTxDescriptionsByIds_(ss, txIds);
+      const learned = maybeLearnMerchantAlias(
+        decisions,
+        origDesc,
+        txDescs,
+        "Learned from " + subjectId + " <-> " + txIds.join("+")
+      );
+      if (forceStyle) {
+        try { sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID); } catch (e) { }
+      }
+      return {
+        changed: true,
+        needsRefresh: true,
+        toastMsg: "🔗 Paired " + subjectId + " ↔ " + txIds.join("+") +
+          (learned && learned.learned ? " (learned alias: " + learned.stmtKey + " ↔ " + learned.txKey + ")" : "")
+      };
+    }
 
     if (payer && !isNeglectedPayer(payer)) {
       const cleanPayer = formatPayerCell(payer);
@@ -593,14 +727,14 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
     }
 
     if (!allowDelete) {
-      if (!payer) return false;
+      if (!payer) return noChange;
       const existing = decisions.stmtAssign && decisions.stmtAssign[subjectId];
       if (!existing) {
         if ((prefix === "F" || (prefix === "C" && !isPaymentCreditDesc(origDesc))) && payer === CONFIG.DEFAULT_FEE_PAYER) {
-          return false;
+          return noChange;
         }
         if (prefix === "C" && isPaymentCreditDesc(origDesc) && isNeglectedPayer(payer)) {
-          return false;
+          return noChange;
         }
       }
     }
@@ -610,56 +744,99 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
       const targetVal = isNeg ? "NEGLECT" : payer;
       const existing = decisions.stmtAssign[subjectId];
       if (!forceStyle && existing && existing.target === targetVal && existing.note === note) {
-        return false;
+        return noChange;
       }
       setStmtAssign(decisions, subjectId, targetVal, note, "user");
       if (forceStyle) {
         sheet.getRange(row, 1, 1, 8).setBackground(isNeg ? "#eeeeee" : CONFIG.COLORS.PAID);
       }
-      return true;
+      return { changed: true, needsRefresh: false, toastMsg: "" };
     }
 
     clearStmtAssign(decisions, subjectId);
     if (forceStyle) {
       sheet.getRange(row, 1, 1, 8).setBackground("#ffffff");
     }
-    return true;
+    return { changed: true, needsRefresh: false, toastMsg: "" };
   }
 
-  // Case 2: Edit in Table 3 (TX-*)
-  if (/^TX-/i.test(firstCol)) {
+  // Case 2: Edit in Orphan Logs panel (ORPH-* and legacy TX-*)
+  if (/^(?:ORPH|TX)-/i.test(firstCol)) {
     const actionVal = String(rowVals[5] || "").trim();
-    const isNeg = isNeglectedPayer(actionVal);
+    const orphanPairMatch = actionVal.match(/^🔗\s*Pair(?:\s+with)?:\s*(S-\d+)/i);
+    if (orphanPairMatch) {
+      const stmtId = orphanPairMatch[1].toUpperCase();
+      const baseTxId = subjectId.split(":")[0].toUpperCase();
+      if (!baseTxId) return noChange;
 
-    if (isNeg) {
-      if (!forceStyle && decisions.txNeglect[subjectId]) return false;
-      setTxNeglect(decisions, subjectId, "", "user");
-      if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
-      return true;
+      const existingMatch = decisions.stmtMatch && decisions.stmtMatch[stmtId];
+      if (!forceStyle && existingMatch && existingMatch.targetIds && existingMatch.targetIds.includes(baseTxId)) {
+        return noChange;
+      }
+
+      Object.keys(decisions.stmtMatch || {}).forEach(otherStmtId => {
+        if (otherStmtId === stmtId) return;
+        const other = decisions.stmtMatch[otherStmtId];
+        if (other && other.targetIds && other.targetIds.includes(baseTxId)) {
+          delete decisions.stmtMatch[otherStmtId];
+          decisions._dirty = true;
+        }
+      });
+
+      setStmtMatch(decisions, stmtId, [baseTxId], String(rowVals[6] || "").trim() || "Paired from orphan log", "user");
+      clearStmtAssign(decisions, stmtId);
+      clearTxNeglect(decisions, subjectId);
+
+      const ss = sheet.getParent();
+      const stmtDesc = lookupStmtDescriptionById_(ss, stmtId);
+      const learned = maybeLearnMerchantAlias(
+        decisions,
+        stmtDesc,
+        [String(rowVals[2] || "").trim()],
+        "Learned from " + stmtId + " <-> " + baseTxId
+      );
+      if (forceStyle) {
+        try { sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID); } catch (e) { }
+      }
+      return {
+        changed: true,
+        needsRefresh: true,
+        toastMsg: "🔗 Paired " + stmtId + " ↔ " + baseTxId +
+          (learned && learned.learned ? " (learned alias: " + learned.stmtKey + " ↔ " + learned.txKey + ")" : "")
+      };
     }
 
-    if (!allowDelete) return false;
+    const isNeg = isNeglectedPayer(actionVal);
+    if (isNeg) {
+      if (!forceStyle && decisions.txNeglect[subjectId]) return noChange;
+      setTxNeglect(decisions, subjectId, String(rowVals[6] || "").trim(), "user");
+      if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#eeeeee");
+      return { changed: true, needsRefresh: false, toastMsg: "" };
+    }
+
+    if (!allowDelete) return noChange;
+    const hadNeglect = Boolean(decisions.txNeglect && decisions.txNeglect[subjectId]);
     clearTxNeglect(decisions, subjectId);
-    if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#f8f9fa");
-    return true;
+    if (forceStyle) sheet.getRange(row, 1, 1, 8).setBackground("#fff8e1");
+    return { changed: hadNeglect, needsRefresh: false, toastMsg: "" };
   }
 
   // Case 3: Edit in Table 4 (INST-*)
   if (/^INST-\d+/i.test(firstCol)) {
     const origDesc = String(rowVals[2] || "").trim();
     const amt = parseFloat(rowVals[3]);
-    if (isNaN(amt) || amt <= 0 || !origDesc) return false;
+    if (isNaN(amt) || amt <= 0 || !origDesc) return noChange;
 
     let actionVal = String(rowVals[5] || "").trim();
     const sourceCat = String(rowVals[4] || "").trim();
     const note = String(rowVals[6] || "").trim();
 
     if (!allowDelete) {
-      if (!actionVal) return false;
+      if (!actionVal) return noChange;
       const existing = decisions.instOverride && decisions.instOverride[subjectId];
       if (!existing) {
-        if (sourceCat.includes("Sheet Only") && actionVal === "🚫 Not on Statement (Skip)") return false;
-        if (sourceCat.includes("Matched") && !isNeglectedPayer(actionVal) && /^✅\s*Billed\s+to\s+/i.test(actionVal)) return false;
+        if (sourceCat.includes("Sheet Only") && actionVal === "🚫 Not on Statement (Skip)") return noChange;
+        if (sourceCat.includes("Matched") && !isNeglectedPayer(actionVal) && /^✅\s*Billed\s+to\s+/i.test(actionVal)) return noChange;
       }
     }
 
@@ -676,23 +853,23 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
     if (actionVal) {
       const existing = decisions.instOverride[subjectId];
       if (!forceStyle && existing && existing.target === actionVal && existing.note === note) {
-        return false;
+        return noChange;
       }
       setInstOverride(decisions, subjectId, actionVal, note, "user");
       if (forceStyle) {
         sheet.getRange(row, 1, 1, 8).setBackground(isNeg ? "#eeeeee" : CONFIG.COLORS.PAID);
       }
-      return true;
+      return { changed: true, needsRefresh: false, toastMsg: "" };
     }
 
     clearInstOverride(decisions, subjectId);
     if (forceStyle) {
       sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.DUE_SOON);
     }
-    return true;
+    return { changed: true, needsRefresh: false, toastMsg: "" };
   }
 
-  return false;
+  return noChange;
 }
 
 function syncActiveReconSheetToDecisions(ss, tz) {
@@ -710,7 +887,8 @@ function syncActiveReconSheetToDecisions(ss, tz) {
   let changed = false;
 
   for (let row = 12; row <= lastR; row++) {
-    if (processActiveReconRowChange(sheet, allRows, row, decisions, tz, { allowDelete: false, forceStyle: false })) {
+    const res = processActiveReconRowChange(sheet, allRows, row, decisions, tz, { allowDelete: false, forceStyle: false });
+    if (res && res.changed) {
       changed = true;
     }
   }

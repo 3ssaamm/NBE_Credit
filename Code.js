@@ -1473,8 +1473,9 @@ function reconcileActiveStatement(ss, tz) {
   const cardBal = calculateCardBalance(ss, tz);
   const stmtPeriod = cardBal.stmtPeriod || getStatementPeriod(cardBal.statementDate, minStmtTxDate, maxStmtTxDate);
 
-  // 2. Read Transactions Sheet
+  // 2. Read Transactions Sheet (Columns A:E only — never mutate user columns)
   const txDebits = [];
+  const pendingNextTx = [];
   if (txSheet && txSheet.getLastRow() >= 2) {
     const txData = txSheet.getRange(2, 1, txSheet.getLastRow() - 1, 5).getValues();
     txData.forEach((row, idx) => {
@@ -1486,17 +1487,28 @@ function reconcileActiveStatement(ss, tz) {
         const cycle = getBillingCycleForPurchase(pDate, tz);
         const belongsToCycle = (cycle && cycle.cycleSortKey === cardBal.activeCycleKey) ||
                                (!cycle && stmtPeriod.start && stmtPeriod.end && pDate >= stmtPeriod.start && pDate <= stmtPeriod.end);
-        if (!belongsToCycle) return;
-
-        txDebits.push({
-          txId: (idInfo.tx.ids && idInfo.tx.ids[idx]) || "",
-          rowNum: idx + 2,
-          date: pDate,
-          desc: desc,
-          person: person,
-          amount: amt,
-          matched: false
-        });
+        if (belongsToCycle) {
+          txDebits.push({
+            txId: (idInfo.tx.ids && idInfo.tx.ids[idx]) || "",
+            rowNum: idx + 2,
+            date: pDate,
+            desc: desc,
+            person: person,
+            amount: amt,
+            matched: false
+          });
+        } else if (cycle && cardBal.activeCycleKey && cycle.cycleSortKey > cardBal.activeCycleKey) {
+          pendingNextTx.push({
+            txId: (idInfo.tx.ids && idInfo.tx.ids[idx]) || "",
+            rowNum: idx + 2,
+            date: pDate,
+            desc: desc,
+            person: person,
+            amount: amt,
+            cycleSortKey: cycle.cycleSortKey,
+            cycleLabel: cycle.cycleLabel
+          });
+        }
       }
     });
   }
@@ -1644,99 +1656,18 @@ function reconcileActiveStatement(ss, tz) {
 
   const installmentReconItems = [...unmatchedStmtItems, ...unmatchedSheetItems, ...matchedInstItems];
 
-  // 5. Multi-Pass Matching for Purchases (DEBIT)
-  function daysBetween(d1, d2) {
-    if (!d1 || !d2) return 0;
-    return Math.abs((d1.getTime() - d2.getTime()) / (1000 * 60 * 60 * 24));
-  }
+  // 5. Confidence-Tiered Matching for Purchases (DEBIT)
+  const matchResult = matchStatementDebits(stmtDebits, txDebits, decisions, tz);
+  const suggestedMatches = matchResult.suggestedMatches || [];
 
-  function markStatementMatched(st, items) {
-    st.matched = true;
-    st.matchedItems = items;
-    items.forEach(tx => { tx.matched = true; });
-    st.assignedPayer = [...new Set(items.map(tx => tx.person))].join(" + ");
-  }
+  const suggestedSet = new Set(suggestedMatches);
+  const unmatchedDebits = stmtDebits.filter(st => !st.matched);
+  const missingInSheet = [
+    ...unmatchedDebits.filter(st => suggestedSet.has(st)),
+    ...unmatchedDebits.filter(st => !suggestedSet.has(st))
+  ];
 
-  function isDedicatedUnrecordedMerchant(desc) {
-    const d = String(desc || "").toLowerCase();
-    return d.includes("nutopia") || d.includes("sutherland") || d.includes("google one") || d.includes("stamp tax") || d.includes("unr_");
-  }
-
-  function runSubsetSplitPass(requireKeywordOverlap) {
-    stmtDebits.forEach(st => {
-      if (st.matched) return;
-      if (!requireKeywordOverlap && isDedicatedUnrecordedMerchant(st.desc)) return;
-      const nearby = txDebits.filter(tx => {
-        if (tx.matched) return false;
-        if (st.date && tx.date && daysBetween(st.date, tx.date) > 5) return false;
-        return !requireKeywordOverlap || hasMerchantKeywordOverlap(st.desc, tx.desc);
-      });
-      if (nearby.length < 2) return;
-      const combo = findSubsetCombination(nearby, st.amount, 6, 0.10);
-      if (combo) {
-        markStatementMatched(st, combo);
-      }
-    });
-  }
-
-  // Pass 0: Locked Explicit Matches by ID from _Decisions
-  stmtDebits.forEach(st => {
-    if (st.matched || !st.stmtId) return;
-    const savedMatch = decisions.stmtMatch && decisions.stmtMatch[st.stmtId];
-    if (!savedMatch || !savedMatch.targetIds || savedMatch.targetIds.length === 0) return;
-    const matchedTxs = savedMatch.targetIds
-      .map(tid => txDebits.find(tx => tx.txId === tid && !tx.matched))
-      .filter(Boolean);
-    if (matchedTxs.length === savedMatch.targetIds.length) {
-      markStatementMatched(st, matchedTxs);
-    }
-  });
-
-  // Pass 1: Strict 1-to-1 Match (Amount within 0.05, Date within 5 days, Keyword Overlap)
-  stmtDebits.forEach(st => {
-    if (st.matched) return;
-    const candidates = txDebits.filter(tx => {
-      if (tx.matched) return false;
-      if (Math.abs(tx.amount - st.amount) > 0.05) return false;
-      if (st.date && tx.date && daysBetween(st.date, tx.date) > 5) return false;
-      return hasMerchantKeywordOverlap(st.desc, tx.desc);
-    });
-
-    if (candidates.length > 0) {
-      candidates.sort((a, b) => daysBetween(st.date, a.date) - daysBetween(st.date, b.date));
-      markStatementMatched(st, [candidates[0]]);
-    }
-  });
-
-  // Pass 2a: N-way Split Match with Keyword Overlap (e.g. multi-person Amazon order)
-  runSubsetSplitPass(true);
-
-  // Pass 2b: 1-to-1 Exact Amount (<= 0.05) + Date (<= 5 days) sorted globally by smallest date diff
-  const pairCandidates = [];
-  stmtDebits.forEach(st => {
-    if (st.matched || isDedicatedUnrecordedMerchant(st.desc)) return;
-    txDebits.forEach(tx => {
-      if (tx.matched) return;
-      if (Math.abs(tx.amount - st.amount) > 0.05) return;
-      const diff = (st.date && tx.date) ? daysBetween(st.date, tx.date) : 0;
-      if (st.date && tx.date && diff > 5) return;
-      pairCandidates.push({ st, tx, diff });
-    });
-  });
-  pairCandidates.sort((a, b) => a.diff - b.diff);
-  pairCandidates.forEach(pair => {
-    if (!pair.st.matched && !pair.tx.matched) {
-      markStatementMatched(pair.st, [pair.tx]);
-    }
-  });
-
-  // Pass 2c: N-way Split Match by Amount + Date (<= 5 days) across different POS names
-  runSubsetSplitPass(false);
-
-  const suggestedMatches = [];
-  const missingInSheet = stmtDebits.filter(st => !st.matched);
-
-  // Prune Table 2 assignment overrides only for the exact matched statement ID
+  // Prune Table 2 assignment overrides only for matched statement IDs
   stmtDebits.forEach(st => {
     if (st.matched && st.stmtId && decisions.stmtAssign[st.stmtId]) {
       clearStmtAssign(decisions, st.stmtId);
@@ -1745,19 +1676,20 @@ function reconcileActiveStatement(ss, tz) {
 
   const unmatchedTx = txDebits.filter(tx => !tx.matched);
 
-  // Expand unmatched sheet transactions (including split items) for transparent attribution
-  const expandedUnmatched = [];
+  // Build Orphan Logs (in-period transactions without a paired bank line — NOT billed on current statement)
+  const orphanLogs = [];
   const txOccTracker = {};
   unmatchedTx.forEach((tx, idx) => {
     const payers = splitPayerNames(tx.person);
+    const baseHints = tx.suggestedStmts || [];
     if (payers.length <= 1) {
       const p = payers[0] || tx.person;
-      const exId = `TX-${idx + 1}`;
+      const exId = `ORPH-${idx + 1}`;
       const baseKey = makeReconKey(tx.date, tx.amount, tx.desc, tz);
       txOccTracker[baseKey] = (txOccTracker[baseKey] || 0) + 1;
       const occ = txOccTracker[baseKey];
       const pKeyWithOcc = `${baseKey}_#${occ}`;
-      expandedUnmatched.push({
+      orphanLogs.push({
         id: exId,
         subjectId: buildTxSubjectId(tx.txId, p, 1),
         txId: tx.txId,
@@ -1766,18 +1698,19 @@ function reconcileActiveStatement(ss, tz) {
         amount: tx.amount,
         person: p,
         isNeglected: false,
-        _legacyKeys: [pKeyWithOcc, occ === 1 ? baseKey : null, exId].filter(Boolean)
+        suggestedStmts: baseHints,
+        _legacyKeys: [pKeyWithOcc, occ === 1 ? baseKey : null, `TX-${idx + 1}`, exId].filter(Boolean)
       });
     } else {
       const splitAmt = tx.amount / payers.length;
       const legacyWholeKey = makeReconKey(tx.date, tx.amount, tx.desc, tz);
       payers.forEach((p, pIdx) => {
-        const exId = `TX-${idx + 1}.${pIdx + 1}`;
+        const exId = `ORPH-${idx + 1}.${pIdx + 1}`;
         const baseKey = makeReconKey(tx.date, splitAmt, tx.desc, tz);
         txOccTracker[baseKey] = (txOccTracker[baseKey] || 0) + 1;
         const occ = txOccTracker[baseKey];
         const pKeyWithOcc = `${baseKey}_#${occ}`;
-        expandedUnmatched.push({
+        orphanLogs.push({
           id: exId,
           subjectId: buildTxSubjectId(tx.txId, p, payers.length),
           txId: tx.txId,
@@ -1786,11 +1719,43 @@ function reconcileActiveStatement(ss, tz) {
           amount: splitAmt,
           person: p,
           isNeglected: false,
-          _legacyKeys: [pKeyWithOcc, occ === 1 ? baseKey : null, `${legacyWholeKey}_#${pIdx + 1}`, exId].filter(Boolean)
+          suggestedStmts: baseHints,
+          _legacyKeys: [pKeyWithOcc, occ === 1 ? baseKey : null, `${legacyWholeKey}_#${pIdx + 1}`, `TX-${idx + 1}.${pIdx + 1}`, exId].filter(Boolean)
         });
       });
     }
   });
+
+  const pendingNextItems = [];
+  pendingNextTx.forEach((tx, idx) => {
+    const payers = splitPayerNames(tx.person);
+    if (payers.length <= 1) {
+      pendingNextItems.push({
+        id: `PEND-${idx + 1}`,
+        txId: tx.txId,
+        date: tx.date,
+        desc: tx.desc,
+        amount: tx.amount,
+        person: payers[0] || tx.person,
+        cycleLabel: tx.cycleLabel || ""
+      });
+    } else {
+      const splitAmt = tx.amount / payers.length;
+      payers.forEach((p, pIdx) => {
+        pendingNextItems.push({
+          id: `PEND-${idx + 1}.${pIdx + 1}`,
+          txId: tx.txId,
+          date: tx.date,
+          desc: `${tx.desc} (Split ${pIdx + 1}/${payers.length})`,
+          amount: splitAmt,
+          person: p,
+          cycleLabel: tx.cycleLabel || ""
+        });
+      });
+    }
+  });
+
+  const expandedUnmatched = orphanLogs;
 
   // Stage 2 one-time migration from legacy _Recon_Store (Table 2, Table 3, Table 4)
   if (legacyMigrationCtx && !decisions.isMigrated) {
@@ -1855,8 +1820,8 @@ function reconcileActiveStatement(ss, tz) {
       : "Merchant Refund (Reduces Debt)"
   });
 
-  // Apply Table 3 Neglect Decisions purely by permanent SubjectId
-  expandedUnmatched.forEach(tx => {
+  // Apply Orphan Log dismiss decisions purely by permanent SubjectId
+  orphanLogs.forEach(tx => {
     tx.isNeglected = Boolean(tx.subjectId && decisions.txNeglect && decisions.txNeglect[tx.subjectId]);
     delete tx._legacyKeys;
   });
@@ -1875,7 +1840,9 @@ function reconcileActiveStatement(ss, tz) {
     missingInSheet,
     txDebits,
     unmatchedTx,
+    orphanLogs,
     expandedUnmatched,
+    pendingNextItems,
     cardBal,
     decisions,
     reconStore: decisions,
@@ -1961,17 +1928,20 @@ function buildDebtLedger(ss, tz, recon) {
     }
   });
 
-  // 1b. Attributed Unmatched Purchases (From Transactions sheet - billed to family members by default!)
-  (recon.expandedUnmatched || []).forEach(tx => {
-    if (!tx.isNeglected && tx.person && !isNeglectedPayer(tx.person)) {
-      addShare(tx.person, tx.amount, "UnmatchedPurchase");
-    }
-  });
+  // Note (Q5c/Q13): In-period unpaired Orphan Logs are NOT billed on top of the bank statement;
+  // purchases only count once paired with a statement line or assigned in Needs Pairing.
 
   // 2. Attributed Installments (From Table 4 Installment Reconciliation Items)
+  let unresolvedInstCount = 0;
+  let unresolvedInstTotal = 0;
   (recon.installmentReconItems || []).forEach(inst => {
     const act = String(inst.action || "").trim();
-    if (!act || isNeglectedPayer(act)) return;
+    if (!act) {
+      unresolvedInstCount++;
+      unresolvedInstTotal += (parseFloat(inst.amount) || 0);
+      return;
+    }
+    if (isNeglectedPayer(act)) return;
     const cleanPayer = act.replace(/^✅\s*Billed\s+to\s+/i, "").trim();
     if (cleanPayer && !isNeglectedPayer(cleanPayer)) {
       addShare(cleanPayer, inst.amount, "Installment");
@@ -1979,18 +1949,26 @@ function buildDebtLedger(ss, tz, recon) {
   });
 
   // 3. Attributed Fees (Default: Mai or overridden)
-  recon.stmtFees.forEach(fee => {
-    if (fee.assignedPayer && !isNeglectedPayer(fee.assignedPayer)) {
-      addShare(fee.assignedPayer, fee.amount, "Fee");
-    }
-  });
-
-  // 4. Attributed Unrecorded Missing Statement Debits
   let neglectedTotal = 0;
   let neglectedCount = 0;
   let unassignedTotal = 0;
   let unassignedCount = 0;
+  let unresolvedFeesCount = 0;
+  let unresolvedFeesTotal = 0;
 
+  recon.stmtFees.forEach(fee => {
+    if (isNeglectedPayer(fee.assignedPayer)) {
+      neglectedTotal += fee.amount;
+      neglectedCount++;
+    } else if (fee.assignedPayer) {
+      addShare(fee.assignedPayer, fee.amount, "Fee");
+    } else {
+      unresolvedFeesCount++;
+      unresolvedFeesTotal += fee.amount;
+    }
+  });
+
+  // 4. Attributed Unrecorded Missing Statement Debits
   recon.missingInSheet.forEach(m => {
     if (isNeglectedPayer(m.assignedPayer)) {
       neglectedTotal += m.amount;
@@ -2003,13 +1981,18 @@ function buildDebtLedger(ss, tz, recon) {
     }
   });
 
-  // 5. Attributed Refunds / Credits
+  // 5. Attributed Refunds / Credits (only count neglected bill payments in carriedOver so assigned credits aren't double-counted)
   let billPaymentsTotal = 0;
+  let unresolvedCreditsCount = 0;
+  let unresolvedCreditsTotal = 0;
   recon.stmtCredits.forEach(cr => {
-    if (isPaymentCreditDesc(cr.desc)) {
+    if (isPaymentCreditDesc(cr.desc) && isNeglectedPayer(cr.assignedPayer)) {
       billPaymentsTotal += cr.amount;
     }
-    if (cr.assignedPayer && !isNeglectedPayer(cr.assignedPayer)) {
+    if (!cr.assignedPayer) {
+      unresolvedCreditsCount++;
+      unresolvedCreditsTotal += cr.amount;
+    } else if (!isNeglectedPayer(cr.assignedPayer)) {
       addShare(cr.assignedPayer, cr.amount, "Refund");
     }
   });
@@ -2030,6 +2013,26 @@ function buildDebtLedger(ss, tz, recon) {
     refundsTotal += ps.refunds;
     familySharesTotal += ps.netTotal;
   });
+
+  const orphanList = recon.orphanLogs || recon.expandedUnmatched || [];
+  let orphanActiveCount = 0;
+  let orphanActiveTotal = 0;
+  let orphanTotal = 0;
+  orphanList.forEach(o => {
+    const amt = parseFloat(o.amount) || 0;
+    orphanTotal += amt;
+    if (!o.isNeglected) {
+      orphanActiveCount++;
+      orphanActiveTotal += amt;
+    }
+  });
+
+  const pendingList = recon.pendingNextItems || [];
+  const pendingCount = pendingList.length;
+  const pendingTotal = pendingList.reduce((s, p) => s + (parseFloat(p.amount) || 0), 0);
+
+  const unresolvedCount = unassignedCount + unresolvedFeesCount + unresolvedCreditsCount + unresolvedInstCount;
+  const unresolvedTotal = unassignedTotal + unresolvedFeesTotal - unresolvedCreditsTotal + unresolvedInstTotal;
 
   const closingBill = cardBal.billedBalance || 0;
   const openingBalance = cardBal.openingBalance || 0;
@@ -2053,6 +2056,19 @@ function buildDebtLedger(ss, tz, recon) {
     neglectedCount,
     unassignedTotal,
     unassignedCount,
+    unresolvedFeesCount,
+    unresolvedFeesTotal,
+    unresolvedCreditsCount,
+    unresolvedCreditsTotal,
+    unresolvedInstCount,
+    unresolvedInstTotal,
+    unresolvedCount,
+    unresolvedTotal,
+    orphanActiveCount,
+    orphanActiveTotal,
+    orphanTotal,
+    pendingCount,
+    pendingTotal,
     refundsTotal,
     familySharesTotal,
     auditDifference,
@@ -2087,24 +2103,34 @@ function getReconTableBounds(ledger, recon) {
   const startExRow = startExHeaderRow + 2;
   const endExRow = startExRow + Math.max(1, numExceptions) - 1;
 
-  const numUnmatched = (recon.expandedUnmatched || []).length;
-  const hasTable3 = numUnmatched > 0;
-  const startTxHeaderRow = endExRow + 3;
-  const startTxRow = startTxHeaderRow + 2;
-  const endTxRow = startTxRow + Math.max(1, numUnmatched) - 1;
+  const numOrphans = (recon.orphanLogs || recon.expandedUnmatched || []).length;
+  const hasOrphanTable = numOrphans > 0;
+  const startOrphanHeaderRow = endExRow + 3;
+  const startOrphanRow = startOrphanHeaderRow + 2;
+  const endOrphanRow = startOrphanRow + Math.max(1, numOrphans) - 1;
 
   const numInstRecon = (recon.installmentReconItems || []).length;
   const hasTable4 = numInstRecon > 0;
-  const prevEndRow = hasTable3 ? endTxRow : endExRow;
-  const startInstHeaderRow = prevEndRow + 3;
+  const prevEndBeforeInst = hasOrphanTable ? endOrphanRow : endExRow;
+  const startInstHeaderRow = prevEndBeforeInst + 3;
   const startInstRow = startInstHeaderRow + 2;
   const endInstRow = startInstRow + Math.max(1, numInstRecon) - 1;
+
+  const numPending = (recon.pendingNextItems || []).length;
+  const hasPendingTable = numPending > 0;
+  const prevEndBeforePending = hasTable4 ? endInstRow : prevEndBeforeInst;
+  const startPendingHeaderRow = prevEndBeforePending + 3;
+  const startPendingRow = startPendingHeaderRow + 2;
+  const endPendingRow = startPendingRow + Math.max(1, numPending) - 1;
 
   return {
     numPayers, startShareRow, endShareRow, totShareRow,
     numExceptions, startExHeaderRow, startExRow, endExRow,
-    numUnmatched, hasTable3, startTxHeaderRow, startTxRow, endTxRow,
-    numInstRecon, hasTable4, startInstHeaderRow, startInstRow, endInstRow
+    numOrphans, hasOrphanTable, startOrphanHeaderRow, startOrphanRow, endOrphanRow,
+    numUnmatched: numOrphans, hasTable3: hasOrphanTable,
+    startTxHeaderRow: startOrphanHeaderRow, startTxRow: startOrphanRow, endTxRow: endOrphanRow,
+    numInstRecon, hasTable4, startInstHeaderRow, startInstRow, endInstRow,
+    numPending, hasPendingTable, startPendingHeaderRow, startPendingRow, endPendingRow
   };
 }
 
@@ -2135,7 +2161,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const endShareRow = bounds.endShareRow;
   const totShareRow = bounds.totShareRow;
 
-  // Build Table 2 Exceptions Items
+  // Build Unified Table 2 Needs Pairing & Statement Review Items
   const exceptionItems = [];
   recon.stmtFees.forEach((f, idx) => {
     exceptionItems.push({
@@ -2146,33 +2172,42 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       amount: f.amount,
       category: "Bank Fee / Tax",
       assignedPayer: f.assignedPayer || CONFIG.DEFAULT_FEE_PAYER,
-      note: f.note || "Auto-assigned to Mai"
+      suggestedPairs: [],
+      note: f.note || "Auto-assigned fee"
     });
   });
 
   recon.stmtCredits.forEach((c, idx) => {
+    const isPay = isPaymentCreditDesc(c.desc);
     exceptionItems.push({
       id: `C-${idx + 1}`,
       subjectId: c.stmtId || "",
       date: c.date || c.dateStr,
       desc: c.desc,
       amount: c.amount,
-      category: "Refund / Credit",
+      category: isPay ? "Bill Payment (Credit)" : "Refund / Credit",
       assignedPayer: c.assignedPayer || "",
-      note: c.note || (isPaymentCreditDesc(c.desc) ? "Bill Payment / Settlement (Neglected by default)" : "Merchant Refund (Reduces Debt)")
+      suggestedPairs: [],
+      note: c.note || (isPay ? "Bill Payment / Settlement (Neglected by default)" : "Merchant Refund (Reduces Debt)")
     });
   });
 
   recon.missingInSheet.forEach((m, idx) => {
+    const sugs = m.suggestedPairs || [];
+    const hasUnresolvedSugs = sugs.length > 0 && !m.assignedPayer;
+    const topSug = sugs[0];
     exceptionItems.push({
       id: `M-${idx + 1}`,
       subjectId: m.stmtId || "",
       date: m.date || m.dateStr,
       desc: m.desc,
       amount: m.amount,
-      category: "Missing Purchase",
+      category: hasUnresolvedSugs ? "Missing Purchase (💡)" : "Missing Purchase",
       assignedPayer: m.assignedPayer || "",
-      note: m.note || cleanMerchantName(m.desc)
+      suggestedPairs: sugs,
+      note: hasUnresolvedSugs
+        ? `💡 ${topSug.reason} → ${topSug.dropdownLabel}`
+        : (m.note || cleanMerchantName(m.desc))
     });
   });
 
@@ -2181,21 +2216,28 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const startExRow = bounds.startExRow;
   const endExRow = bounds.endExRow;
 
-  // Build Table 3 Unmatched Sheet Transactions (Billed by Default)
-  const unmatchedList = recon.expandedUnmatched || [];
-  const numUnmatched = unmatchedList.length;
-  const hasTable3 = bounds.hasTable3;
-  const startTxHeaderRow = bounds.startTxHeaderRow;
-  const startTxRow = bounds.startTxRow;
-  const endTxRow = bounds.endTxRow;
+  // Orphan Logs (in-period transactions without a paired bank line)
+  const orphanList = recon.orphanLogs || recon.expandedUnmatched || [];
+  const numOrphans = orphanList.length;
+  const hasOrphanTable = bounds.hasOrphanTable;
+  const startOrphanHeaderRow = bounds.startOrphanHeaderRow;
+  const startOrphanRow = bounds.startOrphanRow;
+  const endOrphanRow = bounds.endOrphanRow;
 
-  // Build Table 4 Installments Reconciliation Items
+  // Table 4 Installments Reconciliation Items
   const instReconList = recon.installmentReconItems || [];
   const numInstRecon = instReconList.length;
   const hasTable4 = bounds.hasTable4;
   const startInstHeaderRow = bounds.startInstHeaderRow;
   const startInstRow = bounds.startInstRow;
   const endInstRow = bounds.endInstRow;
+
+  // Pending Next Statement Items (post-closing purchases)
+  const pendingList = recon.pendingNextItems || [];
+  const numPending = pendingList.length;
+  const hasPendingTable = bounds.hasPendingTable;
+  const startPendingHeaderRow = bounds.startPendingHeaderRow;
+  const startPendingRow = bounds.startPendingRow;
 
   // 3. Overview Card & Balance Waterfall (Declarative Formulas)
   sheet.getRange("A4:H4").merge()
@@ -2207,11 +2249,26 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const stmtDateStr = recon.cardBal.statementDate ? Utilities.formatDate(recon.cardBal.statementDate, tz, "yyyy-MM-dd") : "N/A";
   const dueDateStr = Utilities.formatDate(ledger.activeDueDate, tz, "MMMM d, yyyy");
 
-  const badgeFormula = `=IF(ABS(F6)<0.5, "✅ Perfect Match (0.00 EGP difference)", IF(F6>0, "ℹ️ Shares exceed bank bill by +" & TEXT(F6, "#,##0.00") & " EGP", "⚠️ Bank bill exceeds shares by -" & TEXT(ABS(F6), "#,##0.00") & " EGP"))`;
+  const t2UnresolvedCount = numExceptions > 0 ? `COUNTIFS(F${startExRow}:F${endExRow}, "")` : "0";
+  const t2UnresolvedAmt = numExceptions > 0
+    ? `(SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "", E${startExRow}:E${endExRow}, "<>*Credit*") - SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "", E${startExRow}:E${endExRow}, "*Credit*"))`
+    : "0";
+  const t4UnresolvedCount = hasTable4 ? `COUNTIFS(E${startInstRow}:E${endInstRow}, "⚠️*", F${startInstRow}:F${endInstRow}, "")` : "0";
+  const t4UnresolvedAmt = hasTable4 ? `SUMIFS(D${startInstRow}:D${endInstRow}, E${startInstRow}:E${endInstRow}, "⚠️*", F${startInstRow}:F${endInstRow}, "")` : "0";
+
+  const unresolvedCountExpr = hasTable4 ? `(${t2UnresolvedCount} + ${t4UnresolvedCount})` : t2UnresolvedCount;
+  const unresolvedAmtExpr = hasTable4 ? `(${t2UnresolvedAmt} + ${t4UnresolvedAmt})` : t2UnresolvedAmt;
+
+  const negPayExpr = numExceptions > 0
+    ? `SUMIFS(D${startExRow}:D${endExRow}, E${startExRow}:E${endExRow}, "Bill Payment (Credit)", F${startExRow}:F${endExRow}, "🚫*")`
+    : "0";
+  const carriedOverExpr = `(${(ledger.openingBalance || 0).toFixed(2)} - ${negPayExpr})`;
+
+  const badgeFormula = `=IF(AND(${unresolvedCountExpr}=0, ABS(F6)<0.5), "✅ Balanced (0 unresolved · 0.00 diff)", IF(${unresolvedCountExpr}>0, "⚠️ Unresolved: " & ${unresolvedCountExpr} & " line(s) (" & TEXT(${unresolvedAmtExpr},"#,##0.00") & " EGP)", IF(F6>0, "ℹ️ Statement Check: +" & TEXT(F6,"#,##0.00") & " EGP", "⚠️ Statement Check: -" & TEXT(ABS(F6),"#,##0.00") & " EGP")))`;
 
   const kpiRows = [
     ["Statement Date:", stmtDateStr, "Bank Closing Bill:", ledger.closingBill, "Recon Status:", badgeFormula],
-    ["Payment Due Date:", dueDateStr, "Family Shares Total:", `=H${totShareRow}`, "Audit Difference:", `=D6-D5`],
+    ["Payment Due Date:", dueDateStr, "Family Shares Total:", `=H${totShareRow}`, "Statement Check:", `=(D6 + ${carriedOverExpr}) - D5`],
     ["Active Billing Cycle:", ledger.activeCycleLabel, "Total Card Utilized:", recon.cardBal.totalUtilized, "Available Limit Now:", recon.cardBal.availableBalanceNow]
   ];
 
@@ -2269,13 +2326,13 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange("D5:D7").setNumberFormat("#,##0.00");
   sheet.getRange("F6:F7").setNumberFormat("#,##0.00");
 
-  // Difference Detective & Live Breakdown Bar (Formula)
-  const t3BilledExpr = hasTable3 ? `SUMIFS(D${startTxRow}:D${endTxRow}, F${startTxRow}:F${endTxRow}, "<>🚫*")` : "0";
-  const t2UnassignedExpr = numExceptions > 0 ? `SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "", E${startExRow}:E${endExRow}, "<>Refund / Credit")` : "0";
-  const t2NeglectedExpr = numExceptions > 0 ? `SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "🚫*", E${startExRow}:E${endExRow}, "<>Refund / Credit")` : "0";
-  const diffDetectiveFormula = `="🔍 Diff Detective (" & IF(F6>=0,"+","") & TEXT(F6,"#,##0.00") & " EGP): Table 3 Extra Sheet Tx Billed: +" & TEXT(${t3BilledExpr},"#,##0.00") & " | Table 2 Unassigned: -" & TEXT(${t2UnassignedExpr},"#,##0.00") & " | Table 2 Neglected: -" & TEXT(${t2NeglectedExpr},"#,##0.00") & " | Inst/Stmt/Other: " & TEXT(F6 - (${t3BilledExpr}) + (${t2UnassignedExpr}) + (${t2NeglectedExpr}),"+#,##0.00;-#,##0.00;0.00")`;
+  // Live Statement Check & Audit Bar (Row 8)
+  const orphanActiveCountExpr = hasOrphanTable ? `COUNTIFS(F${startOrphanRow}:F${endOrphanRow}, "<>🚫*")` : "0";
+  const orphanActiveAmtExpr = hasOrphanTable ? `SUMIFS(D${startOrphanRow}:D${endOrphanRow}, F${startOrphanRow}:F${endOrphanRow}, "<>🚫*")` : "0";
+  const pendingTotalFixed = (ledger.pendingTotal || 0).toFixed(2);
+  const auditBarFormula = `="🔍 Unresolved bank lines: " & ${unresolvedCountExpr} & " (" & TEXT(${unresolvedAmtExpr},"#,##0.00") & " EGP) → target 0 | Statement check: " & TEXT(F6,"+#,##0.00;-#,##0.00;0.00") & " EGP | Carryover: " & TEXT(${carriedOverExpr},"+#,##0.00;-#,##0.00;0.00") & " | Orphan logs: " & ${orphanActiveCountExpr} & " (" & TEXT(${orphanActiveAmtExpr},"#,##0.00") & " EGP) | Pending next cycle: ${ledger.pendingCount || 0} (${pendingTotalFixed} EGP)"`;
   sheet.getRange("A8:H8").merge()
-    .setFormula(diffDetectiveFormula)
+    .setFormula(auditBarFormula)
     .setFontSize(8)
     .setFontStyle("italic")
     .setFontColor(CONFIG.COLORS.TEXT_MUTED)
@@ -2298,15 +2355,19 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   if (numPayers > 0) {
     const shareRows = sharePeople.map((ps, idx) => {
       const r = startShareRow + idx;
-      const purchFormula = hasTable3
-        ? `=${ps.matchedPurchases.toFixed(2)} + SUMIFS($D$${startTxRow}:$D$${endTxRow}, $E$${startTxRow}:$E$${endTxRow}, $B${r}, $F$${startTxRow}:$F$${endTxRow}, "<>🚫*")`
-        : `=${ps.matchedPurchases.toFixed(2)}`;
+      const purchFormula = `=${ps.matchedPurchases.toFixed(2)}`;
       const instFormula = hasTable4
         ? `=SUMIFS($D$${startInstRow}:$D$${endInstRow}, $F$${startInstRow}:$F$${endInstRow}, "*" & TRIM($B${r}) & "*", $F$${startInstRow}:$F$${endInstRow}, "<>🚫*")`
         : `=${ps.installments.toFixed(2)}`;
-      const feesFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Bank Fee / Tax")`;
-      const unrecFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Missing Purchase")`;
-      const refFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Refund / Credit")`;
+      const feesFormula = numExceptions > 0
+        ? `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Bank Fee / Tax")`
+        : "=0";
+      const unrecFormula = numExceptions > 0
+        ? `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Missing Purchase*")`
+        : "=0";
+      const refFormula = numExceptions > 0
+        ? `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "*Credit*")`
+        : "=0";
       const netFormula = `=C${r}+D${r}+E${r}+F${r}-G${r}`;
 
       return [
@@ -2344,25 +2405,26 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setBorder(true, true, true, true, true, true);
   sheet.getRange(totShareRow, 3, 1, 6).setNumberFormat("#,##0.00");
 
-  // 5. Actionable Exceptions Table (Table 2 - Statement Review / Assignment)
+  // 5. Unified Needs Pairing & Statement Review Table (Table 2)
   const t2BannerRange = sheet.getRange(startExHeaderRow, 1, 1, 8).merge()
     .setFontWeight("bold")
     .setFontSize(10)
     .setBackground(CONFIG.COLORS.DUE_SOON);
   if (numExceptions > 0) {
-    t2BannerRange.setFormula(`="⚠️ Actionable Statement Charges & Exceptions (" & ${numExceptions} & " Items | Unassigned: " & COUNTIFS(F${startExRow}:F${endExRow}, "") & " items = " & TEXT(${t2UnassignedExpr}, "#,##0.00") & " EGP)"`);
+    const t2SuggestedCount = `COUNTIFS(E${startExRow}:E${endExRow}, "*💡*", F${startExRow}:F${endExRow}, "")`;
+    t2BannerRange.setFormula(`="🔗 Needs Pairing & Statement Review (" & ${numExceptions} & " Items | Unresolved: " & ${t2UnresolvedCount} & " = " & TEXT(${t2UnresolvedAmt}, "#,##0.00") & " EGP | Suggested pairs: " & ${t2SuggestedCount} & ")"`);
   } else {
-    t2BannerRange.setValue("⚠️ Actionable Statement Charges & Exceptions (0 Items)");
+    t2BannerRange.setValue("🔗 Needs Pairing & Statement Review (0 Items — Statement 100% Reconciled)");
   }
 
-  const exHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Category", "Assign Payer", "Custom Note", "Status", "_Subject_ID"];
+  const exHeaders = ["#", "Date", "Description / Merchant", "Amount (EGP)", "Category", "Resolve (Pair / Assign)", "Suggestion / Note", "Status", "_Subject_ID"];
   sheet.getRange(startExHeaderRow + 1, 1, 1, 8).setFontWeight("bold").setFontSize(9).setBackground(CONFIG.COLORS.HEADER);
   sheet.getRange(startExHeaderRow + 1, 1, 1, exHeaders.length).setValues([exHeaders]);
 
   if (numExceptions > 0) {
     const exRows = exceptionItems.map((ex, idx) => {
       const r = startExRow + idx;
-      const statusFormula = `=IF(ISBLANK(F${r}), "⚠️ Needs Payer", IF(LEFT(F${r}, 1)="🚫", "🚫 Neglected / Bank Error", "✅ Assigned"))`;
+      const statusFormula = `=IF(ISBLANK(F${r}), IF(ISNUMBER(SEARCH("💡", E${r})), "💡 Confirm Pair or Assign", "⚠️ Needs Action"), IF(LEFT(F${r}, 1)="🚫", "🚫 Neglected", IF(LEFT(F${r}, 1)="🔗", "🔗 Pairing...", "✅ Assigned")))`;
       return [
         ex.id,
         ex.date,
@@ -2383,42 +2445,85 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     sheet.getRange(startExRow, 4, exRows.length, 1).setNumberFormat("#,##0.00");
 
     const dynamicPayers = getAllUniquePayers(ss);
-    const payerOptions = [...dynamicPayers, "🚫 Neglect / Ignore"];
-    const payerValidation = SpreadsheetApp.newDataValidation()
-      .requireValueInList(payerOptions, true)
+    const standardOptions = [...dynamicPayers, "🚫 Neglect / Ignore"];
+    const defaultValidation = SpreadsheetApp.newDataValidation()
+      .requireValueInList(standardOptions, true)
       .setAllowInvalid(true)
       .build();
-    sheet.getRange(startExRow, 6, exRows.length, 1).setDataValidation(payerValidation);
+    sheet.getRange(startExRow, 6, exRows.length, 1).setDataValidation(defaultValidation);
+
+    const activeOrphanPool = orphanList.filter(o => !o.isNeglected && o.txId);
+    const seenOrphanTx = new Set();
+    const uniqueActiveOrphans = [];
+    activeOrphanPool.forEach(o => {
+      if (!seenOrphanTx.has(o.txId)) {
+        seenOrphanTx.add(o.txId);
+        uniqueActiveOrphans.push(o);
+      }
+    });
 
     for (let i = 0; i < exceptionItems.length; i++) {
-      const cat = exceptionItems[i].category;
-      const payer = exceptionItems[i].assignedPayer;
+      const ex = exceptionItems[i];
+      const r = startExRow + i;
+
+      if (ex.suggestedPairs && ex.suggestedPairs.length > 0) {
+        const sugLabels = ex.suggestedPairs.map(sp => sp.dropdownLabel);
+        const rowVal = SpreadsheetApp.newDataValidation()
+          .requireValueInList([...sugLabels, ...standardOptions], true)
+          .setAllowInvalid(true)
+          .build();
+        sheet.getRange(r, 6).setDataValidation(rowVal);
+      } else if (/^M-/.test(ex.id) && !ex.assignedPayer && uniqueActiveOrphans.length > 0) {
+        const closest = uniqueActiveOrphans
+          .slice()
+          .sort((a, b) => Math.abs(a.amount - ex.amount) - Math.abs(b.amount - ex.amount))
+          .slice(0, 3)
+          .map(o => formatPairDropdownLabel([o]));
+        if (closest.length > 0) {
+          const rowVal = SpreadsheetApp.newDataValidation()
+            .requireValueInList([...standardOptions, ...closest], true)
+            .setAllowInvalid(true)
+            .build();
+          sheet.getRange(r, 6).setDataValidation(rowVal);
+        }
+      }
+
+      const cat = ex.category;
+      const payer = ex.assignedPayer;
+      const hasSugs = ex.suggestedPairs && ex.suggestedPairs.length > 0;
       if (isNeglectedPayer(payer)) {
-        sheet.getRange(startExRow + i, 1, 1, 8).setBackground("#eeeeee");
-      } else if (cat === "Refund / Credit") {
-        sheet.getRange(startExRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
+        sheet.getRange(r, 1, 1, 8).setBackground("#eeeeee");
+      } else if (cat.includes("Credit")) {
+        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
       } else if (payer) {
-        sheet.getRange(startExRow + i, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
+        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
+      } else if (hasSugs) {
+        sheet.getRange(r, 1, 1, 8).setBackground("#e8f0fe");
+      } else {
+        sheet.getRange(r, 1, 1, 8).setBackground("#ffffff");
       }
     }
   }
 
-  // 6. Sheet Transactions Not on Current Bank Statement (Table 3 - Billed by Default)
-  if (hasTable3) {
-    sheet.getRange(startTxHeaderRow, 1, 1, 8).merge()
-      .setFormula(`="⏳ Transactions in Sheet Not on Current Bank Statement (" & COUNTIF(F${startTxRow}:F${endTxRow}, "<>🚫*") & " of " & ${numUnmatched} & " Billed = +" & TEXT(${t3BilledExpr}, "#,##0.00") & " EGP added above Bank Bill — Set to 🚫 Neglect to exclude)"`)
+  // 6. Orphan Logs Panel (In-period transactions without a paired bank line — NOT billed)
+  if (hasOrphanTable) {
+    sheet.getRange(startOrphanHeaderRow, 1, 1, 8).merge()
+      .setFormula(`="🔎 Orphan Logs — In-Period Transactions Without a Bank Line (" & ${numOrphans} & " Items | Unresolved: " & COUNTIF(F${startOrphanRow}:F${endOrphanRow}, "<>🚫*") & " = " & TEXT(SUMIFS(D${startOrphanRow}:D${endOrphanRow}, F${startOrphanRow}:F${endOrphanRow}, "<>🚫*"), "#,##0.00") & " EGP — NOT billed until paired above)"`)
       .setFontWeight("bold")
       .setFontSize(10)
       .setBackground("#e8eaed");
 
-    const unHeaders = ["#", "Date", "Description", "Amount (EGP)", "Person", "Billing Action", "Custom Note", "Status", "_Subject_ID"];
-    sheet.getRange(startTxHeaderRow + 1, 1, 1, 8).setFontWeight("bold").setFontSize(9).setBackground(CONFIG.COLORS.HEADER);
-    sheet.getRange(startTxHeaderRow + 1, 1, 1, unHeaders.length).setValues([unHeaders]);
+    const orphanHeaders = ["#", "Date", "Description", "Amount (EGP)", "Person", "Resolution", "Pairing Hint / Note", "Status", "_Subject_ID"];
+    sheet.getRange(startOrphanHeaderRow + 1, 1, 1, 8).setFontWeight("bold").setFontSize(9).setBackground(CONFIG.COLORS.HEADER);
+    sheet.getRange(startOrphanHeaderRow + 1, 1, 1, orphanHeaders.length).setValues([orphanHeaders]);
 
-    const txRows = unmatchedList.map((tx, idx) => {
-      const r = startTxRow + idx;
-      const statusFormula = `=IF(LEFT(F${r}, 1)="🚫", "🚫 Neglected", "✅ Billed to " & E${r})`;
-      const defaultAction = tx.isNeglected ? "🚫 Neglect / Ignore" : `✅ Billed to ${tx.person}`;
+    const orphanRows = orphanList.map((tx, idx) => {
+      const r = startOrphanRow + idx;
+      const statusFormula = `=IF(LEFT(F${r}, 1)="🚫", "🚫 Dismissed", IF(LEFT(F${r}, 1)="🔗", "🔗 Pairing...", "🔎 Unpaired (Not Billed)"))`;
+      const defaultAction = tx.isNeglected ? "🚫 Dismiss / Duplicate Log" : "⏳ Not on Statement Yet (Ignored)";
+      const hintNote = (tx.suggestedStmts && tx.suggestedStmts.length > 0)
+        ? `💡 ${tx.suggestedStmts[0].reason} → ${tx.suggestedStmts[0].stmtId} (${tx.suggestedStmts[0].stmt.amount.toFixed(2)})`
+        : "Not found on current statement";
       return [
         tx.id,
         tx.date,
@@ -2426,30 +2531,41 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
         tx.amount,
         tx.person,
         defaultAction,
-        "Recorded in Transactions",
+        hintNote,
         statusFormula,
         tx.subjectId || ""
       ];
     });
 
-    sheet.getRange(startTxRow, 1, txRows.length, unHeaders.length).setValues(txRows);
-    sheet.getRange(startTxRow, 1, txRows.length, 8).setFontSize(9);
-    sheet.getRange(startTxRow, 2, txRows.length, 1).setNumberFormat("yyyy-MM-dd");
-    sheet.getRange(startTxRow, 4, txRows.length, 1).setNumberFormat("#,##0.00");
+    sheet.getRange(startOrphanRow, 1, orphanRows.length, orphanHeaders.length).setValues(orphanRows);
+    sheet.getRange(startOrphanRow, 1, orphanRows.length, 8).setFontSize(9);
+    sheet.getRange(startOrphanRow, 2, orphanRows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(startOrphanRow, 4, orphanRows.length, 1).setNumberFormat("#,##0.00");
 
-    for (let i = 0; i < unmatchedList.length; i++) {
-      const r = startTxRow + i;
-      const p = unmatchedList[i].person;
-      const txValidation = SpreadsheetApp.newDataValidation()
-        .requireValueInList([`✅ Billed to ${p}`, "🚫 Neglect / Ignore"], true)
+    const unassignedStmtDebits = (recon.missingInSheet || []).filter(m => !m.assignedPayer);
+    for (let i = 0; i < orphanList.length; i++) {
+      const r = startOrphanRow + i;
+      const orph = orphanList[i];
+      const sugLabels = (orph.suggestedStmts || []).map(s => s.dropdownLabel);
+      if (sugLabels.length === 0 && unassignedStmtDebits.length > 0) {
+        unassignedStmtDebits
+          .slice()
+          .sort((a, b) => Math.abs(a.amount - orph.amount) - Math.abs(b.amount - orph.amount))
+          .slice(0, 3)
+          .forEach(st => sugLabels.push(formatOrphanPairDropdownLabel(st)));
+      }
+      const orphanValidation = SpreadsheetApp.newDataValidation()
+        .requireValueInList([...sugLabels, "⏳ Not on Statement Yet (Ignored)", "🚫 Dismiss / Duplicate Log"], true)
         .setAllowInvalid(true)
         .build();
-      sheet.getRange(r, 6).setDataValidation(txValidation);
+      sheet.getRange(r, 6).setDataValidation(orphanValidation);
 
-      if (unmatchedList[i].isNeglected) {
+      if (orph.isNeglected) {
         sheet.getRange(r, 1, 1, 8).setBackground("#eeeeee");
+      } else if (orph.suggestedStmts && orph.suggestedStmts.length > 0) {
+        sheet.getRange(r, 1, 1, 8).setBackground("#e8f0fe");
       } else {
-        sheet.getRange(r, 1, 1, 8).setBackground("#f8f9fa");
+        sheet.getRange(r, 1, 1, 8).setBackground("#fff8e1");
       }
     }
   }
@@ -2520,6 +2636,35 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     }
   }
 
+  // 8. Pending — Next Statement Panel (Post-closing purchases — NOT billed on current statement)
+  if (hasPendingTable) {
+    sheet.getRange(startPendingHeaderRow, 1, 1, 8).merge()
+      .setValue(`⏳ Pending — Next Statement (${numPending} Purchases = ${pendingTotalFixed} EGP — Dated after statement cutoff; NOT billed now)`)
+      .setFontWeight("bold")
+      .setFontSize(10)
+      .setBackground("#e8eaed");
+
+    const pendingHeaders = ["#", "Date", "Description", "Amount (EGP)", "Person", "Target Cycle", "Note", "Status", "_Subject_ID"];
+    sheet.getRange(startPendingHeaderRow + 1, 1, 1, 8).setFontWeight("bold").setFontSize(9).setBackground(CONFIG.COLORS.HEADER);
+    sheet.getRange(startPendingHeaderRow + 1, 1, 1, pendingHeaders.length).setValues([pendingHeaders]);
+
+    const pendingRows = pendingList.map(p => [
+      p.id,
+      p.date,
+      p.desc,
+      p.amount,
+      p.person,
+      p.cycleLabel || "",
+      "Post-closing purchase",
+      "⏳ Next Statement",
+      p.txId || ""
+    ]);
+    sheet.getRange(startPendingRow, 1, pendingRows.length, pendingHeaders.length).setValues(pendingRows);
+    sheet.getRange(startPendingRow, 1, pendingRows.length, 8).setFontSize(9).setBackground("#f8f9fa");
+    sheet.getRange(startPendingRow, 2, pendingRows.length, 1).setNumberFormat("yyyy-MM-dd");
+    sheet.getRange(startPendingRow, 4, pendingRows.length, 1).setNumberFormat("#,##0.00");
+  }
+
   try { sheet.hideColumns(9); } catch (e) { }
 
   applySheetLayoutFitting(sheet, {
@@ -2527,14 +2672,14 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     bannerHeight: 30,
     customRowHeights: { 2: 20, 4: 24, 10: 26 },
     explicitColWidths: {
-      1: 50,  // #
+      1: 55,  // #
       2: 125, // Date / Member
       3: 210, // Description / Category
       4: 105, // Amount / Purchases
-      5: 105, // Installments
-      6: 125, // Fees / Payer / Action
-      7: 105, // Unrecorded / Total / Note
-      8: 155  // Status / Dropdown
+      5: 115, // Installments / Category
+      6: 145, // Resolve (Pair / Assign)
+      7: 145, // Suggestion / Note
+      8: 155  // Status
     }
   });
 }
@@ -2825,15 +2970,15 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
 
   const txColsExpr = `ARRAYFORMULA({${txRef}!$A$2:$C, IFERROR(${txRef}!$E$2:$E / IF($B$3="All Family Members", 1, LEN(${txRef}!$D$2:$D) - LEN(SUBSTITUTE(${txRef}!$D$2:$D, "+", "")) + 1), 0), ${txRef}!$D$2:$D, IF(${txRef}!$A$2:$A<>"","✅ Recorded","")})`;
   const txBaseCond = `(${txRef}!$A$2:$A<>"") * (${txRef}!$E$2:$E>0) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${txRef}!$D$2:$D)))) * (${txRef}!$B$2:$B>=$Z$1) * (${txRef}!$B$2:$B<($Z$2+1))`;
-  const txNotNegCond = bounds.hasTable3
-    ? ` * MAP(${txRef}!$B$2:$B, ${txRef}!$C$2:$C, ${txRef}!$D$2:$D, LAMBDA(dt, dc, pr, IF(dc="", FALSE, COUNTIFS(${arRef}!$B$${bounds.startTxRow}:$B$${bounds.endTxRow}, dt, ${arRef}!$C$${bounds.startTxRow}:$C$${bounds.endTxRow}, dc & "*", ${arRef}!$E$${bounds.startTxRow}:$E$${bounds.endTxRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", pr)), "*", "*" & TRIM(pr) & "*"), "*" & TRIM($B$3) & "*"), ${arRef}!$F$${bounds.startTxRow}:$F$${bounds.endTxRow}, "🚫*") < IF($B$3="All Family Members", LEN(pr) - LEN(SUBSTITUTE(pr, "+", "")) + 1, 1))))`
+  const txNotOrphanCond = bounds.hasOrphanTable
+    ? ` * MAP(${txRef}!$B$2:$B, ${txRef}!$C$2:$C, ${txRef}!$D$2:$D, LAMBDA(dt, dc, pr, IF(dc="", FALSE, COUNTIFS(${arRef}!$B$${bounds.startOrphanRow}:$B$${bounds.endOrphanRow}, dt, ${arRef}!$C$${bounds.startOrphanRow}:$C$${bounds.endOrphanRow}, dc & "*", ${arRef}!$E$${bounds.startOrphanRow}:$E$${bounds.endOrphanRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", pr)), "*", "*" & TRIM(pr) & "*"), "*" & TRIM($B$3) & "*")) < IF($B$3="All Family Members", LEN(pr) - LEN(SUBSTITUTE(pr, "+", "")) + 1, 1))))`
     : "";
-  const purchFilterPart = `IFERROR(FILTER(${txColsExpr}, ${txBaseCond}${txNotNegCond}), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
+  const purchFilterPart = `IFERROR(FILTER(${txColsExpr}, ${txBaseCond}${txNotOrphanCond}), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
 
   let exFilterPart;
   if (bounds.numExceptions > 0) {
-    const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, IF(${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}="Refund / Credit", -1, 1) * ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}, ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}})`;
-    const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (LEFT(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, 1)<>"🚫") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
+    const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, IF(ISNUMBER(SEARCH("Credit", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow})), -1, 1) * ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}, ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}})`;
+    const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (LEFT(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, 1)<>"🚫") * (LEFT(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, 1)<>"🔗") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
     exFilterPart = `IFERROR(FILTER(${exColsExpr}, ${exFilterCond}), {"—", "—", "No unrecorded statement items, fees, or refunds", 0, "—", "—"})`;
   } else {
     exFilterPart = `{"—", "—", "No statement adjustments for this cycle", 0, "—", "—"}`;
@@ -3134,17 +3279,28 @@ function handleActiveReconEdit(e) {
     ? rawRows
     : rawRows.map(r => [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], ""]);
   let modified = false;
+  let needsRefresh = false;
+  let toastMsg = "";
 
   for (let row = loopStart; row <= loopEnd; row++) {
-    if (processActiveReconRowChange(sheet, allRows, row, decisions, tz, { allowDelete: true, forceStyle: true })) {
+    const res = processActiveReconRowChange(sheet, allRows, row, decisions, tz, { allowDelete: true, forceStyle: true });
+    if (res && res.changed) {
       modified = true;
+      if (res.needsRefresh) needsRefresh = true;
+      if (res.toastMsg) toastMsg = res.toastMsg;
     }
   }
 
   if (modified) {
     saveDecisions(ss, decisions);
   }
-  // ZERO SCREEN WIPE: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
+  if (needsRefresh) {
+    updateLiveDashboard({ skipPDF: true, ss: ss });
+    if (toastMsg) {
+      try { ss.toast(toastMsg, "💳 NBE Tracker", 4); } catch (err) { }
+    }
+  }
+  // ZERO SCREEN WIPE on normal edits: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
 }
 
 function onEdit(e) {
@@ -3213,7 +3369,7 @@ function onEdit(e) {
 }
 
 function updateLiveDashboard(options) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = (options && options.ss) || SpreadsheetApp.getActiveSpreadsheet();
   const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
 
   cleanupDeprecatedSheets(ss);
@@ -3606,6 +3762,9 @@ function buildAnonymizedFixture(ss, tz) {
     }
     if (type === "STMT_MATCH") {
       return [type, subjId, target, "", source, locked, updatedAt];
+    }
+    if (type === "MERCHANT_ALIAS") {
+      return [type, makeNormDesc(anonymizeDesc(subjId)), makeNormDesc(anonymizeDesc(target)), "", source, locked, updatedAt];
     }
     const anonSubj = anonymizeDecisionSubjectId(type, subjId);
     const anonTarget = (type === "TX_NEGLECT") ? target : mapPayerField(target);
