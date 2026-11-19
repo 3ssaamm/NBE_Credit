@@ -103,27 +103,42 @@ const origRows = sheetRows.map((sh, idx) => [
 origRows[30][9] = 1;
 instSheet.getRange(2, 1, origRows.length, 11).setValues(origRows);
 
-const snapshotBefore = instSheet.getRange(2, 1, origRows.length, 11).getValues();
+const snapshotBefore = instSheet.getRange(2, 1, origRows.length, 9).getValues();
 
-// Paid state sync -> must compute exact progress in progressMap WITHOUT overwriting Cols A:K
+// Paid state sync -> must compute exact progress & persist INST_PROGRESS WITHOUT mutating Cols A:I
 const paidRes = sandbox.syncInstallmentsFromStatement(ss, tz, true);
-const snapshotAfterPaid = instSheet.getRange(2, 1, origRows.length, 11).getValues();
-assert.deepStrictEqual(snapshotAfterPaid, snapshotBefore, "syncInstallmentsFromStatement(paid) must NEVER mutate Installments Cols A:K");
+const snapshotAfterPaid = instSheet.getRange(2, 1, origRows.length, 9).getValues();
+assert.deepStrictEqual(snapshotAfterPaid, snapshotBefore, "syncInstallmentsFromStatement(paid) must NEVER mutate Installments user Cols A:I");
 assert.strictEqual(paidRes.progressMap[0].paidCount, 10, "Kettle Mido bank-derived paid count when paid -> 10");
 assert.strictEqual(paidRes.progressMap[32].paidCount, 1, "Fan (1 of 6) bank-derived paid count when paid -> 1");
-assert.strictEqual(paidRes.progressMap[16].status || paidRes.progressMap[16].isCompleted, true, "Completed Noon 2 of 6 stays Completed");
+assert.strictEqual(paidRes.progressMap[16].isCompleted, true, "Completed Noon 2 of 6 stays Completed");
 
-assert.strictEqual(instSheet._getCell(1, 13), "Bank Progress", "Col M header must be Bank Progress");
-assert.strictEqual(instSheet._getCell(1, 14), "Bank Status", "Col N header must be Bank Status");
-assert.ok(String(instSheet._getCell(2, 13)).startsWith("="), "Col M must contain formula");
-assert.ok(String(instSheet._getCell(2, 14)).startsWith("="), "Col N must contain formula");
+assert.strictEqual(instSheet._getCell(1, 10), "Bank Progress", "Col J header must be Bank Progress");
+assert.strictEqual(instSheet._getCell(1, 11), "Bank Status", "Col K header must be Bank Status");
+assert.strictEqual(instSheet._getCell(1, 12), "_Row_ID", "Col L header must be hidden _Row_ID");
+assert.ok(instSheet.hiddenCols.has(12), "Installments Col L (_Row_ID) must be hidden");
+assert.ok(!instSheet.hiddenCols.has(10) && !instSheet.hiddenCols.has(11), "Cols J & K must remain visible");
+assert.strictEqual(instSheet.getLastColumn(), 12, "No redundant duplicate Cols M/N should exist");
+assert.ok(String(instSheet._getCell(2, 10)).startsWith("="), "Col J must contain formula");
+assert.ok(String(instSheet._getCell(2, 11)).startsWith("="), "Col K must contain formula");
+assert.ok(!/\b[JK]2\b/.test(String(instSheet._getCell(2, 10))), "Col J formula must have ZERO circular self-reference");
+assert.ok(!/\b[JK]2\b/.test(String(instSheet._getCell(2, 11))), "Col K formula must have ZERO circular self-reference");
 
-// Pending state sync -> bank-derived pending count without mutating Cols A:K
+// Verify legacy Completed row (Noon 2 of 6, index 16 -> sheet row 18) migrated to INST_PROGRESS & renders Completed
+const decAfterPaid = sandbox.loadDecisions(ss);
+const noonId = instSheet._getCell(18, 12);
+assert.ok(decAfterPaid.instProgress[noonId] && decAfterPaid.instProgress[noonId].completed, "Completed Noon row must migrate into INST_PROGRESS");
+assert.ok(String(instSheet._getCell(18, 10)).includes("2 / ") || String(instSheet._getCell(18, 10)).includes('2 & " / " & E18'), "Completed Noon Col J should embed migrated 2/E18");
+assert.ok(String(instSheet._getCell(18, 11)).includes('"Completed"'), "Completed Noon Col K should resolve Completed");
+assert.strictEqual(decAfterPaid.instProgress[instSheet._getCell(2, 12)].paid, 10, "Kettle INST_PROGRESS should record paid=10 when paid");
+
+// Pending state sync -> bank-derived pending count reversibly updates INST_PROGRESS without mutating Cols A:I
 const pendingRes = sandbox.syncInstallmentsFromStatement(ss, tz, false);
-const snapshotAfterPending = instSheet.getRange(2, 1, origRows.length, 11).getValues();
-assert.deepStrictEqual(snapshotAfterPending, snapshotBefore, "syncInstallmentsFromStatement(pending) must NEVER mutate Installments Cols A:K");
+const snapshotAfterPending = instSheet.getRange(2, 1, origRows.length, 9).getValues();
+assert.deepStrictEqual(snapshotAfterPending, snapshotBefore, "syncInstallmentsFromStatement(pending) must NEVER mutate Installments user Cols A:I");
 assert.strictEqual(pendingRes.progressMap[0].paidCount, 9, "Kettle Mido bank-derived paid count when pending -> 9");
 assert.strictEqual(pendingRes.progressMap[32].paidCount, 0, "Fan (1 of 6) bank-derived paid count when pending -> 0");
-assert.strictEqual(instSheet._getCell(32, 10), 1, "Cosmatics user Col J value (1) must remain completely untouched");
+const decAfterPending = sandbox.loadDecisions(ss);
+assert.strictEqual(decAfterPending.instProgress[instSheet._getCell(2, 12)].paid, 9, "Kettle INST_PROGRESS must revert cleanly to paid=9 when pending");
 
 console.log("installment_sync.test.js: all installment linking, non-overwrite, and bank progress assertions passed.");

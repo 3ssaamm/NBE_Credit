@@ -382,10 +382,298 @@ function computeBankDerivedInstallmentProgress(matches, sheetInstallmentRows, is
   return progressByKey;
 }
 
+function parseInstallmentPaidCell(val) {
+  if (typeof val === "number" && !isNaN(val)) {
+    return Math.max(0, Math.floor(val));
+  }
+  const s = String(val || "").trim();
+  if (!s || s.startsWith("=")) return 0;
+  const m = s.match(/^(\d+)(?:\s*\/\s*\d+)?/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+function isLegacyManualInstallmentLayout(instSheet) {
+  if (!instSheet || instSheet.getLastRow() < 1) return false;
+  const scanWidth = Math.min(12, Math.max(10, instSheet.getLastColumn() || 10));
+  const headers = instSheet.getRange(1, 1, 1, scanWidth).getValues()[0];
+  const h10 = String(headers[9] || "").trim().toLowerCase();
+  const h11 = String(headers[10] || "").trim().toLowerCase();
+  if (h10 === "bank progress" && h11 === "bank status") return false;
+  if (h10 === "_row_id") return false;
+  return true;
+}
+
+function migrateLegacyInstallmentColsToProgress(instSheet, decisions, instIds) {
+  if (!instSheet || instSheet.getLastRow() < 2 || !decisions) return 0;
+  if (!isLegacyManualInstallmentLayout(instSheet)) return 0;
+
+  const lastRow = instSheet.getLastRow();
+  const numRows = lastRow - 1;
+  const idCol = findExistingIdColumn(instSheet, 1);
+  let idList = instIds;
+  if ((!idList || idList.length === 0) && idCol > 0) {
+    idList = instSheet.getRange(2, idCol, numRows, 1).getValues().map(r => r[0]);
+  }
+  if (!idList || idList.length === 0) return 0;
+
+  const width = Math.min(11, Math.max(9, instSheet.getLastColumn() || 9));
+  const dataRange = instSheet.getRange(2, 1, numRows, width);
+  const rows = dataRange.getValues();
+  const formulas = typeof dataRange.getFormulas === "function" ? dataRange.getFormulas() : null;
+
+  let migrated = 0;
+  for (let idx = 0; idx < rows.length; idx++) {
+    const instId = idList[idx] ? String(idList[idx]).trim().toUpperCase() : "";
+    if (!instId) continue;
+    if (decisions.instProgress && decisions.instProgress[instId]) continue;
+
+    const row = rows[idx];
+    const hasDescOrEmi = Boolean(String(row[2] || "").trim() || parseFloat(row[7]) > 0);
+    if (!hasDescOrEmi) continue;
+
+    let rawJ = "";
+    let rawK = "";
+    let fJ = "";
+    let fK = "";
+    if (idCol === 11) {
+      rawK = width >= 10 ? row[9] : "";
+      fK = (formulas && formulas[idx] && width >= 10) ? formulas[idx][9] : "";
+    } else {
+      rawJ = width >= 10 ? row[9] : "";
+      rawK = width >= 11 ? row[10] : "";
+      fJ = (formulas && formulas[idx] && width >= 10) ? formulas[idx][9] : "";
+      fK = (formulas && formulas[idx] && width >= 11) ? formulas[idx][10] : "";
+    }
+
+    if (
+      String(rawJ || "").trim().startsWith("=") ||
+      String(rawK || "").trim().startsWith("=") ||
+      String(fJ || "").trim().startsWith("=") ||
+      String(fK || "").trim().startsWith("=")
+    ) {
+      continue;
+    }
+
+    const duration = parseInt(row[4], 10) || 0;
+    const oldPaid = parseInstallmentPaidCell(rawJ);
+    const oldStatus = String(rawK || "").trim().toLowerCase();
+    const oldCompleted = oldStatus === "completed" || (duration > 0 && oldPaid >= duration);
+
+    if (oldCompleted || oldPaid > 0) {
+      const finalPaid = (oldCompleted && duration > 0) ? Math.max(oldPaid, duration) : oldPaid;
+      setInstProgress(decisions, instId, {
+        paid: finalPaid,
+        total: duration,
+        billed: finalPaid,
+        cycle: "",
+        completed: oldCompleted,
+        source: "migrated",
+        note: "Migrated from legacy columns"
+      });
+      migrated++;
+    }
+  }
+
+  return migrated;
+}
+
+function resolveInstallmentBaseline(sh, decisions, activeCycleKey, tz) {
+  const instId = sh && sh.instId ? String(sh.instId).trim().toUpperCase() : "";
+  const duration = (sh && parseInt(sh.duration, 10)) || 0;
+
+  if (decisions && decisions.instProgress && instId && decisions.instProgress[instId]) {
+    const rec = decisions.instProgress[instId];
+    let effectivePaid;
+    if (rec.cycle && activeCycleKey && activeCycleKey > rec.cycle) {
+      effectivePaid = Math.max(rec.paid || 0, rec.billed || 0);
+    } else {
+      effectivePaid = rec.paid || 0;
+    }
+    const isCompleted = Boolean(rec.completed || (duration > 0 && effectivePaid >= duration));
+    return {
+      paymentsMade: effectivePaid,
+      isCompleted,
+      status: isCompleted ? "Completed" : "Ongoing",
+      source: "decisions"
+    };
+  }
+
+  if (sh) {
+    const rawPaid = parseInstallmentPaidCell(sh.rawLegacyPaid);
+    const rawStatus = String(sh.rawLegacyStatus || "").trim().toLowerCase();
+    const legacyCompleted = rawStatus === "completed" || (duration > 0 && rawPaid >= duration);
+    if (legacyCompleted || rawPaid > 0) {
+      const finalPaid = (legacyCompleted && duration > 0) ? Math.max(rawPaid, duration) : rawPaid;
+      return {
+        paymentsMade: finalPaid,
+        isCompleted: legacyCompleted,
+        status: legacyCompleted ? "Completed" : "Ongoing",
+        source: "legacy"
+      };
+    }
+
+    if (sh.startDate && duration > 0 && activeCycleKey && typeof getBillingCycleForInstallment === "function") {
+      const lastCyc = getBillingCycleForInstallment(sh.startDate, duration - 1, tz);
+      if (lastCyc && lastCyc.cycleSortKey && lastCyc.cycleSortKey < activeCycleKey) {
+        return {
+          paymentsMade: duration,
+          isCompleted: true,
+          status: "Completed",
+          source: "calendar"
+        };
+      }
+    }
+  }
+
+  return {
+    paymentsMade: 0,
+    isCompleted: false,
+    status: "Ongoing",
+    source: "default"
+  };
+}
+
+function readSheetInstallmentRows(instSheet, instIds, decisions, activeCycleKey, tz) {
+  if (!instSheet || instSheet.getLastRow() < 2) return [];
+
+  if (decisions) {
+    migrateLegacyInstallmentColsToProgress(instSheet, decisions, instIds);
+  }
+
+  const legacyLayout = isLegacyManualInstallmentLayout(instSheet);
+  const idCol = findExistingIdColumn(instSheet, 1);
+  const numRows = instSheet.getLastRow() - 1;
+  const width = legacyLayout ? Math.min(11, Math.max(9, instSheet.getLastColumn() || 9)) : 9;
+  const dataRange = instSheet.getRange(2, 1, numRows, width);
+  const instData = dataRange.getValues();
+  const formulas = (legacyLayout && typeof dataRange.getFormulas === "function") ? dataRange.getFormulas() : null;
+
+  const sheetInstallmentRows = [];
+  instData.forEach((row, idx) => {
+    const startDate = parseDateValue(row[1], tz);
+    const desc = String(row[2] || "").trim();
+    const totalPrice = parseFloat(row[3]) || 0;
+    const duration = parseInt(row[4], 10);
+    const emi = parseFloat(row[7]);
+    const payer = String(row[8] || "").replace(/[\u00A0\s]+/g, " ").trim();
+    if (isNaN(emi) || emi <= 0 || !payer) return;
+
+    const instId = (instIds && instIds[idx]) ? String(instIds[idx]).trim().toUpperCase() : "";
+    let rawLegacyPaid = "";
+    let rawLegacyStatus = "";
+    if (legacyLayout) {
+      let candJ = "";
+      let candK = "";
+      let fJ = "";
+      let fK = "";
+      if (idCol === 11) {
+        candK = width >= 10 ? row[9] : "";
+        fK = (formulas && formulas[idx] && width >= 10) ? formulas[idx][9] : "";
+      } else {
+        candJ = width >= 10 ? row[9] : "";
+        candK = width >= 11 ? row[10] : "";
+        fJ = (formulas && formulas[idx] && width >= 10) ? formulas[idx][9] : "";
+        fK = (formulas && formulas[idx] && width >= 11) ? formulas[idx][10] : "";
+      }
+      if (!String(candJ || "").trim().startsWith("=") && !String(fJ || "").trim().startsWith("=")) {
+        rawLegacyPaid = candJ;
+      }
+      if (!String(candK || "").trim().startsWith("=") && !String(fK || "").trim().startsWith("=")) {
+        rawLegacyStatus = candK;
+      }
+    }
+
+    const base = resolveInstallmentBaseline(
+      { instId, startDate, duration, rawLegacyPaid, rawLegacyStatus },
+      decisions,
+      activeCycleKey,
+      tz
+    );
+
+    sheetInstallmentRows.push({
+      index: idx,
+      instId,
+      rowNum: idx + 2,
+      startDate,
+      dateStr: startDate ? makeNormDateStr(startDate, tz) : String(row[1] || ""),
+      desc,
+      totalPrice,
+      duration,
+      emi,
+      payer,
+      paymentsMade: base.paymentsMade,
+      status: base.status,
+      isCompleted: base.isCompleted
+    });
+  });
+
+  return sheetInstallmentRows;
+}
+
+function persistBankObservedInstallmentProgress(progressMap, decisions, activeCycleKey) {
+  if (!progressMap || !decisions) return;
+  const seen = new Set();
+  Object.keys(progressMap).forEach(k => {
+    const prog = progressMap[k];
+    if (!prog || !prog.onStatement || !prog.instId) return;
+    const id = String(prog.instId).trim().toUpperCase();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+
+    setInstProgress(decisions, id, {
+      paid: prog.paidCount,
+      total: prog.billedTotal || 0,
+      billed: prog.billedCurrent !== null && prog.billedCurrent !== undefined ? prog.billedCurrent : prog.paidCount,
+      cycle: activeCycleKey || "",
+      completed: prog.isCompleted,
+      source: "bank",
+      note: prog.stmtId ? ("From " + prog.stmtId) : ""
+    });
+  });
+}
+
+function normalizeInstallmentsColumns(instSheet) {
+  if (!instSheet) return { idCol: 12, progressCol: 10, statusCol: 11 };
+
+  const maxCol = instSheet.getMaxColumns();
+  if (maxCol < 12 && typeof instSheet.insertColumnsAfter === "function") {
+    instSheet.insertColumnsAfter(maxCol, 12 - maxCol);
+  }
+
+  const lastRow = Math.max(1, instSheet.getLastRow());
+  const existingIdCol = findExistingIdColumn(instSheet, 1);
+  if (existingIdCol > 0 && existingIdCol !== 12) {
+    const idColVals = instSheet.getRange(1, existingIdCol, lastRow, 1).getValues();
+    instSheet.getRange(1, 12, lastRow, 1).setValues(idColVals);
+    if (existingIdCol === 10 || existingIdCol === 11) {
+      instSheet.getRange(1, existingIdCol, lastRow, 1).clearContent();
+    }
+  } else if (existingIdCol === 0) {
+    instSheet.getRange(1, 12).setValue(ROW_ID_HEADER);
+  }
+
+  try { instSheet.showColumns(10, 2); } catch (e) { }
+  try { instSheet.hideColumns(12); } catch (e) { }
+
+  const lastCol = instSheet.getLastColumn();
+  for (let c = lastCol; c >= 13; c--) {
+    const h = String(instSheet.getRange(1, c).getValue() || "").trim().toLowerCase();
+    if (h === "bank progress" || h === "bank status" || h === "_row_id") {
+      if (typeof instSheet.deleteColumn === "function") {
+        instSheet.deleteColumn(c);
+      } else {
+        instSheet.getRange(1, c, lastRow, 1).clearContent();
+      }
+    }
+  }
+
+  return { idCol: 12, progressCol: 10, statusCol: 11 };
+}
+
 function getOrCreateInstallmentProgressCols(instSheet) {
-  if (!instSheet) return { idCol: 12, progressCol: 13, statusCol: 14 };
+  if (!instSheet) return { idCol: 12, progressCol: 10, statusCol: 11 };
   const idCol = findExistingIdColumn(instSheet, 1) || 12;
-  const lastCol = Math.max(idCol, instSheet.getLastColumn() || idCol);
+  const lastCol = Math.max(11, instSheet.getLastColumn() || 11);
   const headers = instSheet.getRange(1, 1, 1, lastCol).getValues()[0];
 
   let progressCol = 0;
@@ -396,23 +684,37 @@ function getOrCreateInstallmentProgressCols(instSheet) {
     else if (h === "bank status") statusCol = c + 1;
   }
 
-  if (!progressCol) progressCol = Math.max(idCol + 1, 13);
-  if (!statusCol) statusCol = progressCol + 1;
-
-  const maxCol = instSheet.getMaxColumns();
-  if (statusCol > maxCol && typeof instSheet.insertColumnsAfter === "function") {
-    instSheet.insertColumnsAfter(maxCol, statusCol - maxCol);
-  }
-
-  return { idCol, progressCol, statusCol };
+  return {
+    idCol,
+    progressCol: progressCol || 10,
+    statusCol: statusCol || 11
+  };
 }
 
-function renderInstallmentProgressFormulas(ss, bounds) {
+function renderInstallmentProgressFormulas(ss, bounds, optContext) {
   if (!ss) return null;
   const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
   if (!instSheet || instSheet.getLastRow() < 1) return null;
 
-  const cols = getOrCreateInstallmentProgressCols(instSheet);
+  const ctx = optContext || {};
+  const tz = ctx.tz || ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+  const decisions = ctx.decisions || loadDecisions(ss);
+  const activeCycleKey = ctx.activeCycleKey || "";
+  const progressMap = ctx.progressMap || null;
+
+  const lastRow = instSheet.getLastRow();
+  if (lastRow >= 2) {
+    const preIdCol = findExistingIdColumn(instSheet, 1);
+    const preIds = preIdCol > 0
+      ? instSheet.getRange(2, preIdCol, lastRow - 1, 1).getValues().map(r => r[0])
+      : [];
+    migrateLegacyInstallmentColsToProgress(instSheet, decisions, preIds);
+    if (decisions._dirty && (!optContext || !optContext.decisions)) {
+      saveDecisions(ss, decisions);
+    }
+  }
+
+  const cols = normalizeInstallmentsColumns(instSheet);
   const { idCol, progressCol, statusCol } = cols;
 
   instSheet.getRange(1, progressCol, 1, 2)
@@ -421,10 +723,11 @@ function renderInstallmentProgressFormulas(ss, bounds) {
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
 
-  const lastRow = instSheet.getLastRow();
   if (lastRow < 2) return cols;
 
   const numRows = lastRow - 1;
+  const rowMeta = instSheet.getRange(2, 1, numRows, 5).getValues();
+  const idVals = instSheet.getRange(2, idCol, numRows, 1).getValues();
   const idColLet = getColumnLetter(idCol);
   const arRef = `'${CONFIG.SHEETS.ACTIVE_RECON}'`;
   const hasTable4 = Boolean(bounds && bounds.hasTable4 && bounds.startInstRow && bounds.endInstRow >= bounds.startInstRow);
@@ -433,29 +736,55 @@ function renderInstallmentProgressFormulas(ss, bounds) {
   const statusFormulas = [];
 
   for (let r = 2; r <= lastRow; r++) {
+    const idx = r - 2;
+    const startDate = parseDateValue(rowMeta[idx][1], tz);
+    const duration = parseInt(rowMeta[idx][4], 10) || 0;
+    const instId = String(idVals[idx][0] || "").trim().toUpperCase();
+    const prog = (progressMap && ((instId && progressMap[instId]) || progressMap[idx])) || null;
+
+    let fallbackPaid;
+    let fallbackCompleted;
+    if (prog && !prog.onStatement) {
+      fallbackPaid = parseInt(prog.paidCount, 10) || 0;
+      fallbackCompleted = Boolean(prog.isCompleted);
+    } else {
+      const base = resolveInstallmentBaseline({ instId, startDate, duration }, decisions, activeCycleKey, tz);
+      fallbackPaid = base.paymentsMade;
+      fallbackCompleted = base.isCompleted;
+    }
+
+    const curFallback = (prog && prog.billedCurrent) ? prog.billedCurrent : fallbackPaid;
+    const offStmtStatusExpr = fallbackCompleted
+      ? '"Completed"'
+      : `IF(AND(E${r}>0, ${fallbackPaid}>=E${r}), "Completed", "Ongoing")`;
+
     if (hasTable4) {
       const idRange = `${arRef}!$I$${bounds.startInstRow}:$I$${bounds.endInstRow}`;
       const descRange = `${arRef}!$C$${bounds.startInstRow}:$C$${bounds.endInstRow}`;
       const paidCell = `${arRef}!$H$6`;
       const idxExpr = `IFERROR(MATCH("S-*::" & id, ${idRange}, 0), IFERROR(MATCH("S-*::" & id & ":*", ${idRange}, 0), 0))`;
-      const curExpr = `IFERROR(VALUE(REGEXEXTRACT(d, "\\((\\d+)\\s+of\\s+\\d+\\)")), J${r})`;
+      const curExpr = `IFERROR(VALUE(REGEXEXTRACT(d, "\\((\\d+)\\s+of\\s+\\d+\\)")), ${curFallback})`;
       const totExpr = `IFERROR(VALUE(REGEXEXTRACT(d, "\\(\\d+\\s+of\\s+(\\d+)\\)")), E${r})`;
       const paidExpr = `IF(ISBLANK(${paidCell}), MAX(0, cur-1), cur)`;
 
       progFormulas.push([
-        `=IF(C${r}="", "", LET(id, TRIM(${idColLet}${r}), idx, ${idxExpr}, IF(idx=0, J${r} & " / " & E${r}, LET(d, INDEX(${descRange}, idx), cur, ${curExpr}, tot, ${totExpr}, paid, ${paidExpr}, paid & " / " & tot))))`
+        `=IF(C${r}="", "", LET(id, TRIM(${idColLet}${r}), idx, ${idxExpr}, IF(idx=0, ${fallbackPaid} & " / " & E${r}, LET(d, INDEX(${descRange}, idx), cur, ${curExpr}, tot, ${totExpr}, paid, ${paidExpr}, paid & " / " & tot))))`
       ]);
       statusFormulas.push([
-        `=IF(C${r}="", "", LET(id, TRIM(${idColLet}${r}), idx, ${idxExpr}, IF(idx=0, K${r}, LET(d, INDEX(${descRange}, idx), cur, ${curExpr}, tot, ${totExpr}, paid, ${paidExpr}, IF(AND(tot>0, paid>=tot), "Completed", "Ongoing")))))`
+        `=IF(C${r}="", "", LET(id, TRIM(${idColLet}${r}), idx, ${idxExpr}, IF(idx=0, ${offStmtStatusExpr}, LET(d, INDEX(${descRange}, idx), cur, ${curExpr}, tot, ${totExpr}, paid, ${paidExpr}, IF(AND(tot>0, paid>=tot), "Completed", "Ongoing")))))`
       ]);
     } else {
-      progFormulas.push([`=IF(C${r}="", "", J${r} & " / " & E${r})`]);
-      statusFormulas.push([`=IF(C${r}="", "", K${r})`]);
+      progFormulas.push([`=IF(C${r}="", "", ${fallbackPaid} & " / " & E${r})`]);
+      statusFormulas.push([`=IF(C${r}="", "", ${offStmtStatusExpr})`]);
     }
   }
 
-  instSheet.getRange(2, progressCol, numRows, 1).setValues(progFormulas).setFontSize(9).setHorizontalAlignment("center");
-  instSheet.getRange(2, statusCol, numRows, 1).setValues(statusFormulas).setFontSize(9).setHorizontalAlignment("center");
+  const progRange = instSheet.getRange(2, progressCol, numRows, 1);
+  const statusRange = instSheet.getRange(2, statusCol, numRows, 1);
+  try { progRange.clearDataValidations(); } catch (e) { }
+  try { statusRange.clearDataValidations(); } catch (e) { }
+  progRange.setNumberFormat("@").setValues(progFormulas).setFontSize(9).setHorizontalAlignment("center");
+  statusRange.setNumberFormat("@").setValues(statusFormulas).setFontSize(9).setHorizontalAlignment("center");
 
   return cols;
 }

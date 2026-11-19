@@ -94,6 +94,18 @@ class MockRange {
   getNumRows() { return this.nr; }
   getNumColumns() { return this.nc; }
   getValue() { return this.sheet._getCell(this.r, this.c); }
+  getFormulas() {
+    const out = [];
+    for (let i = 0; i < this.nr; i++) {
+      const row = [];
+      for (let j = 0; j < this.nc; j++) {
+        const v = this.sheet._getCell(this.r + i, this.c + j);
+        row.push(typeof v === "string" && v.startsWith("=") ? v : "");
+      }
+      out.push(row);
+    }
+    return out;
+  }
   getValues() {
     const out = [];
     for (let i = 0; i < this.nr; i++) {
@@ -141,6 +153,14 @@ class MockRange {
     for (let i = 0; i < this.nr; i++) {
       for (let j = 0; j < this.nc; j++) {
         this.sheet.validations[`${this.r + i}_${this.c + j}`] = dv;
+      }
+    }
+    return this;
+  }
+  clearDataValidations() {
+    for (let i = 0; i < this.nr; i++) {
+      for (let j = 0; j < this.nc; j++) {
+        delete this.sheet.validations[`${this.r + i}_${this.c + j}`];
       }
     }
     return this;
@@ -212,6 +232,43 @@ class MockSheet {
   getMaxColumns() { return this.maxCol; }
   getMaxRows() { return Math.max(this.getLastRow(), 50); }
   insertColumnsAfter(afterPos, howMany) { this.maxCol += (howMany || 1); }
+  deleteColumns(colIndex, howMany) {
+    const count = howMany || 1;
+    const shiftGrid = src => {
+      const next = {};
+      Object.keys(src).forEach(k => {
+        const parts = k.split("_");
+        const r = parseInt(parts[0], 10);
+        const c = parseInt(parts[1], 10);
+        if (c < colIndex) next[k] = src[k];
+        else if (c >= colIndex + count) next[`${r}_${c - count}`] = src[k];
+      });
+      return next;
+    };
+    this.grid = shiftGrid(this.grid);
+    this.backgrounds = shiftGrid(this.backgrounds);
+    this.validations = shiftGrid(this.validations);
+
+    const nextWidths = {};
+    Object.keys(this.colWidths).forEach(cs => {
+      const c = parseInt(cs, 10);
+      if (c < colIndex) nextWidths[c] = this.colWidths[cs];
+      else if (c >= colIndex + count) nextWidths[c - count] = this.colWidths[cs];
+    });
+    this.colWidths = nextWidths;
+
+    const nextHidden = new Set();
+    this.hiddenCols.forEach(c => {
+      if (c < colIndex) nextHidden.add(c);
+      else if (c >= colIndex + count) nextHidden.add(c - count);
+    });
+    this.hiddenCols = nextHidden;
+
+    this.maxCol = Math.max(1, this.maxCol - count);
+  }
+  deleteColumn(colIndex) {
+    this.deleteColumns(colIndex, 1);
+  }
   clear() {
     this.grid = {};
     this.backgrounds = {};

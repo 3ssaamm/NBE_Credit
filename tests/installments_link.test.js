@@ -205,4 +205,212 @@ const tz = "Africa/Cairo";
   assert.strictEqual(Number(replayLedger.installmentsTotal.toFixed(2)), 260.89);
 }
 
-console.log("installments_link.test.js: all Phase 3 installment link, cross-month reuse, emoji, and replay assertions passed.");
+// ==========================================
+// Test 5: Real October Fixture In-Place Col J/K Replacement, Duplicate M/N Cleanup & Two-Pass Stability
+// ==========================================
+{
+  const realFixturePath = path.join(__dirname, "fixtures", "2026-11-real.json");
+  const realFixture = JSON.parse(fs.readFileSync(realFixturePath, "utf8"));
+
+  const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
+  const ss = new MockSpreadsheet();
+  setActiveSpreadsheet(ss);
+  populateSpreadsheetFromFixture(ss, realFixture, CONFIG);
+
+  const inst = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  // Simulate leftover Phase 3 duplicate columns M & N on Installments
+  inst.getRange(1, 13, 1, 2).setValues([["Bank Progress", "Bank Status"]]);
+  inst.getRange(2, 13, 2, 2).setValues([
+    ["=LET(...)", "=LET(...)"],
+    ["=LET(...)", "=LET(...)"]
+  ]);
+  // Add sample manual data validation dropdown rule on Col K to verify clearDataValidations removes it
+  inst.getRange(2, 11, 5, 1).setDataValidation({ dummy: true });
+
+  // Pass 1 & Pass 2 full dashboard refresh
+  sandbox.updateLiveDashboard();
+  sandbox.updateLiveDashboard();
+
+  assert.strictEqual(inst._getCell(1, 10), "Bank Progress", "Col J must become Bank Progress");
+  assert.strictEqual(inst._getCell(1, 11), "Bank Status", "Col K must become Bank Status");
+  assert.strictEqual(inst._getCell(1, 12), "_Row_ID", "Col L must stay hidden _Row_ID");
+  assert.ok(inst.hiddenCols.has(12), "Installments Col L (_Row_ID) must be hidden");
+  assert.ok(!inst.hiddenCols.has(10) && !inst.hiddenCols.has(11), "Cols J & K must be visible");
+  assert.strictEqual(inst.getLastColumn(), 12, "Duplicate Phase 3 Cols M/N must be deleted");
+  assert.strictEqual(inst.validations["2_11"], undefined, "Stale manual dropdown validation on Col K must be cleared");
+
+  // Every data row 2..40 must have non-self-referencing formulas
+  for (let r = 2; r <= 40; r++) {
+    const fJ = String(inst._getCell(r, 10));
+    const fK = String(inst._getCell(r, 11));
+    assert.ok(fJ.startsWith("=") && !/\b[JK]\d+\b/.test(fJ), `Row ${r} Col J formula must not self-reference: ${fJ}`);
+    assert.ok(fK.startsWith("=") && !/\b[JK]\d+\b/.test(fK), `Row ${r} Col K formula must not self-reference: ${fK}`);
+  }
+
+  // I-00016 & I-00017 stay Completed and excluded from Table 4 Sheet Only; I-00036..I-00039 stay Ongoing 0/12
+  assert.ok(String(inst._getCell(17, 10)).includes('12 & " / " & E17') || String(inst._getCell(17, 10)).includes("12"), "I-00016 must keep 12/12 progress");
+  assert.ok(String(inst._getCell(17, 11)).includes('"Completed"'), "I-00016 must stay Completed");
+  assert.ok(String(inst._getCell(18, 11)).includes('"Completed"'), "I-00017 must stay Completed");
+  assert.ok(String(inst._getCell(37, 10)).includes('0 & " / " & E37'), "Future I-00036 must show 0 / E37");
+  assert.ok(String(inst._getCell(37, 11)).includes('"Ongoing"'), "Future I-00036 must stay Ongoing");
+
+  const recon = sandbox.reconcileActiveStatement(ss, tz);
+  assert.strictEqual(Number(recon.cardBal.totalBlockedInstallments.toFixed(2)), 19542.07);
+  const sheetOnlyIds = recon.unmatchedSheetInstallments.map(x => x.instId).sort();
+  assert.deepStrictEqual(Array.from(sheetOnlyIds), ["I-00036", "I-00037", "I-00038", "I-00039"]);
+
+  const mb = ss.getSheetByName(CONFIG.SHEETS.MEMBER_BREAKDOWN);
+  const mbInstFormula = String(mb._getCell(10, 8) || "");
+  assert.ok(mbInstFormula.includes("$I$2:$K"), `Member Breakdown right table must project $I$2:$K: ${mbInstFormula}`);
+
+  // Confirm Test 5 migrated I-00016 & I-00017 into INST_PROGRESS
+  const dec5 = sandbox.loadDecisions(ss);
+  assert.ok(dec5.instProgress["I-00016"] && dec5.instProgress["I-00016"].completed === true, "I-00016 must persist Completed in INST_PROGRESS");
+  assert.ok(dec5.instProgress["I-00017"] && dec5.instProgress["I-00017"].completed === true, "I-00017 must persist Completed in INST_PROGRESS");
+}
+
+// ==========================================
+// Test 6: Recovery If User Already Manually Deleted Cols J & K
+// ==========================================
+{
+  const realFixturePath = path.join(__dirname, "fixtures", "2026-11-real.json");
+  const realFixture = JSON.parse(fs.readFileSync(realFixturePath, "utf8"));
+
+  const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
+  const ss = new MockSpreadsheet();
+  setActiveSpreadsheet(ss);
+  populateSpreadsheetFromFixture(ss, realFixture, CONFIG);
+
+  const inst = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  // Add Phase 3 M/N then simulate user deleting manual Cols J & K (cols 10..11) BEFORE running updateLiveDashboard
+  inst.getRange(1, 13, 1, 2).setValues([["Bank Progress", "Bank Status"]]);
+  inst.deleteColumns(10, 2);
+  assert.strictEqual(inst._getCell(1, 10), "_Row_ID", "After user deletes J & K, _Row_ID shifted to Col 10");
+
+  sandbox.updateLiveDashboard();
+
+  assert.strictEqual(inst._getCell(1, 10), "Bank Progress", "Col J must be restored as Bank Progress");
+  assert.strictEqual(inst._getCell(1, 11), "Bank Status", "Col K must be restored as Bank Status");
+  assert.strictEqual(inst._getCell(1, 12), "_Row_ID", "Col L must be restored as hidden _Row_ID");
+  assert.strictEqual(inst._getCell(2, 12), "I-00001", "Existing I-00001 ID must be preserved cleanly in Col L");
+  assert.strictEqual(inst._getCell(17, 12), "I-00016", "Existing I-00016 ID must be preserved cleanly in Col L");
+  assert.ok(inst.hiddenCols.has(12), "Col L (_Row_ID) must be hidden");
+  assert.ok(!inst.hiddenCols.has(10) && !inst.hiddenCols.has(11), "Cols J & K must be unhidden/visible");
+  assert.strictEqual(inst.getLastColumn(), 12);
+
+  const recon = sandbox.reconcileActiveStatement(ss, tz);
+  // I-00017 (2025-11-30, 2m -> last cycle 2026-02 < 2026-11) recovers Completed via calendar fallback even if manual cols were pre-deleted
+  assert.ok(!recon.unmatchedSheetInstallments.some(x => x.instId === "I-00017"), "Past I-00017 must recover Completed via calendar fallback");
+
+  // Also verify post-migration recovery: once INST_PROGRESS exists, even deleting J/K preserves exact 19542.07 blocked total
+  const ss2 = new MockSpreadsheet();
+  setActiveSpreadsheet(ss2);
+  populateSpreadsheetFromFixture(ss2, realFixture, CONFIG);
+  sandbox.updateLiveDashboard();
+  const inst2 = ss2.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  inst2.deleteColumns(10, 2);
+  sandbox.updateLiveDashboard();
+  const recon2 = sandbox.reconcileActiveStatement(ss2, tz);
+  assert.strictEqual(inst2._getCell(1, 10), "Bank Progress");
+  assert.strictEqual(inst2._getCell(1, 11), "Bank Status");
+  assert.strictEqual(inst2._getCell(1, 12), "_Row_ID");
+  assert.strictEqual(Number(recon2.cardBal.totalBlockedInstallments.toFixed(2)), 19542.07);
+}
+
+// ==========================================
+// Test 7 & 8: Cross-Month Completion Without H6 & handlePaymentDateEdit Non-Clobber
+// ==========================================
+{
+  const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
+  const ss = new MockSpreadsheet();
+  setActiveSpreadsheet(ss);
+
+  const inst = ss.insertSheet(CONFIG.SHEETS.INSTALLMENTS);
+  inst.getRange(1, 1, 1, 11).setValues([["#", "Start Date", "Description", "Total Price", "Months", "C6", "C7", "EMI", "Payer", "Payments Made", "Status"]]);
+  inst.getRange(2, 1, 2, 11).setValues([
+    [1, new Date(2026, 4, 10, 12, 0, 0), "Gym Plan", 600, 6, 0, 0, 100, "Mido", 5, "Ongoing"],
+    [2, new Date(2026, 7, 10, 12, 0, 0), "Phone Plan", 1200, 6, 0, 0, 200, "Mai", 2, "Ongoing"]
+  ]);
+
+  sandbox.writeStatementToSheet(ss, {
+    statementDate: "31-10-2026",
+    dueDate: "27-11-2026",
+    creditLimit: 100000,
+    openingBalance: 0,
+    closingBalance: 300,
+    totalDebit: 300,
+    totalCredit: 0,
+    card: "1234"
+  }, [
+    { txDate: "31-10-2026", postDate: "31-10-2026", desc: "GYM PLAN 6 OF 6", type: "INSTALLMENT", amount: 100 },
+    { txDate: "31-10-2026", postDate: "31-10-2026", desc: "PHONE PLAN 3 OF 6", type: "INSTALLMENT", amount: 200 }
+  ]);
+
+  sandbox.updateLiveDashboard();
+
+  const gymId = inst._getCell(2, 12);
+  const phoneId = inst._getCell(3, 12);
+  let dec = sandbox.loadDecisions(ss);
+  assert.strictEqual(dec.instProgress[gymId].paid, 5, "While H6 blank, Gym 6 OF 6 stores paid=5, billed=6");
+  assert.strictEqual(dec.instProgress[gymId].billed, 6);
+  assert.strictEqual(dec.instProgress[phoneId].paid, 2);
+
+  // Test 8: handlePaymentDateEdit must save BOTH CYCLE_PAYMENT and updated INST_PROGRESS without clobbering
+  const ar = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+  ar.getRange(6, 8).setValue("2026-11-25");
+  sandbox.handlePaymentDateEdit(ar, ar.getRange(6, 8), tz, true);
+
+  dec = sandbox.loadDecisions(ss);
+  assert.ok(dec.paymentRecords["2026-11"] && dec.paymentRecords["2026-11"].dateStr === "2026-11-25", "CYCLE_PAYMENT must persist");
+  assert.strictEqual(dec.instProgress[phoneId].paid, 3, "INST_PROGRESS must NOT be clobbered by saveDecisions in handlePaymentDateEdit");
+  assert.strictEqual(dec.instProgress[gymId].completed, true, "Gym becomes Completed when H6 is paid");
+
+  // Clear H6 -> reverts both CYCLE_PAYMENT and INST_PROGRESS cleanly
+  ar.getRange(6, 8).setValue("");
+  sandbox.handlePaymentDateEdit(ar, ar.getRange(6, 8), tz, true);
+
+  dec = sandbox.loadDecisions(ss);
+  assert.strictEqual(dec.paymentRecords["2026-11"], undefined, "Clearing H6 must remove CYCLE_PAYMENT");
+  assert.strictEqual(dec.instProgress[phoneId].paid, 2, "Clearing H6 must revert Phone INST_PROGRESS to paid=2");
+  assert.strictEqual(dec.instProgress[gymId].completed, false, "Clearing H6 must revert Gym to unpaid (billed=6)");
+
+  // Test 7 continued: Import next cycle (2026-12) WITHOUT Gym (since 6/6 finished even though H6 was never filled!)
+  sandbox.writeStatementToSheet(ss, {
+    statementDate: "30-11-2026",
+    dueDate: "27-12-2026",
+    creditLimit: 100000,
+    openingBalance: 0,
+    closingBalance: 200,
+    totalDebit: 200,
+    totalCredit: 0,
+    card: "1234"
+  }, [
+    { txDate: "30-11-2026", postDate: "30-11-2026", desc: "PHONE PLAN 4 OF 6", type: "INSTALLMENT", amount: 200 }
+  ]);
+
+  sandbox.updateLiveDashboard();
+  const decRecon = sandbox.reconcileActiveStatement(ss, tz);
+  assert.strictEqual(decRecon.unmatchedSheetInstallments.length, 0, "Completed Gym Plan from 2026-11 must NOT appear as Sheet Only in 2026-12");
+  assert.ok(String(inst._getCell(2, 11)).includes('"Completed"'), "Gym Col K formula must resolve Completed in 2026-12");
+  assert.strictEqual(Number(decRecon.cardBal.totalBlockedInstallments.toFixed(2)), 600.00, "Only Phone Plan (3 remaining * 200 = 600) should be blocked");
+
+  // Test 9: Export anonymized fixture from formula-based Col J/K + INST_PROGRESS & replay losslessly
+  const exported = sandbox.buildAnonymizedFixture(ss, tz);
+  const serializedExp = JSON.stringify(exported).toLowerCase();
+  assert.ok(exported.decisions.some(d => d[0] === "INST_PROGRESS"), "Exported fixture must preserve INST_PROGRESS decisions");
+  ["gym", "phone", "mido", "mai"].forEach(tok => {
+    assert.ok(!serializedExp.includes(tok), `Exported fixture must not leak token "${tok}"`);
+  });
+
+  const replayEnv3 = createGasSandbox();
+  const ssReplay3 = new MockSpreadsheet();
+  replayEnv3.setActiveSpreadsheet(ssReplay3);
+  populateSpreadsheetFromFixture(ssReplay3, exported, replayEnv3.CONFIG);
+  const replayRecon3 = replayEnv3.sandbox.reconcileActiveStatement(ssReplay3, tz);
+  const replayLedger3 = replayEnv3.sandbox.buildDebtLedger(ssReplay3, tz, replayRecon3);
+  assert.strictEqual(replayRecon3.unmatchedSheetInstallments.length, 0, "Replayed 2026-12 fixture must keep Gym Completed (not Sheet Only)");
+  assert.strictEqual(Number(replayRecon3.cardBal.totalBlockedInstallments.toFixed(2)), 600.00);
+  assert.strictEqual(Number(replayLedger3.installmentsTotal.toFixed(2)), 200.00);
+}
+
+console.log("installments_link.test.js: all Phase 3 installment link, cross-month reuse, column replacement, emoji, and replay assertions passed.");

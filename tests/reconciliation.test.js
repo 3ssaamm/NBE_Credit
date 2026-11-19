@@ -223,10 +223,14 @@ for (let i = 0; i < ledger4.personShares.length; i++) {
 }
 
 sandbox.syncInstallmentsFromStatement(ss, tz, true);
-assert.strictEqual(instSheet._getCell(2, 10), 9, "syncInstallmentsFromStatement must NEVER overwrite user's Payments Made column (Col J)");
-assert.strictEqual(instSheet._getCell(1, 13), "Bank Progress", "Should populate read-only Bank Progress formula header in Col M");
-assert.strictEqual(instSheet._getCell(1, 14), "Bank Status", "Should populate read-only Bank Status formula header in Col N");
-assert.ok(String(instSheet._getCell(2, 13)).includes("LET("), "Bank Progress column should use reactive LET formula");
+assert.strictEqual(instSheet._getCell(1, 10), "Bank Progress", "Should populate reactive Bank Progress header in Col J");
+assert.strictEqual(instSheet._getCell(1, 11), "Bank Status", "Should populate reactive Bank Status header in Col K");
+assert.strictEqual(instSheet._getCell(1, 12), "_Row_ID", "Should keep hidden _Row_ID in Col L");
+assert.ok(instSheet.hiddenCols.has(12), "Installments Col L (_Row_ID) must be hidden");
+assert.strictEqual(instSheet.getLastColumn(), 12, "No redundant Cols M/N should exist on Installments");
+assert.ok(String(instSheet._getCell(2, 10)).includes("LET("), "Bank Progress column (Col J) should use reactive LET formula");
+assert.ok(!String(instSheet._getCell(2, 10)).includes("J2") && !String(instSheet._getCell(2, 10)).includes("K2"), "Bank Progress Col J must not self-reference J2/K2");
+assert.ok(!String(instSheet._getCell(2, 11)).includes("J2") && !String(instSheet._getCell(2, 11)).includes("K2"), "Bank Status Col K must not self-reference J2/K2");
 
 // ==========================================
 // Test 5: Multi-Date NUTOPIA Persistence, Legacy _#k Recovery & Same-Date Isolation

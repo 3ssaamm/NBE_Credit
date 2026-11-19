@@ -43,6 +43,7 @@ function loadDecisions(ss) {
     instOverride: {},
     instLinks: {},
     stmtInstLink: {},
+    instProgress: {},
     merchantAliases: {},
     paymentRecords: {},
     counters: { S: 0, T: 0, I: 0 },
@@ -161,6 +162,30 @@ function loadDecisions(ss) {
           isApplied: locked,
           updatedAt
         };
+      } else if (type === "INST_PROGRESS" && subjectId) {
+        let meta = {};
+        try {
+          if (target) meta = JSON.parse(target);
+        } catch (e) { }
+        const id = subjectId.toUpperCase();
+        const rawPaid = parseInt(meta.paid, 10);
+        const rawTotal = parseInt(meta.total, 10);
+        const rawBilled = parseInt(meta.billed, 10);
+        const paid = isNaN(rawPaid) ? 0 : rawPaid;
+        const total = isNaN(rawTotal) ? 0 : rawTotal;
+        const billed = isNaN(rawBilled) ? paid : rawBilled;
+        store.instProgress[id] = {
+          instId: id,
+          paid,
+          total,
+          billed,
+          cycle: String(meta.cycle || "").trim(),
+          completed: meta.completed === true,
+          note,
+          source,
+          locked,
+          updatedAt
+        };
       }
     });
   } catch (err) {
@@ -239,6 +264,22 @@ function saveDecisions(ss, decisions) {
       const a = decisions.merchantAliases[key];
       if (!a || !a.stmtKey || !a.txKey) return;
       rows.push(["MERCHANT_ALIAS", a.stmtKey, a.txKey, a.note || "", a.source || "user", a.locked !== false, a.updatedAt || nowStr]);
+    });
+
+    Object.keys(decisions.instProgress || {}).sort().forEach(instId => {
+      const p = decisions.instProgress[instId];
+      if (!p) return;
+      const paid = parseInt(p.paid, 10) || 0;
+      const total = parseInt(p.total, 10) || 0;
+      const billed = p.billed !== undefined && p.billed !== null ? (parseInt(p.billed, 10) || 0) : paid;
+      const payload = JSON.stringify({
+        paid,
+        total,
+        billed,
+        cycle: String(p.cycle || "").trim(),
+        completed: p.completed === true
+      });
+      rows.push(["INST_PROGRESS", instId, payload, p.note || "", p.source || "system", p.locked !== false, p.updatedAt || nowStr]);
     });
 
     const lastRow = sheet.getLastRow();
@@ -430,6 +471,47 @@ function clearStmtInstLink(decisions, stmtId) {
     delete decisions.stmtInstLink[stmtId];
     decisions._dirty = true;
   }
+}
+
+function setInstProgress(decisions, instId, entry) {
+  const id = String(instId || "").trim().toUpperCase();
+  if (!decisions || !id || !entry) return;
+  if (!decisions.instProgress) decisions.instProgress = {};
+
+  const rawPaid = parseInt(entry.paid, 10);
+  const rawTotal = parseInt(entry.total, 10);
+  const rawBilled = (entry.billed !== undefined && entry.billed !== null) ? parseInt(entry.billed, 10) : rawPaid;
+  const paid = isNaN(rawPaid) ? 0 : rawPaid;
+  const total = isNaN(rawTotal) ? 0 : rawTotal;
+  const billed = isNaN(rawBilled) ? paid : rawBilled;
+  const cycle = String(entry.cycle || "").trim();
+  const completed = Boolean(entry.completed);
+
+  const existing = decisions.instProgress[id];
+  if (
+    existing &&
+    existing.paid === paid &&
+    existing.total === total &&
+    existing.billed === billed &&
+    existing.cycle === cycle &&
+    existing.completed === completed
+  ) {
+    return;
+  }
+
+  decisions.instProgress[id] = {
+    instId: id,
+    paid,
+    total,
+    billed,
+    cycle,
+    completed,
+    note: entry.note || "",
+    source: entry.source || "system",
+    locked: entry.locked !== false,
+    updatedAt: nowCairoTimestamp_()
+  };
+  decisions._dirty = true;
 }
 
 function lookupTxDescriptionsByIds_(ss, txIds) {
