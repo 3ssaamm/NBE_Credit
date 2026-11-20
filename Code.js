@@ -1218,6 +1218,39 @@ function reconcileActiveStatement(ss, tz, optContext) {
       : "Merchant Refund (Reduces Debt)"
   });
 
+  // 10. Optional Assignable Prior Cycle Carryover Item (Opening Balance - Neglected Bill Payments)
+  let neglectedBillPayments = 0;
+  stmtCredits.forEach(cr => {
+    if (isPaymentCreditDesc(cr.desc) && isNeglectedPayer(cr.assignedPayer)) {
+      neglectedBillPayments += cr.amount;
+    }
+  });
+  const carrySubjectId = "CARRY::" + (cardBal.activeCycleKey || "ACTIVE");
+  const rawCarryover = Number(((cardBal.openingBalance || 0) - neglectedBillPayments).toFixed(2));
+  const savedCarry = decisions.stmtAssign && decisions.stmtAssign[carrySubjectId];
+  const hasSavedCarry = Boolean(
+    savedCarry &&
+    savedCarry.target &&
+    savedCarry.target !== "NEGLECT" &&
+    !isNeglectedPayer(savedCarry.target) &&
+    !savedCarry.isNeglected
+  );
+  const carryoverItem = {
+    id: "CARRY-1",
+    subjectId: carrySubjectId,
+    date: cardBal.statementDate || "",
+    dateStr: cardBal.statementDate ? Utilities.formatDate(cardBal.statementDate, tz, "yyyy-MM-dd") : "",
+    desc: "Prior Cycle Carryover (Opening − Neglected Payments)",
+    amount: rawCarryover,
+    category: "Prior Cycle Carryover",
+    assignedPayer: hasSavedCarry
+      ? (formatPayerCell(savedCarry.target) || savedCarry.target)
+      : "🚫 Keep Unassigned (Prior Cycle)",
+    isAssigned: hasSavedCarry,
+    note: (savedCarry && savedCarry.note) ? savedCarry.note : "Optional: assign to a member, or leave unassigned",
+    showRow: Math.abs(rawCarryover) >= 0.01 || hasSavedCarry
+  };
+
   // Apply Orphan Log dismiss decisions purely by permanent SubjectId
   orphanLogs.forEach(tx => {
     tx.isNeglected = Boolean(tx.subjectId && decisions.txNeglect && decisions.txNeglect[tx.subjectId]);
@@ -1238,6 +1271,7 @@ function reconcileActiveStatement(ss, tz, optContext) {
     installmentReconItems,
     stmtFees,
     stmtCredits,
+    carryoverItem,
     suggestedMatches,
     missingInSheet,
     txDebits,
@@ -1418,6 +1452,24 @@ function buildDebtLedger(ss, tz, recon) {
     }
   });
 
+  // 5b. Assignable Prior Cycle Carryover (added to assigned member's shares without double-counting in F6)
+  const openingBalance = cardBal.openingBalance || 0;
+  const carriedOver = openingBalance - billPaymentsTotal;
+  const carryItem = recon.carryoverItem || null;
+  const carryAssignedPayer = (carryItem && carryItem.assignedPayer && !isNeglectedPayer(carryItem.assignedPayer))
+    ? carryItem.assignedPayer
+    : "";
+  let assignedCarryover = 0;
+  if (carryAssignedPayer && Math.abs(carriedOver) >= 0.005) {
+    if (carriedOver > 0) {
+      addShare(carryAssignedPayer, carriedOver, "Unrecorded");
+    } else {
+      addShare(carryAssignedPayer, Math.abs(carriedOver), "Refund");
+    }
+    assignedCarryover = carriedOver;
+  }
+  const unassignedCarriedOver = carriedOver - assignedCarryover;
+
   let purchasesTotal = 0;
   let installmentsTotal = 0;
   let feesTotal = 0;
@@ -1456,9 +1508,7 @@ function buildDebtLedger(ss, tz, recon) {
   const unresolvedTotal = unassignedTotal + unresolvedFeesTotal - unresolvedCreditsTotal + unresolvedInstTotal;
 
   const closingBill = cardBal.billedBalance || 0;
-  const openingBalance = cardBal.openingBalance || 0;
-  const carriedOver = openingBalance - billPaymentsTotal;
-  const auditDifference = (familySharesTotal + carriedOver) - closingBill;
+  const auditDifference = (familySharesTotal + unassignedCarriedOver) - closingBill;
   const isExactMatch = Math.abs(auditDifference) < 0.50;
 
   return {
@@ -1469,6 +1519,9 @@ function buildDebtLedger(ss, tz, recon) {
     openingBalance,
     billPaymentsTotal,
     carriedOver,
+    carryoverAssignedPayer: carryAssignedPayer,
+    assignedCarryover,
+    unassignedCarriedOver,
     purchasesTotal,
     installmentsTotal,
     feesTotal,
@@ -1520,10 +1573,14 @@ function getReconTableBounds(ledger, recon) {
 
   const creditsCount = recon.stmtCredits ? recon.stmtCredits.length : 0;
   const unlinkedInstCount = recon.unlinkedStmtInstallments ? recon.unlinkedStmtInstallments.length : 0;
-  const numExceptions = (recon.stmtFees ? recon.stmtFees.length : 0) + creditsCount + unlinkedInstCount + (recon.missingInSheet ? recon.missingInSheet.length : 0);
+  const numBankExceptions = (recon.stmtFees ? recon.stmtFees.length : 0) + creditsCount + unlinkedInstCount + (recon.missingInSheet ? recon.missingInSheet.length : 0);
+  const hasCarryoverRow = Boolean(recon && recon.carryoverItem && recon.carryoverItem.showRow);
+  const numExceptions = numBankExceptions + (hasCarryoverRow ? 1 : 0);
   const startExHeaderRow = totShareRow + 3;
   const startExRow = startExHeaderRow + 2;
   const endExRow = startExRow + Math.max(1, numExceptions) - 1;
+  const bankExEndRow = numBankExceptions > 0 ? (startExRow + numBankExceptions - 1) : (startExRow - 1);
+  const carryRow = hasCarryoverRow ? endExRow : -1;
 
   const numOrphans = (recon.orphanLogs || recon.expandedUnmatched || []).length;
   const hasOrphanTable = numOrphans > 0;
@@ -1547,7 +1604,8 @@ function getReconTableBounds(ledger, recon) {
 
   return {
     numPayers, startShareRow, endShareRow, totShareRow,
-    numExceptions, startExHeaderRow, startExRow, endExRow,
+    numBankExceptions, numExceptions, startExHeaderRow, startExRow, bankExEndRow, endExRow,
+    hasCarryoverRow, carryRow,
     numOrphans, hasOrphanTable, startOrphanHeaderRow, startOrphanRow, endOrphanRow,
     numUnmatched: numOrphans, hasTable3: hasOrphanTable,
     startTxHeaderRow: startOrphanHeaderRow, startTxRow: startOrphanRow, endTxRow: endOrphanRow,
@@ -1708,10 +1766,14 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     });
   });
 
-  const numExceptions = exceptionItems.length;
+  const numBankExceptions = bounds.numBankExceptions;
+  const numExceptions = bounds.numExceptions;
   const startExHeaderRow = bounds.startExHeaderRow;
   const startExRow = bounds.startExRow;
+  const bankExEndRow = bounds.bankExEndRow;
   const endExRow = bounds.endExRow;
+  const hasCarryoverRow = bounds.hasCarryoverRow;
+  const carryRow = bounds.carryRow;
 
   // Orphan Logs (in-period transactions without a paired bank line)
   const orphanList = recon.orphanLogs || recon.expandedUnmatched || [];
@@ -1742,14 +1804,15 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     t2UnresolvedAmt,
     unresolvedCountExpr,
     unresolvedAmtExpr,
-    carriedOverExpr
+    negPayExpr,
+    unassignedCarriedOverExpr
   } = healthModel.expressions;
 
   const badgeFormula = `=IF(AND(${unresolvedCountExpr}=0, ABS(F6)<0.5), "✅ Balanced (0 unresolved · 0.00 diff)", IF(${unresolvedCountExpr}>0, "⚠️ Unresolved: " & ${unresolvedCountExpr} & " line(s) (" & TEXT(${unresolvedAmtExpr},"#,##0.00") & " EGP)", IF(F6>0, "ℹ️ Statement Check: +" & TEXT(F6,"#,##0.00") & " EGP", "⚠️ Statement Check: -" & TEXT(ABS(F6),"#,##0.00") & " EGP")))`;
 
   const kpiRows = [
     ["Statement Date:", stmtDateStr, "Bank Closing Bill:", ledger.closingBill, "Recon Status:", badgeFormula],
-    ["Payment Due Date:", dueDateStr, "Family Shares Total:", `=H${totShareRow}`, "Statement Check:", `=(D6 + ${carriedOverExpr}) - D5`],
+    ["Payment Due Date:", dueDateStr, "Family Shares Total:", `=H${totShareRow}`, "Statement Check:", `=(D6 + ${unassignedCarriedOverExpr}) - D5`],
     ["Active Billing Cycle:", ledger.activeCycleLabel, "Total Card Utilized:", recon.cardBal.totalUtilized, "Available Limit Now:", recon.cardBal.availableBalanceNow]
   ];
 
@@ -1829,24 +1892,43 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       const r = startShareRow + idx;
       const purchFormula = `=${ps.matchedPurchases.toFixed(2)}`;
       let instFormula;
-      if (hasTable4 && numExceptions > 0) {
-        instFormula = `=SUMIFS($D$${startInstRow}:$D$${endInstRow}, $F$${startInstRow}:$F$${endInstRow}, "*" & TRIM($B${r}) & "*", $F$${startInstRow}:$F$${endInstRow}, "<>🚫*") + SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Installment*")`;
+      if (hasTable4 && numBankExceptions > 0) {
+        instFormula = `=SUMIFS($D$${startInstRow}:$D$${endInstRow}, $F$${startInstRow}:$F$${endInstRow}, "*" & TRIM($B${r}) & "*", $F$${startInstRow}:$F$${endInstRow}, "<>🚫*") + SUMIFS($D$${startExRow}:$D$${bankExEndRow}, $F$${startExRow}:$F$${bankExEndRow}, $B${r}, $E$${startExRow}:$E$${bankExEndRow}, "Installment*")`;
       } else if (hasTable4) {
         instFormula = `=SUMIFS($D$${startInstRow}:$D$${endInstRow}, $F$${startInstRow}:$F$${endInstRow}, "*" & TRIM($B${r}) & "*", $F$${startInstRow}:$F$${endInstRow}, "<>🚫*")`;
-      } else if (numExceptions > 0) {
-        instFormula = `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Installment*")`;
+      } else if (numBankExceptions > 0) {
+        instFormula = `=SUMIFS($D$${startExRow}:$D$${bankExEndRow}, $F$${startExRow}:$F$${bankExEndRow}, $B${r}, $E$${startExRow}:$E$${bankExEndRow}, "Installment*")`;
       } else {
         instFormula = `=${ps.installments.toFixed(2)}`;
       }
-      const feesFormula = numExceptions > 0
-        ? `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Bank Fee / Tax")`
+      const feesFormula = numBankExceptions > 0
+        ? `=SUMIFS($D$${startExRow}:$D$${bankExEndRow}, $F$${startExRow}:$F$${bankExEndRow}, $B${r}, $E$${startExRow}:$E$${bankExEndRow}, "Bank Fee / Tax")`
         : "=0";
-      const unrecFormula = numExceptions > 0
-        ? `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "Missing Purchase*")`
-        : "=0";
-      const refFormula = numExceptions > 0
-        ? `=SUMIFS($D$${startExRow}:$D$${endExRow}, $F$${startExRow}:$F$${endExRow}, $B${r}, $E$${startExRow}:$E$${endExRow}, "*Credit*")`
-        : "=0";
+
+      let posCarryTerm = "";
+      let negCarryTerm = "";
+      if (hasCarryoverRow && carryRow > 0) {
+        const carryNormPayer = `SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(TRIM($F$${carryRow}), " + ", "+"), ", ", "+"), ",", "+")`;
+        const carryMemberMatch = `ISNUMBER(SEARCH("+" & TRIM($B${r}) & "+", "+" & ${carryNormPayer} & "+"))`;
+        const carrySplitDenom = `(LEN(${carryNormPayer}) - LEN(SUBSTITUTE(${carryNormPayer}, "+", "")) + 1)`;
+        posCarryTerm = `IF(AND($D$${carryRow}>0, ISERROR(SEARCH("🚫", $F$${carryRow})), ${carryMemberMatch}), $D$${carryRow} / ${carrySplitDenom}, 0)`;
+        negCarryTerm = `IF(AND($D$${carryRow}<0, ISERROR(SEARCH("🚫", $F$${carryRow})), ${carryMemberMatch}), ABS($D$${carryRow}) / ${carrySplitDenom}, 0)`;
+      }
+
+      const unrecBase = numBankExceptions > 0
+        ? `SUMIFS($D$${startExRow}:$D$${bankExEndRow}, $F$${startExRow}:$F$${bankExEndRow}, $B${r}, $E$${startExRow}:$E$${bankExEndRow}, "Missing Purchase*")`
+        : "";
+      const unrecFormula = unrecBase && posCarryTerm
+        ? `=${unrecBase} + ${posCarryTerm}`
+        : (unrecBase ? `=${unrecBase}` : (posCarryTerm ? `=${posCarryTerm}` : "=0"));
+
+      const refBase = numBankExceptions > 0
+        ? `SUMIFS($D$${startExRow}:$D$${bankExEndRow}, $F$${startExRow}:$F$${bankExEndRow}, $B${r}, $E$${startExRow}:$E$${bankExEndRow}, "*Credit*")`
+        : "";
+      const refFormula = refBase && negCarryTerm
+        ? `=${refBase} + ${negCarryTerm}`
+        : (refBase ? `=${refBase}` : (negCarryTerm ? `=${negCarryTerm}` : "=0"));
+
       const netFormula = `=C${r}+D${r}+E${r}+F${r}-G${r}`;
 
       return [
@@ -1896,18 +1978,26 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setBorder(true, true, true, true, true, true);
   sheet.getRange(totShareRow, 3, 1, 6).setNumberFormat("#,##0.00");
 
-  // 5. Unified Needs Pairing & Statement Review Table (Table 2 — Unresolved first, resolved collapsed)
+  // 5. Unified Needs Pairing & Statement Review Table (Table 2 — Unresolved first, resolved collapsed, Carryover row below)
   const unresolvedEx = exceptionItems.filter(ex => !String(ex.assignedPayer || "").trim());
   const resolvedEx = exceptionItems.filter(ex => Boolean(String(ex.assignedPayer || "").trim()));
-  const orderedExceptions = [...unresolvedEx, ...resolvedEx];
+  const orderedBankExceptions = [...unresolvedEx, ...resolvedEx];
+  const orderedExceptions = orderedBankExceptions.slice();
+  const carryEx = hasCarryoverRow ? Object.assign({}, recon.carryoverItem, { isCarryover: true }) : null;
+  if (carryEx) {
+    orderedExceptions.push(carryEx);
+  }
 
   const t2BannerRange = sheet.getRange(startExHeaderRow, 1, 1, 8).merge()
     .setFontWeight("bold")
     .setFontSize(10)
     .setBackground(unresolvedEx.length === 0 ? CONFIG.COLORS.PRIMARY_LIGHT : CONFIG.COLORS.DUE_SOON);
-  if (numExceptions > 0) {
-    const t2SuggestedCount = `COUNTIFS(E${startExRow}:E${endExRow}, "*💡*", F${startExRow}:F${endExRow}, "")`;
-    t2BannerRange.setFormula(`="🔗 Needs Pairing & Statement Review (" & ${numExceptions} & " Items | Unresolved: " & ${t2UnresolvedCount} & " = " & TEXT(${t2UnresolvedAmt}, "#,##0.00") & " EGP | Suggested pairs: " & ${t2SuggestedCount} & ")"`);
+  if (numBankExceptions > 0) {
+    const t2SuggestedCount = `COUNTIFS(E${startExRow}:E${bankExEndRow}, "*💡*", F${startExRow}:F${bankExEndRow}, "")`;
+    const carryBannerSuffix = hasCarryoverRow ? ' & " + Carryover"' : "";
+    t2BannerRange.setFormula(`="🔗 Needs Pairing & Statement Review (" & ${numBankExceptions} & " Items | Unresolved: " & ${t2UnresolvedCount} & " = " & TEXT(${t2UnresolvedAmt}, "#,##0.00") & " EGP | Suggested pairs: " & ${t2SuggestedCount}${carryBannerSuffix} & ")"`);
+  } else if (hasCarryoverRow) {
+    t2BannerRange.setValue("🔗 Needs Pairing & Statement Review (0 Bank Items · Prior Cycle Carryover)");
   } else {
     t2BannerRange.setValue("🔗 Needs Pairing & Statement Review (0 Items — Statement 100% Reconciled)");
   }
@@ -1919,6 +2009,23 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   if (numExceptions > 0) {
     const exRows = orderedExceptions.map((ex, idx) => {
       const r = startExRow + idx;
+      if (ex.isCarryover) {
+        const carryAmtFormula = numBankExceptions > 0
+          ? `=${(ledger.openingBalance || 0).toFixed(2)} - ${negPayExpr}`
+          : `=${(ledger.openingBalance || 0).toFixed(2)}`;
+        const statusFormula = `=IF(OR(ISBLANK(F${r}), ISNUMBER(SEARCH("🚫", F${r}))), "ℹ️ Unassigned (Prior Cycle)", "✅ Assigned to " & F${r})`;
+        return [
+          ex.id,
+          ex.date,
+          ex.desc,
+          carryAmtFormula,
+          ex.category,
+          ex.assignedPayer,
+          ex.note,
+          statusFormula,
+          ex.subjectId || ""
+        ];
+      }
       const statusFormula = `=IF(ISBLANK(F${r}), IF(ISNUMBER(SEARCH("💡", E${r})), "💡 Confirm Link/Pair or Assign", "⚠️ Needs Action"), IF(ISNUMBER(SEARCH("🚫", F${r})), "🚫 Neglected", IF(ISNUMBER(SEARCH("🔗", F${r})), "🔗 Linking...", "✅ Assigned")))`;
       return [
         ex.id,
@@ -1938,6 +2045,9 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     sheet.getRange(startExRow, 1, exRows.length, 8).setFontSize(9);
     sheet.getRange(startExRow, 2, exRows.length, 1).setNumberFormat("yyyy-MM-dd");
     sheet.getRange(startExRow, 4, exRows.length, 1).setNumberFormat("#,##0.00");
+    if (hasCarryoverRow && carryRow > 0) {
+      sheet.getRange(carryRow, 4, 1, 1).setNumberFormat("+#,##0.00;-#,##0.00;0.00");
+    }
 
     const dynamicPayers = getAllUniquePayers(ss);
     const standardOptions = [...dynamicPayers, "🚫 Neglect / Ignore"];
@@ -1964,7 +2074,12 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       const ex = orderedExceptions[i];
       let rowVal = defaultValidation;
 
-      if (ex.suggestedInstLinks && ex.suggestedInstLinks.length > 0) {
+      if (ex.isCarryover) {
+        rowVal = SpreadsheetApp.newDataValidation()
+          .requireValueInList(["🚫 Keep Unassigned (Prior Cycle)", ...dynamicPayers], true)
+          .setAllowInvalid(true)
+          .build();
+      } else if (ex.suggestedInstLinks && ex.suggestedInstLinks.length > 0) {
         const sugLabels = ex.suggestedInstLinks.map(sl => sl.dropdownLabel);
         rowVal = SpreadsheetApp.newDataValidation()
           .requireValueInList([...sugLabels, ...standardOptions], true)
@@ -2007,7 +2122,9 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       const payer = ex.assignedPayer;
       const hasSugs = (ex.suggestedPairs && ex.suggestedPairs.length > 0) || (ex.suggestedInstLinks && ex.suggestedInstLinks.length > 0);
       let bg = "#ffffff";
-      if (isNeglectedPayer(payer)) {
+      if (ex.isCarryover) {
+        bg = (isNeglectedPayer(payer) || !payer) ? "#f3f4f6" : CONFIG.COLORS.PAID;
+      } else if (isNeglectedPayer(payer)) {
         bg = "#eeeeee";
       } else if (cat.includes("Credit")) {
         bg = CONFIG.COLORS.PRIMARY_LIGHT;
@@ -2482,7 +2599,8 @@ function buildMemberBreakdownSpillFormulas_(ss, bounds) {
 
   let exFilterPart;
   if (bounds.numExceptions > 0) {
-    const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, IF(ISNUMBER(SEARCH("Credit", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow})), -1, 1) * ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}, ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}})`;
+    const exAmountExpr = `(IF(ISNUMBER(SEARCH("Credit", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow})), -1, 1) * ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}) / IF($B$3="All Family Members", 1, LEN(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}) - LEN(SUBSTITUTE(${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, "+", "")) + 1)`;
+    const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, ${exAmountExpr}, ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}})`;
     const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (ISERROR(SEARCH("🚫", ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))) * (ISERROR(SEARCH("🔗", ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))) * (ISERROR(SEARCH("Installment", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}))) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
     exFilterPart = `IFERROR(FILTER(${exColsExpr}, ${exFilterCond}), {"—", "—", "No unrecorded statement items, fees, or refunds", 0, "—", "—"})`;
   } else {

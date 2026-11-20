@@ -102,12 +102,16 @@ function buildMemberStatementData(ss, tz, personName, optContext) {
   const unrecorded = [];
   const fees = [];
   const refunds = [];
+  const carryover = [];
 
   let rawPurchases = 0;
   let rawInstallments = 0;
   let rawUnrecorded = 0;
+  let rawUnrecordedItems = 0;
   let rawFees = 0;
   let rawRefunds = 0;
+  let rawRefundItems = 0;
+  let rawCarryoverSigned = 0;
 
   // 1. Matched Purchases
   (recon.stmtDebits || []).forEach(st => {
@@ -167,11 +171,13 @@ function buildMemberStatementData(ss, tz, personName, optContext) {
   // 3. Unrecorded Missing Statement Purchases
   (recon.missingInSheet || []).forEach(m => {
     if (!m || !m.assignedPayer || isNeglectedPayer(m.assignedPayer)) return;
-    rawUnrecorded += pushMemberSplitItem_(unrecorded, canonicalPerson, m.assignedPayer, m.amount, {
+    const added = pushMemberSplitItem_(unrecorded, canonicalPerson, m.assignedPayer, m.amount, {
       date: m.date || m.dateStr,
       dateStr: m.dateStr,
       desc: m.desc
     }, targetTz);
+    rawUnrecorded += added;
+    rawUnrecordedItems += added;
   });
 
   // 4. Bank Fees & Taxes
@@ -187,12 +193,41 @@ function buildMemberStatementData(ss, tz, personName, optContext) {
   // 5. Refunds / Credits
   (recon.stmtCredits || []).forEach(cr => {
     if (!cr || !cr.assignedPayer || isNeglectedPayer(cr.assignedPayer)) return;
-    rawRefunds += pushMemberSplitItem_(refunds, canonicalPerson, cr.assignedPayer, cr.amount, {
+    const added = pushMemberSplitItem_(refunds, canonicalPerson, cr.assignedPayer, cr.amount, {
       date: cr.date || cr.dateStr,
       dateStr: cr.dateStr,
       desc: cr.desc
     }, targetTz);
+    rawRefunds += added;
+    rawRefundItems += added;
   });
+
+  // 6. Prior Cycle Carryover (when explicitly assigned to member)
+  const carryItem = recon.carryoverItem;
+  if (carryItem && carryItem.assignedPayer && !isNeglectedPayer(carryItem.assignedPayer)) {
+    const carryAmt = Number((ledger && ledger.carriedOver !== undefined ? ledger.carriedOver : carryItem.amount) || 0);
+    if (Math.abs(carryAmt) >= 0.005) {
+      const carryMeta = {
+        date: carryItem.date || carryItem.dateStr,
+        dateStr: carryItem.dateStr,
+        desc: carryItem.desc
+      };
+      const prevLen = carryover.length;
+      const absAdded = pushMemberSplitItem_(carryover, canonicalPerson, carryItem.assignedPayer, Math.abs(carryAmt), carryMeta, targetTz);
+      if (absAdded > 0) {
+        if (carryAmt > 0) {
+          rawUnrecorded += absAdded;
+          rawCarryoverSigned += absAdded;
+        } else {
+          rawRefunds += absAdded;
+          rawCarryoverSigned -= absAdded;
+          for (let ci = prevLen; ci < carryover.length; ci++) {
+            carryover[ci].isCredit = true;
+          }
+        }
+      }
+    }
+  }
 
   const netTotal = roundShare2_(rawPurchases + rawInstallments + rawFees + rawUnrecorded - rawRefunds);
   const cardBal = recon.cardBal || {};
@@ -238,12 +273,16 @@ function buildMemberStatementData(ss, tz, personName, optContext) {
     unrecorded,
     fees,
     refunds,
+    carryover,
     totals: {
       purchases: roundShare2_(rawPurchases),
       installments: roundShare2_(rawInstallments),
       unrecorded: roundShare2_(rawUnrecorded),
+      unrecordedItems: roundShare2_(rawUnrecordedItems),
       fees: roundShare2_(rawFees),
       refunds: roundShare2_(rawRefunds),
+      refundItems: roundShare2_(rawRefundItems),
+      carryover: roundShare2_(rawCarryoverSigned),
       netTotal: netTotal
     }
   };
@@ -275,9 +314,10 @@ function formatWhatsAppStatement(memberData, optTz) {
   const unrecorded = memberData.unrecorded || [];
   const fees = memberData.fees || [];
   const refunds = memberData.refunds || [];
+  const carryover = memberData.carryover || [];
 
   const hasAnyItems = purchases.length > 0 || installments.length > 0 ||
-    unrecorded.length > 0 || fees.length > 0 || refunds.length > 0;
+    unrecorded.length > 0 || fees.length > 0 || refunds.length > 0 || carryover.length > 0;
 
   lines.push("");
 
@@ -295,7 +335,8 @@ function formatWhatsAppStatement(memberData, optTz) {
       lines.push("");
     }
     if (unrecorded.length > 0) {
-      lines.push(`🧾 *Unrecorded / Statement Items (${formatShareMoney_(t.unrecorded)} EGP):*`);
+      const unrecSum = t.unrecordedItems !== undefined ? t.unrecordedItems : t.unrecorded;
+      lines.push(`🧾 *Unrecorded / Statement Items (${formatShareMoney_(unrecSum)} EGP):*`);
       unrecorded.forEach(it => lines.push(formatWhatsAppLine_(it, false, false, targetTz)));
       lines.push("");
     }
@@ -305,8 +346,17 @@ function formatWhatsAppStatement(memberData, optTz) {
       lines.push("");
     }
     if (refunds.length > 0) {
-      lines.push(`↩️ *Refunds / Credits (-${formatShareMoney_(t.refunds)} EGP):*`);
+      const refSum = t.refundItems !== undefined ? t.refundItems : t.refunds;
+      lines.push(`↩️ *Refunds / Credits (-${formatShareMoney_(refSum)} EGP):*`);
       refunds.forEach(it => lines.push(formatWhatsAppLine_(it, false, true, targetTz)));
+      lines.push("");
+    }
+    if (carryover.length > 0) {
+      const carryHeaderAmt = t.carryover < 0
+        ? `-${formatShareMoney_(Math.abs(t.carryover))}`
+        : formatShareMoney_(t.carryover);
+      lines.push(`🔄 *Prior Cycle Carryover (${carryHeaderAmt} EGP):*`);
+      carryover.forEach(it => lines.push(formatWhatsAppLine_(it, false, Boolean(it.isCredit), targetTz)));
       lines.push("");
     }
   }

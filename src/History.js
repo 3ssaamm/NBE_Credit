@@ -577,8 +577,10 @@ function collectCycleDecisionsSnapshot_(recon, ledger) {
     });
   });
 
+  const carryCycleSubjectId = cycleKey ? ("CARRY::" + cycleKey).toUpperCase() : "";
   Object.keys(decisions.stmtAssign || {}).sort().forEach(id => {
-    if (!activeStmtIds.has(id.toUpperCase())) return;
+    const upperId = id.toUpperCase();
+    if (!activeStmtIds.has(upperId) && !(carryCycleSubjectId && upperId === carryCycleSubjectId)) return;
     const rec = decisions.stmtAssign[id];
     if (!rec) return;
     snapshot.push({
@@ -688,6 +690,10 @@ function closeActiveStatement(ss, tz) {
     closingBill: roundHist2_(ledger.closingBill),
     familySharesTotal: roundHist2_(ledger.familySharesTotal),
     carriedOver: roundHist2_(ledger.carriedOver),
+    carryoverAssignedPayer: ledger.carryoverAssignedPayer || "",
+    unassignedCarriedOver: roundHist2_(
+      ledger.unassignedCarriedOver !== undefined ? ledger.unassignedCarriedOver : ledger.carriedOver
+    ),
     auditDifference: roundHist2_(ledger.auditDifference),
     paymentDate: paymentDateStr || "",
     decisionCount: decisionSnapshot.length,

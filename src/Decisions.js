@@ -1122,6 +1122,48 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
     return { changed: true, needsRefresh: false, toastMsg: "" };
   }
 
+  // Case 1b: Edit in Table 2 Prior Cycle Carryover row (CARRY-*)
+  if (/^CARRY-\d+/i.test(firstCol)) {
+    let payer = String(rowVals[5] || "").trim();
+    const note = String(rowVals[6] || "").trim();
+
+    if (payer && !isNeglectedPayer(payer)) {
+      const cleanPayer = formatPayerCell(payer);
+      if (cleanPayer && cleanPayer !== payer) {
+        payer = cleanPayer;
+        rowVals[5] = payer;
+        sheet.getRange(row, 6).setValue(payer);
+      }
+    }
+
+    const isUnassigned = !payer || isNeglectedPayer(payer);
+    const existing = decisions.stmtAssign && decisions.stmtAssign[subjectId];
+    if (!allowDelete && !payer) return noChange;
+    if (!allowDelete && isUnassigned && !existing) return noChange;
+
+    if (isUnassigned) {
+      const hadExisting = Boolean(existing);
+      clearStmtAssign(decisions, subjectId);
+      if (forceStyle) {
+        if (!payer) {
+          rowVals[5] = "🚫 Keep Unassigned (Prior Cycle)";
+          sheet.getRange(row, 6).setValue("🚫 Keep Unassigned (Prior Cycle)");
+        }
+        sheet.getRange(row, 1, 1, 8).setBackground("#f3f4f6");
+      }
+      return { changed: hadExisting, needsRefresh: false, toastMsg: "" };
+    }
+
+    if (!forceStyle && existing && existing.target === payer && existing.note === note) {
+      return noChange;
+    }
+    setStmtAssign(decisions, subjectId, payer, note, "user");
+    if (forceStyle) {
+      sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
+    }
+    return { changed: true, needsRefresh: false, toastMsg: "" };
+  }
+
   // Case 2: Edit in Orphan Logs panel (ORPH-* and legacy TX-*)
   if (/^(?:ORPH|TX)-/i.test(firstCol)) {
     const actionVal = String(rowVals[5] || "").trim();

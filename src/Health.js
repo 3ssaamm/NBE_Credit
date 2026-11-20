@@ -128,8 +128,13 @@ function buildHealthCheckModel(ss, tz, ledger, recon, optOptions) {
 
   // 7. Live Reactive Formula Expressions Bound to Sheet Tables
   const numExceptions = bounds.numExceptions || 0;
+  const numBankExceptions = bounds.numBankExceptions !== undefined ? bounds.numBankExceptions : numExceptions;
   const startExRow = bounds.startExRow;
-  const endExRow = bounds.endExRow;
+  const bankExEndRow = bounds.bankExEndRow !== undefined
+    ? bounds.bankExEndRow
+    : (numBankExceptions > 0 ? (startExRow + numBankExceptions - 1) : (startExRow - 1));
+  const hasCarryoverRow = Boolean(bounds.hasCarryoverRow);
+  const carryRow = bounds.carryRow || -1;
   const hasTable4 = Boolean(bounds.hasTable4);
   const startInstRow = bounds.startInstRow;
   const endInstRow = bounds.endInstRow;
@@ -137,9 +142,9 @@ function buildHealthCheckModel(ss, tz, ledger, recon, optOptions) {
   const startOrphanRow = bounds.startOrphanRow;
   const endOrphanRow = bounds.endOrphanRow;
 
-  const t2UnresolvedCount = numExceptions > 0 ? `COUNTIFS(F${startExRow}:F${endExRow}, "")` : "0";
-  const t2UnresolvedAmt = numExceptions > 0
-    ? `(SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "", E${startExRow}:E${endExRow}, "<>*Credit*") - SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "", E${startExRow}:E${endExRow}, "*Credit*"))`
+  const t2UnresolvedCount = numBankExceptions > 0 ? `COUNTIFS(F${startExRow}:F${bankExEndRow}, "")` : "0";
+  const t2UnresolvedAmt = numBankExceptions > 0
+    ? `(SUMIFS(D${startExRow}:D${bankExEndRow}, F${startExRow}:F${bankExEndRow}, "", E${startExRow}:E${bankExEndRow}, "<>*Credit*") - SUMIFS(D${startExRow}:D${bankExEndRow}, F${startExRow}:F${bankExEndRow}, "", E${startExRow}:E${bankExEndRow}, "*Credit*"))`
     : "0";
   const t4UnresolvedCount = hasTable4 ? `COUNTIFS(E${startInstRow}:E${endInstRow}, "⚠️*", F${startInstRow}:F${endInstRow}, "")` : "0";
   const t4UnresolvedAmt = hasTable4 ? `SUMIFS(D${startInstRow}:D${endInstRow}, E${startInstRow}:E${endInstRow}, "⚠️*", F${startInstRow}:F${endInstRow}, "")` : "0";
@@ -147,20 +152,23 @@ function buildHealthCheckModel(ss, tz, ledger, recon, optOptions) {
   const unresolvedCountExpr = hasTable4 ? `(${t2UnresolvedCount} + ${t4UnresolvedCount})` : t2UnresolvedCount;
   const unresolvedAmtExpr = hasTable4 ? `(${t2UnresolvedAmt} + ${t4UnresolvedAmt})` : t2UnresolvedAmt;
 
-  const negPayExpr = numExceptions > 0
-    ? `SUMIFS(D${startExRow}:D${endExRow}, E${startExRow}:E${endExRow}, "Bill Payment (Credit)", F${startExRow}:F${endExRow}, "🚫*")`
+  const negPayExpr = numBankExceptions > 0
+    ? `SUMIFS(D${startExRow}:D${bankExEndRow}, E${startExRow}:E${bankExEndRow}, "Bill Payment (Credit)", F${startExRow}:F${bankExEndRow}, "🚫*")`
     : "0";
   const carriedOverExpr = `(${(safeLedger.openingBalance || 0).toFixed(2)} - ${negPayExpr})`;
+  const unassignedCarriedOverExpr = (hasCarryoverRow && carryRow > 0)
+    ? `IF(OR(ISBLANK(F${carryRow}), ISNUMBER(SEARCH("🚫", F${carryRow}))), D${carryRow}, 0)`
+    : carriedOverExpr;
 
   const orphanActiveCountExpr = hasOrphanTable ? `COUNTIFS(F${startOrphanRow}:F${endOrphanRow}, "<>🚫*")` : "0";
   const orphanActiveAmtExpr = hasOrphanTable ? `SUMIFS(D${startOrphanRow}:D${endOrphanRow}, F${startOrphanRow}:F${endOrphanRow}, "<>🚫*")` : "0";
 
   // Subtract ignored/linking rows explicitly instead of "<>🚫*" so blank F cells remain included
-  const unlinkedInstCountExpr = numExceptions > 0
-    ? `(COUNTIF(E${startExRow}:E${endExRow}, "Installment*") - COUNTIFS(E${startExRow}:E${endExRow}, "Installment*", F${startExRow}:F${endExRow}, "🚫*") - COUNTIFS(E${startExRow}:E${endExRow}, "Installment*", F${startExRow}:F${endExRow}, "🔗*"))`
+  const unlinkedInstCountExpr = numBankExceptions > 0
+    ? `(COUNTIF(E${startExRow}:E${bankExEndRow}, "Installment*") - COUNTIFS(E${startExRow}:E${bankExEndRow}, "Installment*", F${startExRow}:F${bankExEndRow}, "🚫*") - COUNTIFS(E${startExRow}:E${bankExEndRow}, "Installment*", F${startExRow}:F${bankExEndRow}, "🔗*"))`
     : "0";
-  const unlinkedInstAmtExpr = numExceptions > 0
-    ? `(SUMIF(E${startExRow}:E${endExRow}, "Installment*", D${startExRow}:D${endExRow}) - SUMIFS(D${startExRow}:D${endExRow}, E${startExRow}:E${endExRow}, "Installment*", F${startExRow}:F${endExRow}, "🚫*") - SUMIFS(D${startExRow}:D${endExRow}, E${startExRow}:E${endExRow}, "Installment*", F${startExRow}:F${endExRow}, "🔗*"))`
+  const unlinkedInstAmtExpr = numBankExceptions > 0
+    ? `(SUMIF(E${startExRow}:E${bankExEndRow}, "Installment*", D${startExRow}:D${bankExEndRow}) - SUMIFS(D${startExRow}:D${bankExEndRow}, E${startExRow}:E${bankExEndRow}, "Installment*", F${startExRow}:F${bankExEndRow}, "🚫*") - SUMIFS(D${startExRow}:D${bankExEndRow}, E${startExRow}:E${bankExEndRow}, "Installment*", F${startExRow}:F${bankExEndRow}, "🔗*"))`
     : "0";
 
   const headerFormula = !parsePassed
@@ -177,7 +185,10 @@ function buildHealthCheckModel(ss, tz, ledger, recon, optOptions) {
     ? `="${parseLabel.replace(/"/g, '""')}"`
     : `=IF(${unresolvedCountExpr}=0, "✅ Tie-Out · 0 Unresolved", "⚠️ " & ${unresolvedCountExpr} & " Unresolved (" & TEXT(${unresolvedAmtExpr},"#,##0.00") & " EGP)")`;
   const tile2Formula = `=IF(${orphanActiveCountExpr}=0, "✅ 0 Orphan Logs", "⚠️ " & ${orphanActiveCountExpr} & " Orphan(s) (" & TEXT(${orphanActiveAmtExpr},"#,##0.00") & " EGP)")`;
-  const tile3Formula = `=IF(${unlinkedInstCountExpr}=0, "✅ 0 Unlinked Inst · Carryover " & TEXT(${carriedOverExpr},"+#,##0.00;-#,##0.00;0.00"), "⚠️ " & ${unlinkedInstCountExpr} & " Unlinked Inst (" & TEXT(${unlinkedInstAmtExpr},"#,##0.00") & " EGP)")`;
+  const carryAssigneeSuffix = (hasCarryoverRow && carryRow > 0)
+    ? ` & IF(OR(ISBLANK(F${carryRow}), ISNUMBER(SEARCH("🚫", F${carryRow}))), "", " → " & F${carryRow})`
+    : "";
+  const tile3Formula = `=IF(${unlinkedInstCountExpr}=0, "✅ 0 Unlinked Inst · Carryover " & TEXT(${carriedOverExpr},"+#,##0.00;-#,##0.00;0.00")${carryAssigneeSuffix}, "⚠️ " & ${unlinkedInstCountExpr} & " Unlinked Inst (" & TEXT(${unlinkedInstAmtExpr},"#,##0.00") & " EGP)")`;
 
   const shortRefresh = Utilities.formatDate(refreshDate, targetTz, "yyyy-MM-dd HH:mm");
   const tile4Label = `🕒 ${shortRefresh} · v${codeVersion}`;
@@ -217,6 +228,9 @@ function buildHealthCheckModel(ss, tz, ledger, recon, optOptions) {
       unresolvedAmtExpr,
       negPayExpr,
       carriedOverExpr,
+      unassignedCarriedOverExpr,
+      hasCarryoverRow,
+      carryRow,
       orphanActiveCountExpr,
       orphanActiveAmtExpr,
       unlinkedInstCountExpr,

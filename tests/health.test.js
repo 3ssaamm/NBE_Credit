@@ -348,4 +348,223 @@ function colLetterToIdx(letters) {
   assert.strictEqual(decAfter, decBefore, "Editing Health strip rows must not mutate _Decisions");
 }
 
-console.log("health.test.js: all unified Health strip, live formula, collapsible drawer, zero-row hiding, tie-out, version stamp, and edit safety assertions passed.");
+// ==========================================
+// Test 6: Assignable Positive Carryover (+311.95), Zero Circularity, Unhide Hidden Member, Share & History, & Clear
+// ==========================================
+{
+  const realFixture = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "2026-11-real.json"), "utf8"));
+  const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
+  const ss = new MockSpreadsheet();
+  setActiveSpreadsheet(ss);
+  populateSpreadsheetFromFixture(ss, realFixture, CONFIG);
+
+  const dash1 = sandbox.updateLiveDashboard({ ss });
+  assert.strictEqual(Number(dash1.ledger.carriedOver.toFixed(2)), 311.95);
+  assert.strictEqual(Number(dash1.ledger.unassignedCarriedOver.toFixed(2)), 311.95);
+  assert.strictEqual(dash1.ledger.assignedCarryover, 0);
+  assert.strictEqual(dash1.ledger.carryoverAssignedPayer, "");
+  assert.strictEqual(Number(dash1.ledger.familySharesTotal.toFixed(2)), 32307.49);
+  assert.strictEqual(Number(dash1.ledger.auditDifference.toFixed(2)), 0.49);
+
+  const ar = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+  const bounds1 = sandbox.getReconTableBounds(dash1.ledger, dash1.recon);
+  assert.strictEqual(bounds1.hasCarryoverRow, true, "Positive carryover must render CARRY-1 row");
+  const carryRow = bounds1.carryRow;
+  assert.strictEqual(carryRow, bounds1.endExRow, "CARRY-1 must render at bottom of Table 2");
+  assert.ok(bounds1.bankExEndRow < carryRow, "Regular bank exceptions must end strictly above carryRow");
+  assert.strictEqual(ar._getCell(carryRow, 1), "CARRY-1");
+  assert.strictEqual(ar._getCell(carryRow, 5), "Prior Cycle Carryover");
+  assert.strictEqual(ar._getCell(carryRow, 6), "🚫 Keep Unassigned (Prior Cycle)");
+  assert.strictEqual(ar.backgrounds[`${carryRow}_1`], "#f3f4f6");
+  assert.ok(
+    !ar.rowGroups.some(g => carryRow >= g.startRow && carryRow <= g.endRow),
+    "CARRY-1 row must NOT be hidden inside collapsed resolved Table 2 group"
+  );
+
+  // Zero circularity: D{carryRow} must only reference rows <= bankExEndRow (< carryRow)
+  const carryAmtFormula = String(ar._getCell(carryRow, 4) || "");
+  assert.ok(carryAmtFormula.startsWith("="), `CARRY-1 Col D must be live formula: ${carryAmtFormula}`);
+  assert.ok(!carryAmtFormula.includes(`D${carryRow}`), `CARRY-1 Col D must never self-reference carryRow: ${carryAmtFormula}`);
+  assert.ok(carryAmtFormula.includes(`:D${bounds1.bankExEndRow}`), `CARRY-1 Col D must scope to bankExEndRow ${bounds1.bankExEndRow}: ${carryAmtFormula}`);
+
+  // F6 uses unassignedCarriedOverExpr referencing F{carryRow} and D{carryRow}; E8 carries arrow expression
+  const f6Formula = String(ar._getCell(6, 6) || "");
+  assert.ok(f6Formula.includes(`F${carryRow}`) && f6Formula.includes(`D${carryRow}`), `F6 must reference CARRY-1 cells: ${f6Formula}`);
+  const e8Formula = String(ar._getCell(8, 5) || "");
+  assert.ok(e8Formula.includes(`F${carryRow}`), `E8 must reactively show Carryover assignee: ${e8Formula}`);
+
+  // Assign CARRY-1 to P6 via handleActiveReconEdit (fast in-place save, no full redraw needed)
+  ar._setCell(carryRow, 6, "P6");
+  sandbox.handleActiveReconEdit({ range: ar.getRange(carryRow, 6) });
+  assert.strictEqual(ar.backgrounds[`${carryRow}_1`], CONFIG.COLORS.PAID);
+
+  const decAfterAssign = sandbox.loadDecisions(ss);
+  assert.ok(decAfterAssign.stmtAssign["CARRY::2026-11"], "CARRY::2026-11 must persist in _Decisions");
+  assert.strictEqual(decAfterAssign.stmtAssign["CARRY::2026-11"].target, "P6");
+
+  // Re-evaluate reconciliation + ledger: P6 absorbs +311.95 with zero double-counting in F6
+  const reconAssigned = sandbox.reconcileActiveStatement(ss, tz);
+  const ledgerAssigned = sandbox.buildDebtLedger(ss, tz, reconAssigned);
+  assert.strictEqual(ledgerAssigned.carryoverAssignedPayer, "P6");
+  assert.strictEqual(Number(ledgerAssigned.assignedCarryover.toFixed(2)), 311.95);
+  assert.strictEqual(Number(ledgerAssigned.unassignedCarriedOver.toFixed(2)), 0.00);
+  assert.strictEqual(Number(ledgerAssigned.familySharesTotal.toFixed(2)), Number((32307.49 + 311.95).toFixed(2)));
+  assert.strictEqual(Number(ledgerAssigned.auditDifference.toFixed(2)), 0.49, "Audit difference must remain 0.49 (no double-counting)");
+
+  const expectedP6 = realFixture.expectedShares["P6"];
+  const actualP6 = ledgerAssigned.personShares.find(ps => ps.person === "P6");
+  assert.strictEqual(Number(actualP6.unrecorded.toFixed(2)), Number((expectedP6.unrecorded + 311.95).toFixed(2)));
+  assert.strictEqual(Number(actualP6.netTotal.toFixed(2)), Number((expectedP6.netTotal + 311.95).toFixed(2)));
+
+  // Share.js statement for P6 includes Carryover section cleanly without double-including in unrecordedItems header
+  const shareP6 = sandbox.shareMemberStatement(ss, tz, "P6", { skipPdf: true });
+  assert.strictEqual(shareP6.memberData.carryover.length, 1);
+  assert.strictEqual(shareP6.memberData.totals.carryover, 311.95);
+  assert.strictEqual(shareP6.memberData.totals.netTotal, Number(actualP6.netTotal.toFixed(2)));
+  assert.ok(shareP6.whatsappText.includes("🔄 *Prior Cycle Carryover (311.95 EGP):*"), `Missing Carryover WhatsApp section: ${shareP6.whatsappText}`);
+
+  // Close cycle to History while CARRY-1 is assigned -> snapshot includes CARRY::2026-11 & auditMeta records payee
+  const closeRes = sandbox.closeActiveStatement(ss, tz);
+  assert.strictEqual(closeRes.closed, true, `Close with assigned carryover must succeed: ${JSON.stringify(closeRes.blockers)}`);
+  const archive = sandbox.readHistoryArchive(ss);
+  assert.strictEqual(Number(archive["2026-11"].people["P6"].toFixed(2)), Number(actualP6.netTotal.toFixed(2)));
+  assert.strictEqual(archive["2026-11"].summary.meta.carryoverAssignedPayer, "P6");
+  assert.strictEqual(archive["2026-11"].summary.meta.unassignedCarriedOver, 0);
+  assert.ok(
+    archive["2026-11"].decisions.some(d => d.type === "STMT_ASSIGN" && d.subjectId === "CARRY::2026-11" && d.target === "P6"),
+    "History snapshot must preserve CARRY::2026-11 assignment"
+  );
+
+  // Assigning CARRY-1 to hidden 0.00 member P4 immediately unhides P4's Table 1 row
+  let rowP4Share = -1;
+  for (let i = 0; i < dash1.ledger.personShares.length; i++) {
+    if (dash1.ledger.personShares[i].person === "P4") {
+      rowP4Share = 12 + i;
+      break;
+    }
+  }
+  assert.ok(rowP4Share > 0 && ar.hiddenRows.has(rowP4Share), "P4 row must initially be hidden");
+  ar._setCell(carryRow, 6, "P4");
+  sandbox.handleActiveReconEdit({ range: ar.getRange(carryRow, 6) });
+  assert.ok(!ar.hiddenRows.has(rowP4Share), "Assigning CARRY-1 to P4 must immediately unhide P4 Table 1 row");
+
+  // Clearing CARRY-1 removes STMT_ASSIGN, restores default unassigned label, & keeps unresolvedCount = 0
+  ar._setCell(carryRow, 6, "");
+  sandbox.handleActiveReconEdit({ range: ar.getRange(carryRow, 6) });
+  assert.strictEqual(ar._getCell(carryRow, 6), "🚫 Keep Unassigned (Prior Cycle)");
+  assert.strictEqual(ar.backgrounds[`${carryRow}_1`], "#f3f4f6");
+  const decAfterClear = sandbox.loadDecisions(ss);
+  assert.strictEqual(decAfterClear.stmtAssign["CARRY::2026-11"], undefined, "Clearing CARRY-1 must delete decision");
+  const reconCleared = sandbox.reconcileActiveStatement(ss, tz);
+  const ledgerCleared = sandbox.buildDebtLedger(ss, tz, reconCleared);
+  const healthCleared = sandbox.buildHealthCheckModel(ss, tz, ledgerCleared, reconCleared);
+  assert.strictEqual(healthCleared.unresolvedCount, 0, "Cleared CARRY-1 must leave unresolvedCount = 0");
+  assert.strictEqual(Number(ledgerCleared.unassignedCarriedOver.toFixed(2)), 311.95);
+}
+
+// ==========================================
+// Test 7: Negative Carryover (-200.00) Split Assignment & Zero-Bank-Exception Table 2 Mode
+// ==========================================
+{
+  const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
+  const ss = new MockSpreadsheet();
+  setActiveSpreadsheet(ss);
+
+  const stmt = ss.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
+  stmt.getRange(2, 1, 3, 6).setValues([
+    ["Statement Date:", new Date(2026, 9, 31, 12, 0, 0), "Due Date:", new Date(2026, 10, 27, 12, 0, 0), "Credit Limit:", 100000],
+    ["Opening Balance:", 1000, "Closing Balance:", 300, "Total Debit:", 500],
+    ["Total Credit:", 1200, "Card Number:", "1234", "Net:", -700]
+  ]);
+  stmt.getRange(6, 1, 1, 7).setValues([["#", "Tx Date", "Post Date", "Description", "Type", "Amount", "Status"]]);
+  stmt.getRange(7, 1, 2, 7).setValues([
+    [1, new Date(2026, 9, 10, 12, 0, 0), new Date(2026, 9, 10, 12, 0, 0), "SHOP", "DEBIT", 500, ""],
+    [2, new Date(2026, 9, 27, 12, 0, 0), new Date(2026, 9, 27, 12, 0, 0), "DIRECT DEBIT PAYMENT", "CREDIT", 1200, ""]
+  ]);
+
+  const txSheet = ss.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
+  txSheet.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
+  txSheet.getRange(2, 1, 2, 5).setValues([
+    [1, new Date(2026, 9, 10, 0, 0, 0), "Shop", "P1", 500],
+    [2, new Date(2026, 11, 5, 0, 0, 0), "Next Month Item", "P2", 75]
+  ]);
+
+  const dashNeg1 = sandbox.updateLiveDashboard({ ss });
+  assert.strictEqual(Number(dashNeg1.ledger.carriedOver.toFixed(2)), -200.00);
+  assert.strictEqual(Number(dashNeg1.ledger.auditDifference.toFixed(2)), 0.00);
+
+  const ar = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+  const boundsNeg = sandbox.getReconTableBounds(dashNeg1.ledger, dashNeg1.recon);
+  const carryRowNeg = boundsNeg.carryRow;
+  assert.strictEqual(ar._getCell(carryRowNeg, 1), "CARRY-1");
+
+  // Assign split via comma + lowercase to verify normalization -> "P1 + P2"
+  ar._setCell(carryRowNeg, 6, "p1, p2");
+  sandbox.handleActiveReconEdit({ range: ar.getRange(carryRowNeg, 6) });
+  assert.strictEqual(ar._getCell(carryRowNeg, 6), "P1 + P2");
+
+  const dashNeg2 = sandbox.updateLiveDashboard({ ss });
+  const p1 = dashNeg2.ledger.personShares.find(ps => ps.person === "P1");
+  const p2 = dashNeg2.ledger.personShares.find(ps => ps.person === "P2");
+  assert.strictEqual(Number(p1.refunds.toFixed(2)), 100.00);
+  assert.strictEqual(Number(p1.netTotal.toFixed(2)), 400.00);
+  assert.strictEqual(Number(p2.refunds.toFixed(2)), 100.00);
+  assert.strictEqual(Number(p2.netTotal.toFixed(2)), -100.00);
+  assert.strictEqual(Number(dashNeg2.ledger.familySharesTotal.toFixed(2)), 300.00);
+  assert.strictEqual(Number(dashNeg2.ledger.unassignedCarriedOver.toFixed(2)), 0.00);
+  assert.strictEqual(Number(dashNeg2.ledger.auditDifference.toFixed(2)), 0.00);
+
+  // Table 1 Col G formulas reference ABS($D$carryRow) / splitCount
+  let foundSplitCreditFormula = false;
+  for (let i = 0; i < dashNeg2.ledger.personShares.length; i++) {
+    const r = 12 + i;
+    const colGFormula = String(ar._getCell(r, 7) || "");
+    if (colGFormula.includes(`ABS($D$${carryRowNeg})`)) {
+      foundSplitCreditFormula = true;
+      assert.ok(colGFormula.includes(`"+" & TRIM($B${r}) & "+"`), `Delimiter-safe member check missing in G${r}: ${colGFormula}`);
+    }
+  }
+  assert.ok(foundSplitCreditFormula, "Table 1 Col G must include split-aware negative Carryover term");
+
+  // Member Breakdown Col D spill divides by split count
+  const mb = ss.getSheetByName(CONFIG.SHEETS.MEMBER_BREAKDOWN);
+  const mbA10 = String(mb.getRange("A10").getFormula() || "");
+  assert.ok(mbA10.includes(`LEN('Active Bill & Reconciliation'!$F$${boundsNeg.startExRow}:$F$${boundsNeg.endExRow}) - LEN(SUBSTITUTE(`), `Member Breakdown must divide split Table 2 rows: ${mbA10}`);
+
+  // WhatsApp statement for P2 shows 1/2 split negative carryover and netTotal = -100.00
+  const shareP2 = sandbox.shareMemberStatement(ss, tz, "P2", { skipPdf: true });
+  assert.strictEqual(shareP2.memberData.totals.carryover, -100.00);
+  assert.strictEqual(shareP2.memberData.totals.netTotal, -100.00);
+  assert.ok(shareP2.whatsappText.includes("💰 *Total Due: -100.00 EGP*"), shareP2.whatsappText);
+  assert.ok(shareP2.whatsappText.includes("🔄 *Prior Cycle Carryover (-100.00 EGP):*"), shareP2.whatsappText);
+  assert.ok(shareP2.whatsappText.includes("(1/2 split) — -100.00 EGP"), shareP2.whatsappText);
+
+  // Zero regular bank exceptions + positive carryover renders cleanly without empty SUMIFS
+  const ssZeroEx = new MockSpreadsheet();
+  setActiveSpreadsheet(ssZeroEx);
+  const stmtZero = ssZeroEx.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
+  stmtZero.getRange(2, 1, 3, 6).setValues([
+    ["Statement Date:", new Date(2026, 9, 31, 12, 0, 0), "Due Date:", new Date(2026, 10, 27, 12, 0, 0), "Credit Limit:", 100000],
+    ["Opening Balance:", 100, "Closing Balance:", 400, "Total Debit:", 300],
+    ["Total Credit:", 0, "Card Number:", "1234", "Net:", 300]
+  ]);
+  stmtZero.getRange(6, 1, 1, 7).setValues([["#", "Tx Date", "Post Date", "Description", "Type", "Amount", "Status"]]);
+  stmtZero.getRange(7, 1, 1, 7).setValues([
+    [1, new Date(2026, 9, 10, 12, 0, 0), new Date(2026, 9, 10, 12, 0, 0), "CAFE SPOT", "DEBIT", 300, ""]
+  ]);
+  const txZero = ssZeroEx.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
+  txZero.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
+  txZero.getRange(2, 1, 1, 5).setValues([
+    [1, new Date(2026, 9, 10, 0, 0, 0), "Cafe Spot", "SoloUser", 300]
+  ]);
+  const dashZero = sandbox.updateLiveDashboard({ ss: ssZeroEx });
+  const boundsZero = sandbox.getReconTableBounds(dashZero.ledger, dashZero.recon);
+  assert.strictEqual(boundsZero.numBankExceptions, 0);
+  assert.strictEqual(boundsZero.hasCarryoverRow, true);
+  assert.strictEqual(boundsZero.carryRow, boundsZero.startExRow);
+  const arZero = ssZeroEx.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+  assert.strictEqual(arZero._getCell(boundsZero.carryRow, 1), "CARRY-1");
+  assert.strictEqual(arZero._getCell(boundsZero.carryRow, 4), "=100.00");
+}
+
+console.log("health.test.js: all unified Health strip, live formula, collapsible drawer, zero-row hiding, carryover assignment, tie-out, version stamp, and edit safety assertions passed.");
