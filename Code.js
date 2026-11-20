@@ -14,6 +14,7 @@ const CONFIG = {
     BANK_STATEMENT: "Bank Statement",
     ACTIVE_RECON: "Active Bill & Reconciliation",
     HISTORY_FORECAST: "Monthly History & Forecast",
+    HISTORY: "History",
     MEMBER_BREAKDOWN: "Member Breakdown",
     RECON_STORE: "_Recon_Store",
     DECISIONS: "_Decisions",
@@ -1573,8 +1574,9 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.setHiddenGridlines(false);
 
   // 1. Title Banner
+  const isCycleLocked = isCycleClosed(ss, ledger.activeCycleKey);
   sheet.getRange("A1:H1").merge()
-    .setValue("💳 NBE Credit Card — Active Bill & Precision Reconciliation (" + ledger.activeCycleLabel + ")")
+    .setValue("💳 NBE Credit Card — Active Bill & Precision Reconciliation (" + ledger.activeCycleLabel + ")" + (isCycleLocked ? " [🔒 Closed in History]" : ""))
     .setFontWeight("bold")
     .setFontSize(13)
     .setBackground(CONFIG.COLORS.PRIMARY)
@@ -2182,41 +2184,19 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
 // 10. UI: MONTHLY HISTORY & FORECAST
 // ==========================================
 
-function getHistoricalMonthsArchive(sheet) {
-  // Read historical seed table from sheet if exists, otherwise return default seed
-  const defaultHistory = {
-    "2026-03": { label: "March 2026", status: "Paid", people: { "Dad": 1210.33, "Mai": 6233.32, "Mido": 2726.90, "Muhanad": 2560.02, "Mum": 420.00, "Zoza": 478.00 } },
-    "2026-04": { label: "April 2026", status: "Paid", people: { "Dad": 1339.15, "Mai": 6549.51, "Mido": 4794.27, "Muhanad": 106.17, "Mum": 420.00, "Zoza": 782.00 } },
-    "2026-05": { label: "May 2026", status: "Paid", people: { "Abdo": 17143.00, "Dad": 1445.33, "Mai": 6014.71, "Mido": 4250.35, "Muhanad": 106.17, "Mum": 420.00, "Zoza": 472.00 } },
-    "2026-06": { label: "June 2026", status: "Paid", people: { "Abdo": 335.00, "Dad": 1210.33, "Mai": 2463.61, "Mido": 4596.09, "Muhanad": 106.17, "Mum": 1244.07, "Zoza": 517.90 } },
-    "2026-07": { label: "July 2026", status: "Paid", people: { "Dad": 1350.33, "Mai": 21696.49, "Mido": 4214.56, "Muhanad": 106.17, "Mum": 494.07, "Zoza": 518.00 } },
-    "2026-08": { label: "August 2026", status: "Settled", people: { "Abdo": 5272.39, "Dad": 1210.33, "Mai": 6380.39, "Mido": 8886.28, "Muhanad": 106.17, "Mum": 494.07, "Zoza": 518.00 } }
-  };
-  return defaultHistory;
-}
+// Immutable closed-statement archive & Close Statement workflow live in src/History.js
 
 function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
+  migrateHistoryFromForecastSheet(ss, tz);
+
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.HISTORY_FORECAST);
   sheet.clear();
   sheet.setHiddenGridlines(false);
 
-  sheet.getRange("A1:K1").merge()
-    .setValue("📅 NBE Credit Card — Monthly History & Multi-Month Forecast Horizon")
-    .setFontWeight("bold")
-    .setFontSize(13)
-    .setBackground(CONFIG.COLORS.PRIMARY)
-    .setFontColor("#ffffff");
+  const history = readHistoryArchive(ss);
+  const histKeys = Object.keys(history).sort();
 
-  sheet.getRange("A2:K2").merge()
-    .setValue("Past audited billing cycles alongside active statement debt and future projected installment commitments.")
-    .setFontStyle("italic")
-    .setFontSize(9)
-    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
-
-  const history = getHistoricalMonthsArchive(sheet);
-  const histKeys = Object.keys(history);
-
-  // Future Forecasts (Next 3 cycles based on Installments sheet)
+  // Future Forecasts (Next 4 cycles based on Installments sheet)
   const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
   const futureForecasts = {};
   if (instSheet && instSheet.getLastRow() >= 2) {
@@ -2249,9 +2229,36 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
 
   const futureKeys = Object.keys(futureForecasts).sort().slice(0, 4);
 
-  // Table Structure
-  const allPayers = getAllUniquePayers(ss);
-  const headers = ["Family Member", ...histKeys.map(k => history[k].label + "\n(Paid)"), ledger.activeCycleLabel + "\n(Active)", ...futureKeys.map(k => futureForecasts[k].label + "\n(Forecast)")];
+  // Build union of active payers + historical members
+  const payerSet = new Set(getAllUniquePayers(ss));
+  histKeys.forEach(k => {
+    Object.keys((history[k] && history[k].people) || {}).forEach(p => {
+      if (p) payerSet.add(p);
+    });
+  });
+  const allPayers = Array.from(payerSet).sort((a, b) => a.localeCompare(b));
+
+  const activeAlreadyClosed = Boolean(history[ledger.activeCycleKey]);
+  const headers = [
+    "Family Member",
+    ...histKeys.map(k => `${history[k].label}\n(${history[k].status || "Closed"})`),
+    ...(activeAlreadyClosed ? [] : [`${ledger.activeCycleLabel}\n(Active)`]),
+    ...futureKeys.map(k => `${futureForecasts[k].label}\n(Forecast)`)
+  ];
+
+  const bannerEndCol = getColumnLetter(Math.max(headers.length, 4));
+  sheet.getRange(`A1:${bannerEndCol}1`).merge()
+    .setValue("📅 NBE Credit Card — Monthly History & Multi-Month Forecast Horizon")
+    .setFontWeight("bold")
+    .setFontSize(13)
+    .setBackground(CONFIG.COLORS.PRIMARY)
+    .setFontColor("#ffffff");
+
+  sheet.getRange(`A2:${bannerEndCol}2`).merge()
+    .setValue("Closed billing cycles from immutable History alongside active statement debt and future projected installment commitments.")
+    .setFontStyle("italic")
+    .setFontSize(9)
+    .setFontColor(CONFIG.COLORS.TEXT_MUTED);
 
   sheet.getRange(4, 1, 1, headers.length).setValues([headers])
     .setFontWeight("bold")
@@ -2260,19 +2267,22 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
     .setWrap(true);
 
   const startDataRow = 5;
-  const lastDataRow = startDataRow + allPayers.length - 1;
+  const lastDataRow = startDataRow + Math.max(1, allPayers.length) - 1;
   const startShareRow = 12;
-  const endShareRow = startShareRow + allPayers.length - 1;
+  const activeShareCount = (ledger.personShares && ledger.personShares.length) || allPayers.length;
+  const endShareRow = startShareRow + Math.max(1, activeShareCount) - 1;
 
   const rows = allPayers.map((p, idx) => {
     const r = startDataRow + idx;
     const row = [p];
 
-    // 1. Past Historical Cycles (Audited & Paid)
+    // 1. Past Closed Cycles (Frozen in History)
     histKeys.forEach(k => row.push(history[k].people[p] || 0));
 
-    // 2. Active Month (Formula linked to Active Bill & Reconciliation Table 1 Net Total)
-    row.push(`=SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$H$${startShareRow}:$H$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($A${r}) & "*")`);
+    // 2. Active Month (Formula linked to Active Bill & Reconciliation Table 1 Net Total, omitted if already closed)
+    if (!activeAlreadyClosed) {
+      row.push(`=SUMIFS('${CONFIG.SHEETS.ACTIVE_RECON}'!$H$${startShareRow}:$H$${endShareRow}, '${CONFIG.SHEETS.ACTIVE_RECON}'!$B$${startShareRow}:$B$${endShareRow}, "*" & TRIM($A${r}) & "*")`);
+    }
 
     // 3. Multi-Month Future Forecasts (Installment Base + Live SUMIFS from Transactions)
     futureKeys.forEach(k => {
@@ -2300,12 +2310,16 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
     totalRow.push(`=SUM(${colLetter}${startDataRow}:${colLetter}${lastDataRow})`);
   }
 
-  sheet.getRange(5, 1, rows.length, headers.length).setValues(rows).setFontSize(9);
+  if (rows.length > 0) {
+    sheet.getRange(5, 1, rows.length, headers.length).setValues(rows).setFontSize(9);
+  }
   sheet.getRange(5 + rows.length, 1, 1, headers.length).setValues([totalRow])
     .setFontWeight("bold")
     .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
 
-  sheet.getRange(5, 2, rows.length + 1, headers.length - 1).setNumberFormat("#,##0.00");
+  if (headers.length > 1) {
+    sheet.getRange(5, 2, rows.length + 1, headers.length - 1).setNumberFormat("#,##0.00");
+  }
 
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
@@ -2313,7 +2327,7 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
     customRowHeights: { 2: 20, 4: 32 },
     explicitColWidths: { 1: 140 },
     autoResizeStartCol: 2,
-    autoResizeColCount: headers.length - 1,
+    autoResizeColCount: Math.max(0, headers.length - 1),
     colWidthBounds: { default: { min: 100, max: 125 } }
   });
 }
@@ -3393,6 +3407,7 @@ function onOpen() {
     .addSeparator()
     .addItem("⚡ Apply Payment Date to Installments Now", "applyPaymentDateNow")
     .addItem("✅ Verify & Record Bill Payment...", "recordActiveBillPaymentPrompt")
+    .addItem("🔒 Close Active Statement to History...", "menuCloseActiveStatement")
     .addSeparator()
     .addItem("🧪 Export Anonymized Test Fixture", "menuExportAnonymizedFixture")
     .addToUi();

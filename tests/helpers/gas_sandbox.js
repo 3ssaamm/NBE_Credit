@@ -295,6 +295,12 @@ class MockSheet {
   }
   setConditionalFormatRules(rules) { this.cfRules = rules || []; }
   getConditionalFormatRules() { return this.cfRules; }
+  protect() {
+    return {
+      setWarningOnly() { return this; },
+      setDescription() { return this; }
+    };
+  }
   getRange(rOrA1, c, nr, nc) {
     if (typeof rOrA1 === "string") {
       const p = parseA1(rOrA1);

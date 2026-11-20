@@ -51,6 +51,8 @@ function loadDecisions(ss) {
     counters: { S: 0, T: 0, I: 0 },
     isMigrated: false,
     migrationNote: "",
+    isHistoryMigrated: false,
+    historyMigrationNote: "",
     _dirty: false
   };
 
@@ -74,6 +76,9 @@ function loadDecisions(ss) {
       if (type === "META_MIGRATION" && subjectId === "V1_RECON_STORE") {
         store.isMigrated = target.toUpperCase() === "TRUE";
         store.migrationNote = note;
+      } else if (type === "META_MIGRATION" && subjectId === "V1_HISTORY_ARCHIVE") {
+        store.isHistoryMigrated = target.toUpperCase() === "TRUE";
+        store.historyMigrationNote = note;
       } else if (type === "META_COUNTER" && (subjectId === "S" || subjectId === "T" || subjectId === "I")) {
         store.counters[subjectId] = parseInt(target, 10) || 0;
       } else if (type === "STMT_ASSIGN" && subjectId) {
@@ -226,6 +231,10 @@ function saveDecisions(ss, decisions) {
 
     if (decisions.isMigrated) {
       rows.push(["META_MIGRATION", "V1_RECON_STORE", "TRUE", decisions.migrationNote || "", "system", true, nowStr]);
+    }
+
+    if (decisions.isHistoryMigrated) {
+      rows.push(["META_MIGRATION", "V1_HISTORY_ARCHIVE", "TRUE", decisions.historyMigrationNote || "", "system", true, nowStr]);
     }
 
     ["S", "T", "I"].forEach(prefix => {
