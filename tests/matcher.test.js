@@ -462,6 +462,18 @@ const tz = "Africa/Cairo";
     assert.strictEqual(Number(ledger.personShares.find(p => p.person === "Dad").purchases.toFixed(2)), 200.00);
     assert.strictEqual(Number(ledger.personShares.find(p => p.person === "Mido").purchases.toFixed(2)), 367.00);
     assert.ok(Object.keys(dec.merchantAliases).length >= 1, "Merchant alias te data <-> we internet should be learned");
+
+    // Verify equation-first fast path: onEdit skips redrawing Monthly History & Forecast when member roster already matches
+    const forecastBeforeFast = ss.getSheetByName(CONFIG.SHEETS.HISTORY_FORECAST);
+    forecastBeforeFast._setCell(1, 12, "KEEP_NO_REDRAW");
+    assert.strictEqual(sandbox.shouldRedrawMonthlyHistory_(ss, ledger), false, "Matching Monthly History sheet should skip redraw on fromEdit");
+    const mbSheetFast = ss.getSheetByName(CONFIG.SHEETS.MEMBER_BREAKDOWN);
+    const prevA10 = mbSheetFast._getCell(10, 1);
+    assert.ok(String(prevA10).startsWith("=VSTACK("), "Member Breakdown A10 must hold spill formula after onEdit");
+    mbSheetFast._setCell(10, 1, "STALE_SPILL");
+    sandbox.updateLiveDashboard({ skipPDF: true, fromEdit: true, ss });
+    assert.strictEqual(forecastBeforeFast._getCell(1, 12), "KEEP_NO_REDRAW", "fromEdit must NOT clear/redraw Monthly History & Forecast");
+    assert.strictEqual(mbSheetFast._getCell(10, 1), prevA10, "fromEdit must refresh Member Breakdown A10 spill formula in-place");
   }
 
   // 7b. Batch paste AND sequential "🔗 Pair with: S-00001" across all 3 rows appends without overwriting

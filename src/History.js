@@ -31,6 +31,96 @@ function roundHist2_(n) {
   return Number((Number(n) || 0).toFixed(2));
 }
 
+function historyMonthNames_() {
+  return [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+  ];
+}
+
+function extractHistoryYearMonth_(val, tz) {
+  if (val === null || val === undefined || val === "") return "";
+  const targetTz = tz || "Africa/Cairo";
+  if (val instanceof Date) {
+    return isNaN(val.getTime()) ? "" : Utilities.formatDate(val, targetTz, "yyyy-MM");
+  }
+
+  const s = String(val).trim();
+  if (!s) return "";
+
+  const ym = s.match(/^(\d{4})-(\d{1,2})(?:-\d{1,2})?$/);
+  if (ym) {
+    const mNum = parseInt(ym[2], 10);
+    if (mNum >= 1 && mNum <= 12) return `${ym[1]}-${String(mNum).padStart(2, "0")}`;
+  }
+
+  const months = historyMonthNames_();
+  const shortMonths = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+  const jsDateStr = s.match(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+([a-z]{3})\s+\d{1,2}\s+(\d{4})\b/i);
+  if (jsDateStr) {
+    const mIdx = shortMonths.indexOf(jsDateStr[1].toLowerCase());
+    if (mIdx >= 0) return `${jsDateStr[2]}-${String(mIdx + 1).padStart(2, "0")}`;
+  }
+
+  const wordYm = s.match(/^([a-z]{3,9})\s+(\d{4})$/i);
+  if (wordYm) {
+    const fullIdx = months.findIndex(mon => mon.toLowerCase() === wordYm[1].toLowerCase());
+    const shortIdx = shortMonths.indexOf(wordYm[1].toLowerCase().substring(0, 3));
+    const mIdx = fullIdx >= 0 ? fullIdx : shortIdx;
+    if (mIdx >= 0) return `${wordYm[2]}-${String(mIdx + 1).padStart(2, "0")}`;
+  }
+
+  if (typeof parseDateValue === "function") {
+    const parsed = parseDateValue(s, targetTz);
+    if (parsed && !isNaN(parsed.getTime())) {
+      return Utilities.formatDate(parsed, targetTz, "yyyy-MM");
+    }
+  }
+  return "";
+}
+
+function normalizeHistoryCycleKey_(rawKey, rawLabel, tz) {
+  if (typeof rawKey === "string") {
+    const trimmed = rawKey.trim();
+    if (/^\d{4}-\d{2}$/.test(trimmed)) return trimmed;
+  }
+  return extractHistoryYearMonth_(rawKey, tz) ||
+    extractHistoryYearMonth_(rawLabel, tz) ||
+    String(rawKey || "").trim();
+}
+
+function normalizeHistoryCycleLabel_(rawLabel, cycleKey, tz) {
+  if (typeof rawLabel === "string") {
+    const trimmed = rawLabel.trim();
+    const m = trimmed.match(/^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$/i);
+    if (m) {
+      const canonicalMon = historyMonthNames_().find(mon => mon.toLowerCase() === m[1].toLowerCase());
+      return `${canonicalMon || m[1]} ${m[2]}`;
+    }
+  }
+
+  const ckMatch = String(cycleKey || "").trim().match(/^(\d{4})-(\d{2})$/);
+  if (ckMatch) {
+    const mIdx = parseInt(ckMatch[2], 10) - 1;
+    const months = historyMonthNames_();
+    if (mIdx >= 0 && mIdx < 12) {
+      return `${months[mIdx]} ${ckMatch[1]}`;
+    }
+  }
+
+  const fallbackYm = extractHistoryYearMonth_(rawLabel, tz);
+  if (fallbackYm) {
+    const fMatch = fallbackYm.match(/^(\d{4})-(\d{2})$/);
+    if (fMatch) {
+      const mIdx = parseInt(fMatch[2], 10) - 1;
+      const months = historyMonthNames_();
+      if (mIdx >= 0 && mIdx < 12) return `${months[mIdx]} ${fMatch[1]}`;
+    }
+  }
+  return String(rawLabel || cycleKey || "").trim();
+}
+
 function getOrCreateHistorySheet(ss) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.HISTORY);
   if (sheet.getLastRow() < 1) {
@@ -41,22 +131,39 @@ function getOrCreateHistorySheet(ss) {
       .setBackground(CONFIG.COLORS.HEADER);
     sheet.setFrozenRows(1);
   }
+  try { sheet.hideSheet(); } catch (e) { }
   return sheet;
 }
 
 function readHistoryArchive(ss) {
   const sheet = ss && ss.getSheetByName(CONFIG.SHEETS.HISTORY);
-  if (!sheet || sheet.getLastRow() < 2) return {};
+  if (!sheet) return {};
+  try { sheet.hideSheet(); } catch (e) { }
+  if (sheet.getLastRow() < 2) return {};
 
+  const targetTz = (ss && ss.getSpreadsheetTimeZone()) || "Africa/Cairo";
   const lastRow = sheet.getLastRow();
   const data = sheet.getRange(2, 1, lastRow - 1, 13).getValues();
   const rawMap = {};
+  const repairedCols = [];
+  let needsRepair = false;
 
   data.forEach(r => {
-    const cycleKey = String(r[0] || "").trim();
+    const cycleKey = normalizeHistoryCycleKey_(r[0], r[1], targetTz);
+    const cycleLabel = normalizeHistoryCycleLabel_(r[1], cycleKey, targetTz);
+    repairedCols.push([cycleKey, cycleLabel]);
+
+    if (cycleKey && (
+      r[0] instanceof Date ||
+      r[1] instanceof Date ||
+      String(r[0] || "").trim() !== cycleKey ||
+      String(r[1] || "").trim() !== cycleLabel
+    )) {
+      needsRepair = true;
+    }
+
     if (!cycleKey) return;
 
-    const cycleLabel = String(r[1] || "").trim();
     const recordType = String(r[2] || "").trim().toUpperCase();
     const status = String(r[3] || "").trim();
 
@@ -82,7 +189,7 @@ function readHistoryArchive(ss) {
     }
 
     const entry = rawMap[cycleKey];
-    if (cycleLabel && !entry.label) entry.label = cycleLabel;
+    if (cycleLabel && (!entry.label || entry.label === cycleKey)) entry.label = cycleLabel;
     if (status && (!entry.status || recordType === "CYCLE_SUMMARY")) entry.status = status;
 
     if (recordType === "CYCLE_SUMMARY") {
@@ -127,6 +234,12 @@ function readHistoryArchive(ss) {
       });
     }
   });
+
+  if (needsRepair && repairedCols.length > 0) {
+    try {
+      sheet.getRange(2, 1, repairedCols.length, 2).setNumberFormat("@").setValues(repairedCols);
+    } catch (e) { }
+  }
 
   const sorted = {};
   Object.keys(rawMap).sort().forEach(k => {
@@ -176,6 +289,7 @@ function appendCycleRowsToHistory_(ss, rows, summaryIndices, decisionStartIdx) {
   const sheet = getOrCreateHistorySheet(ss);
   const startRow = Math.max(2, sheet.getLastRow() + 1);
 
+  sheet.getRange(startRow, 1, rows.length, 2).setNumberFormat("@");
   sheet.getRange(startRow, 1, rows.length, 13).setValues(rows).setFontSize(9);
 
   const numericCount = Math.min(rows.length, decisionStartIdx !== undefined ? decisionStartIdx : rows.length);

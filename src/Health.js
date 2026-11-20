@@ -2,14 +2,15 @@
  * Reconciliation Health Check Model & Panel Renderer
  *
  * Centralizes Active Bill & Reconciliation row layout coordinates and renders
- * the live Health Check panel (Rows 9-11) above Table 1 (startShareRow = 15).
+ * the unified Executive Overview & 1-line Health Check strip (Rows 4-8)
+ * directly above Table 1 (startShareRow = 12).
  *
  * NOTE: Apps Script V8 load order across files is arbitrary — never reference CONFIG or
  * Code.js helpers at top-level evaluation time; only call them inside function bodies.
  */
 
 function getActiveReconStartShareRow() {
-  return 15;
+  return 12;
 }
 
 function roundHealth2_(n) {
@@ -163,14 +164,23 @@ function buildHealthCheckModel(ss, tz, ledger, recon, optOptions) {
     : "0";
 
   const headerFormula = !parsePassed
-    ? `="🩺 Reconciliation Health Check — ❌ Parse Tie-Out Failed"`
-    : `=IF(AND(${unresolvedCountExpr}=0, ${orphanActiveCountExpr}=0, ${unlinkedInstCountExpr}=0, ABS(F6)<0.5), "🩺 Reconciliation Health Check — ✅ All Checks Passed", "🩺 Reconciliation Health Check — ⚠️ " & (IF(${unresolvedCountExpr}>0,1,0) + IF(${orphanActiveCountExpr}>0,1,0) + IF(${unlinkedInstCountExpr}>0,1,0) + IF(ABS(F6)>=0.5,1,0)) & " Check(s) Need Attention")`;
+    ? `="📊 Statement Overview & Health — ❌ Parse Tie-Out Failed"`
+    : `=IF(AND(${unresolvedCountExpr}=0, ${orphanActiveCountExpr}=0, ${unlinkedInstCountExpr}=0, ABS(F6)<0.5), "📊 Statement Overview & Health — ✅ All Checks Passed", "📊 Statement Overview & Health — ⚠️ " & (IF(${unresolvedCountExpr}>0,1,0) + IF(${orphanActiveCountExpr}>0,1,0) + IF(${unlinkedInstCountExpr}>0,1,0) + IF(ABS(F6)>=0.5,1,0)) & " Check(s) Need Attention")`;
 
   const unresolvedFormula = `=IF(${unresolvedCountExpr}=0, "Unresolved Bank Lines: ✅ 0 (0.00 EGP)", "Unresolved Bank Lines: ⚠️ " & ${unresolvedCountExpr} & " (" & TEXT(${unresolvedAmtExpr},"#,##0.00") & " EGP)")`;
   const orphanFormula = `=IF(${orphanActiveCountExpr}=0, "Orphan Logs: ✅ 0 (0.00 EGP)", "Orphan Logs: ⚠️ " & ${orphanActiveCountExpr} & " (" & TEXT(${orphanActiveAmtExpr},"#,##0.00") & " EGP)")`;
   const unlinkedInstFormula = `=IF(${unlinkedInstCountExpr}=0, "Unlinked Installments: ✅ 0 (0.00 EGP)", "Unlinked Installments: ⚠️ " & ${unlinkedInstCountExpr} & " (" & TEXT(${unlinkedInstAmtExpr},"#,##0.00") & " EGP)")`;
   const stmtCheckFormula = `=IF(ABS(F6)<0.5, "Stmt Check: ✅ " & TEXT(F6,"+#,##0.00;-#,##0.00;0.00") & " EGP", "Stmt Check: ⚠️ " & TEXT(F6,"+#,##0.00;-#,##0.00;0.00") & " EGP")`;
   const carryoverPendingFormula = `="Carryover: " & TEXT(${carriedOverExpr},"+#,##0.00;-#,##0.00;0.00") & " | Pending: ${pendingCount} (" & TEXT(${pendingTotal.toFixed(2)},"#,##0.00") & " EGP)"`;
+
+  const tile1Formula = !parsePassed
+    ? `="${parseLabel.replace(/"/g, '""')}"`
+    : `=IF(${unresolvedCountExpr}=0, "✅ Tie-Out · 0 Unresolved", "⚠️ " & ${unresolvedCountExpr} & " Unresolved (" & TEXT(${unresolvedAmtExpr},"#,##0.00") & " EGP)")`;
+  const tile2Formula = `=IF(${orphanActiveCountExpr}=0, "✅ 0 Orphan Logs", "⚠️ " & ${orphanActiveCountExpr} & " Orphan(s) (" & TEXT(${orphanActiveAmtExpr},"#,##0.00") & " EGP)")`;
+  const tile3Formula = `=IF(${unlinkedInstCountExpr}=0, "✅ 0 Unlinked Inst · Carryover " & TEXT(${carriedOverExpr},"+#,##0.00;-#,##0.00;0.00"), "⚠️ " & ${unlinkedInstCountExpr} & " Unlinked Inst (" & TEXT(${unlinkedInstAmtExpr},"#,##0.00") & " EGP)")`;
+
+  const shortRefresh = Utilities.formatDate(refreshDate, targetTz, "yyyy-MM-dd HH:mm");
+  const tile4Label = `🕒 ${shortRefresh} · v${codeVersion}`;
   const lastRefreshLabel = "Last Refresh: " + lastRefreshTime;
   const codeVersionLabel = "Code Version: " + codeVersion;
 
@@ -195,6 +205,7 @@ function buildHealthCheckModel(ss, tz, ledger, recon, optOptions) {
     codeVersion,
     lastRefreshLabel,
     codeVersionLabel,
+    tile4Label,
     overallStatus,
     allHealthy,
     expressions: {
@@ -217,7 +228,10 @@ function buildHealthCheckModel(ss, tz, ledger, recon, optOptions) {
       orphanFormula,
       unlinkedInstFormula,
       stmtCheckFormula,
-      carryoverPendingFormula
+      carryoverPendingFormula,
+      tile1Formula,
+      tile2Formula,
+      tile3Formula
     }
   };
 }
@@ -231,128 +245,97 @@ function renderHealthCheckPanel(sheet, healthModel) {
   const headerBg = isError ? "#fce8e6" : (isHealthy ? "#e8f5e9" : "#fff2cc");
   const headerFg = isError ? "#b71c1c" : (isHealthy ? "#1b5e20" : "#7f6000");
 
-  // Row 9: Health Check Panel Header Bar
-  sheet.getRange("A9:H9").merge()
+  // Row 4: Unified Overview & Health Live Header Bar
+  sheet.getRange("A4:H4").merge()
     .setFormula(healthModel.formulas.headerFormula)
     .setFontWeight("bold")
     .setFontSize(10)
     .setBackground(headerBg)
     .setFontColor(headerFg);
 
-  // Row 10: Parse Tie-Out, Unresolved Bank Lines, Orphan Logs, Unlinked Installments
-  sheet.getRange("A10:B10").merge()
-    .setValue(healthModel.parseLabel)
+  // Row 8: Single-Line 4-Tile Diagnostic Health Strip
+  const tile1Cell = sheet.getRange("A8:B8").merge();
+  if (healthModel.parsePassed) {
+    tile1Cell.setFormula(healthModel.formulas.tile1Formula);
+  } else {
+    tile1Cell.setValue(healthModel.parseLabel);
+  }
+  tile1Cell
     .setFontWeight("bold")
     .setFontSize(9)
-    .setBackground(healthModel.parsePassed ? "#e8f5e9" : "#fce8e6")
-    .setFontColor(healthModel.parsePassed ? "#1b5e20" : "#b71c1c");
+    .setBackground(!healthModel.parsePassed ? "#fce8e6" : (healthModel.unresolvedCount === 0 ? "#e8f5e9" : "#fff8e1"))
+    .setFontColor(!healthModel.parsePassed ? "#b71c1c" : (healthModel.unresolvedCount === 0 ? "#1b5e20" : "#7f6000"));
 
-  sheet.getRange("C10:D10").merge()
-    .setFormula(healthModel.formulas.unresolvedFormula)
-    .setFontWeight("bold")
-    .setFontSize(9)
-    .setBackground(healthModel.unresolvedCount === 0 ? "#e8f5e9" : "#fff8e1")
-    .setFontColor(healthModel.unresolvedCount === 0 ? "#1b5e20" : "#7f6000");
-
-  sheet.getRange("E10:F10").merge()
-    .setFormula(healthModel.formulas.orphanFormula)
+  sheet.getRange("C8:D8").merge()
+    .setFormula(healthModel.formulas.tile2Formula)
     .setFontWeight("bold")
     .setFontSize(9)
     .setBackground(healthModel.orphanCount === 0 ? "#e8f5e9" : "#fff8e1")
     .setFontColor(healthModel.orphanCount === 0 ? "#1b5e20" : "#7f6000");
 
-  sheet.getRange("G10:H10").merge()
-    .setFormula(healthModel.formulas.unlinkedInstFormula)
+  sheet.getRange("E8:F8").merge()
+    .setFormula(healthModel.formulas.tile3Formula)
     .setFontWeight("bold")
     .setFontSize(9)
     .setBackground(healthModel.unlinkedInstCount === 0 ? "#e8f5e9" : "#fff8e1")
     .setFontColor(healthModel.unlinkedInstCount === 0 ? "#1b5e20" : "#7f6000");
 
-  // Row 11: Statement Check, Carryover & Pending, Last Refresh, Code Version
-  sheet.getRange("A11:B11").merge()
-    .setFormula(healthModel.formulas.stmtCheckFormula)
-    .setFontWeight("bold")
+  sheet.getRange("G8:H8").merge()
+    .setValue(healthModel.tile4Label)
     .setFontSize(9)
-    .setBackground(healthModel.statementCheckOk ? "#e8f5e9" : "#fff8e1")
-    .setFontColor(healthModel.statementCheckOk ? "#1b5e20" : "#7f6000");
-
-  sheet.getRange("C11:D11").merge()
-    .setFormula(healthModel.formulas.carryoverPendingFormula)
-    .setFontStyle("italic")
-    .setFontSize(9)
+    .setHorizontalAlignment("center")
     .setBackground("#f8f9fa")
     .setFontColor("#555555");
 
-  sheet.getRange("E11:F11").merge()
-    .setValue(healthModel.lastRefreshLabel)
-    .setFontSize(9)
-    .setBackground("#f8f9fa")
-    .setFontColor("#555555");
+  sheet.getRange("A8:H8").setBorder(true, true, true, true, true, true);
 
-  sheet.getRange("G11:H11").merge()
-    .setValue(healthModel.codeVersionLabel)
-    .setFontWeight("bold")
-    .setFontSize(9)
-    .setBackground("#f8f9fa")
-    .setFontColor("#333333");
-
-  sheet.getRange("A9:H11").setBorder(true, true, true, true, true, true);
-
-  // Live Conditional Formatting Rules (using ISNUMBER(SEARCH(...)) — safe for UTF-16 emojis)
+  // Live Conditional Formatting Rules (ISNUMBER(SEARCH(...)) — safe for UTF-16 emojis)
   try {
-    const headerRange = sheet.getRange("A9:H9");
-    const row10TilesRange = sheet.getRange("C10:H10");
-    const stmtCheckRange = sheet.getRange("A11:B11");
+    const headerRange = sheet.getRange("A4:H4");
+    const stripRange = sheet.getRange("A8:F8");
 
     const rules = [
       SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied('=ISNUMBER(SEARCH("✅", $A$9))')
+        .whenFormulaSatisfied('=ISNUMBER(SEARCH("✅", $A$4))')
         .setBackground("#e8f5e9")
         .setFontColor("#1b5e20")
         .setBold(true)
         .setRanges([headerRange])
         .build(),
       SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied('=ISNUMBER(SEARCH("❌", $A$9))')
+        .whenFormulaSatisfied('=ISNUMBER(SEARCH("❌", $A$4))')
         .setBackground("#fce8e6")
         .setFontColor("#b71c1c")
         .setBold(true)
         .setRanges([headerRange])
         .build(),
       SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied('=ISNUMBER(SEARCH("⚠️", $A$9))')
+        .whenFormulaSatisfied('=ISNUMBER(SEARCH("⚠️", $A$4))')
         .setBackground("#fff2cc")
         .setFontColor("#7f6000")
         .setBold(true)
         .setRanges([headerRange])
         .build(),
       SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied('=ISNUMBER(SEARCH("✅", C10))')
+        .whenFormulaSatisfied('=ISNUMBER(SEARCH("✅", A8))')
         .setBackground("#e8f5e9")
         .setFontColor("#1b5e20")
         .setBold(true)
-        .setRanges([row10TilesRange])
+        .setRanges([stripRange])
         .build(),
       SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied('=ISNUMBER(SEARCH("⚠️", C10))')
+        .whenFormulaSatisfied('=ISNUMBER(SEARCH("❌", A8))')
+        .setBackground("#fce8e6")
+        .setFontColor("#b71c1c")
+        .setBold(true)
+        .setRanges([stripRange])
+        .build(),
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied('=ISNUMBER(SEARCH("⚠️", A8))')
         .setBackground("#fff8e1")
         .setFontColor("#7f6000")
         .setBold(true)
-        .setRanges([row10TilesRange])
-        .build(),
-      SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied('=ISNUMBER(SEARCH("✅", A11))')
-        .setBackground("#e8f5e9")
-        .setFontColor("#1b5e20")
-        .setBold(true)
-        .setRanges([stmtCheckRange])
-        .build(),
-      SpreadsheetApp.newConditionalFormatRule()
-        .whenFormulaSatisfied('=ISNUMBER(SEARCH("⚠️", A11))')
-        .setBackground("#fff8e1")
-        .setFontColor("#7f6000")
-        .setBold(true)
-        .setRanges([stmtCheckRange])
+        .setRanges([stripRange])
         .build()
     ];
     sheet.setConditionalFormatRules(rules);

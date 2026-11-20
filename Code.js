@@ -1539,7 +1539,7 @@ function getReconTableBounds(ledger, recon) {
   const endInstRow = startInstRow + Math.max(1, numInstRecon) - 1;
 
   const numPending = (recon.pendingNextItems || []).length;
-  const hasPendingTable = numPending > 0;
+  const hasPendingTable = false;
   const prevEndBeforePending = hasTable4 ? endInstRow : prevEndBeforeInst;
   const startPendingHeaderRow = prevEndBeforePending + 3;
   const startPendingRow = startPendingHeaderRow + 2;
@@ -1556,8 +1556,59 @@ function getReconTableBounds(ledger, recon) {
   };
 }
 
+function resetActiveReconRowsAndGroups_(sheet) {
+  if (!sheet) return;
+  const prevLastRow = Math.max(1, sheet.getLastRow());
+  try { sheet.showRows(1, prevLastRow); } catch (e) { }
+  let savedGroups = [];
+  try {
+    const rawMeta = String(sheet.getRange(1, 9).getValue() || "").trim();
+    if (rawMeta.startsWith("[[")) {
+      const parsed = JSON.parse(rawMeta);
+      if (Array.isArray(parsed)) savedGroups = parsed;
+    }
+  } catch (e) { }
+  savedGroups.forEach(pair => {
+    if (Array.isArray(pair) && pair[0] >= 1 && pair[1] >= 1) {
+      try { sheet.getRange(pair[0], 1, pair[1], 1).shiftRowGroupDepth(-1); } catch (e) { }
+    }
+  });
+}
+
+function applyCollapsibleRowGroups_(sheet, groupSpecs) {
+  if (!sheet) return;
+  const specs = (groupSpecs || []).filter(g => g && g.startRow >= 1 && g.numRows > 0);
+  if (specs.length === 0) {
+    try { sheet.getRange(1, 9).setValue(""); } catch (e) { }
+    return;
+  }
+  try {
+    if (
+      typeof SpreadsheetApp !== "undefined" &&
+      SpreadsheetApp.GroupControlTogglePosition &&
+      typeof sheet.setRowGroupControlPosition === "function"
+    ) {
+      sheet.setRowGroupControlPosition(SpreadsheetApp.GroupControlTogglePosition.BEFORE);
+    }
+  } catch (e) { }
+
+  const saved = [];
+  specs.forEach(g => {
+    try {
+      sheet.getRange(g.startRow, 1, g.numRows, 1).shiftRowGroupDepth(1);
+      saved.push([g.startRow, g.numRows]);
+      if (g.collapse && typeof sheet.getRowGroup === "function") {
+        const grp = sheet.getRowGroup(g.startRow, 1);
+        if (grp && typeof grp.collapse === "function") grp.collapse();
+      }
+    } catch (e) { }
+  });
+  try { sheet.getRange(1, 9).setValue(saved.length > 0 ? JSON.stringify(saved) : ""); } catch (e) { }
+}
+
 function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.ACTIVE_RECON);
+  resetActiveReconRowsAndGroups_(sheet);
   sheet.clear();
   sheet.setHiddenGridlines(false);
 
@@ -1678,20 +1729,10 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const startInstRow = bounds.startInstRow;
   const endInstRow = bounds.endInstRow;
 
-  // Pending Next Statement Items (post-closing purchases)
-  const pendingList = recon.pendingNextItems || [];
-  const numPending = pendingList.length;
-  const hasPendingTable = bounds.hasPendingTable;
-  const startPendingHeaderRow = bounds.startPendingHeaderRow;
-  const startPendingRow = bounds.startPendingRow;
+  // Pending Next Statement items remain computed in ledger/forecast without a 31-row table on Active Bill
+  const groupSpecs = [];
 
-  // 3. Overview Card & Balance Waterfall (Declarative Formulas)
-  sheet.getRange("A4:H4").merge()
-    .setValue("📊 Active Statement Overview & Mathematical Balance Waterfall")
-    .setFontWeight("bold")
-    .setFontSize(10)
-    .setBackground(CONFIG.COLORS.HEADER);
-
+  // 3. Unified Executive Overview & Live 1-Line Health Strip (Rows 4-8)
   const stmtDateStr = recon.cardBal.statementDate ? Utilities.formatDate(recon.cardBal.statementDate, tz, "yyyy-MM-dd") : "N/A";
   const dueDateStr = Utilities.formatDate(ledger.activeDueDate, tz, "MMMM d, yyyy");
 
@@ -1821,8 +1862,20 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     });
 
     sheet.getRange(startShareRow, 1, shareRows.length, sharesHeaders.length).setValues(shareRows).setFontSize(9);
-    sheet.getRange(startShareRow, 3, shareRows.length, 6).setNumberFormat("#,##0.00");
-    sheet.getRange(startShareRow, 8, shareRows.length, 1).setFontWeight("bold");
+    sheet.getRange(startShareRow, 3, shareRows.length, 5).setNumberFormat('#,##0.00;-#,##0.00;"—"');
+    sheet.getRange(startShareRow, 8, shareRows.length, 1).setNumberFormat("#,##0.00").setFontWeight("bold");
+
+    sharePeople.forEach((ps, idx) => {
+      const hasActivity = Math.abs(ps.purchases || 0) >= 0.005 ||
+        Math.abs(ps.installments || 0) >= 0.005 ||
+        Math.abs(ps.fees || 0) >= 0.005 ||
+        Math.abs(ps.unrecorded || 0) >= 0.005 ||
+        Math.abs(ps.refunds || 0) >= 0.005 ||
+        Math.abs(ps.netTotal || 0) >= 0.005;
+      if (!hasActivity) {
+        try { sheet.hideRows(startShareRow + idx); } catch (e) { }
+      }
+    });
   }
 
   // Summary Row (Formula-Driven)
@@ -1843,11 +1896,15 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setBorder(true, true, true, true, true, true);
   sheet.getRange(totShareRow, 3, 1, 6).setNumberFormat("#,##0.00");
 
-  // 5. Unified Needs Pairing & Statement Review Table (Table 2)
+  // 5. Unified Needs Pairing & Statement Review Table (Table 2 — Unresolved first, resolved collapsed)
+  const unresolvedEx = exceptionItems.filter(ex => !String(ex.assignedPayer || "").trim());
+  const resolvedEx = exceptionItems.filter(ex => Boolean(String(ex.assignedPayer || "").trim()));
+  const orderedExceptions = [...unresolvedEx, ...resolvedEx];
+
   const t2BannerRange = sheet.getRange(startExHeaderRow, 1, 1, 8).merge()
     .setFontWeight("bold")
     .setFontSize(10)
-    .setBackground(CONFIG.COLORS.DUE_SOON);
+    .setBackground(unresolvedEx.length === 0 ? CONFIG.COLORS.PRIMARY_LIGHT : CONFIG.COLORS.DUE_SOON);
   if (numExceptions > 0) {
     const t2SuggestedCount = `COUNTIFS(E${startExRow}:E${endExRow}, "*💡*", F${startExRow}:F${endExRow}, "")`;
     t2BannerRange.setFormula(`="🔗 Needs Pairing & Statement Review (" & ${numExceptions} & " Items | Unresolved: " & ${t2UnresolvedCount} & " = " & TEXT(${t2UnresolvedAmt}, "#,##0.00") & " EGP | Suggested pairs: " & ${t2SuggestedCount} & ")"`);
@@ -1860,7 +1917,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange(startExHeaderRow + 1, 1, 1, exHeaders.length).setValues([exHeaders]);
 
   if (numExceptions > 0) {
-    const exRows = exceptionItems.map((ex, idx) => {
+    const exRows = orderedExceptions.map((ex, idx) => {
       const r = startExRow + idx;
       const statusFormula = `=IF(ISBLANK(F${r}), IF(ISNUMBER(SEARCH("💡", E${r})), "💡 Confirm Link/Pair or Assign", "⚠️ Needs Action"), IF(ISNUMBER(SEARCH("🚫", F${r})), "🚫 Neglected", IF(ISNUMBER(SEARCH("🔗", F${r})), "🔗 Linking...", "✅ Assigned")))`;
       return [
@@ -1903,8 +1960,8 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     const exValidations = [];
     const exBgs = [];
 
-    for (let i = 0; i < exceptionItems.length; i++) {
-      const ex = exceptionItems[i];
+    for (let i = 0; i < orderedExceptions.length; i++) {
+      const ex = orderedExceptions[i];
       let rowVal = defaultValidation;
 
       if (ex.suggestedInstLinks && ex.suggestedInstLinks.length > 0) {
@@ -1966,21 +2023,32 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
 
     sheet.getRange(startExRow, 6, exRows.length, 1).setDataValidations(exValidations);
     sheet.getRange(startExRow, 1, exRows.length, 8).setBackgrounds(exBgs);
+    if (resolvedEx.length > 0) {
+      groupSpecs.push({
+        startRow: startExRow + unresolvedEx.length,
+        numRows: resolvedEx.length,
+        collapse: true
+      });
+    }
   }
 
-  // 6. Orphan Logs Panel (In-period transactions without a paired bank line — NOT billed)
+  // 6. Orphan Logs Panel (In-period transactions without a paired bank line — Active first, dismissed collapsed)
   if (hasOrphanTable) {
+    const activeOrphans = orphanList.filter(o => !o.isNeglected);
+    const dismissedOrphans = orphanList.filter(o => Boolean(o.isNeglected));
+    const orderedOrphans = [...activeOrphans, ...dismissedOrphans];
+
     sheet.getRange(startOrphanHeaderRow, 1, 1, 8).merge()
       .setFormula(`="🔎 Orphan Logs — In-Period Transactions Without a Bank Line (" & ${numOrphans} & " Items | Unresolved: " & COUNTIF(F${startOrphanRow}:F${endOrphanRow}, "<>🚫*") & " = " & TEXT(SUMIFS(D${startOrphanRow}:D${endOrphanRow}, F${startOrphanRow}:F${endOrphanRow}, "<>🚫*"), "#,##0.00") & " EGP — NOT billed until paired above)"`)
       .setFontWeight("bold")
       .setFontSize(10)
-      .setBackground("#e8eaed");
+      .setBackground(activeOrphans.length === 0 ? CONFIG.COLORS.PRIMARY_LIGHT : "#e8eaed");
 
     const orphanHeaders = ["#", "Date", "Description", "Amount (EGP)", "Person", "Resolution", "Pairing Hint / Note", "Status", "_Subject_ID"];
     sheet.getRange(startOrphanHeaderRow + 1, 1, 1, 8).setFontWeight("bold").setFontSize(9).setBackground(CONFIG.COLORS.HEADER);
     sheet.getRange(startOrphanHeaderRow + 1, 1, 1, orphanHeaders.length).setValues([orphanHeaders]);
 
-    const orphanRows = orphanList.map((tx, idx) => {
+    const orphanRows = orderedOrphans.map((tx, idx) => {
       const r = startOrphanRow + idx;
       const statusFormula = `=IF(ISNUMBER(SEARCH("🚫", F${r})), "🚫 Dismissed", IF(ISNUMBER(SEARCH("🔗", F${r})), "🔗 Pairing...", "🔎 Unpaired (Not Billed)"))`;
       const defaultAction = tx.isNeglected ? "🚫 Dismiss / Duplicate Log" : "⏳ Not on Statement Yet (Ignored)";
@@ -2012,8 +2080,8 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     const unassignedStmtDebits = (recon.missingInSheet || []).filter(m => !m.assignedPayer);
     const orphanValidations = [];
     const orphanBgs = [];
-    for (let i = 0; i < orphanList.length; i++) {
-      const orph = orphanList[i];
+    for (let i = 0; i < orderedOrphans.length; i++) {
+      const orph = orderedOrphans[i];
       const sugLabels = (orph.suggestedStmts || []).map(s => s.dropdownLabel);
       if (sugLabels.length === 0) {
         partialStmtDebits
@@ -2043,6 +2111,13 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     }
     sheet.getRange(startOrphanRow, 6, orphanRows.length, 1).setDataValidations(orphanValidations);
     sheet.getRange(startOrphanRow, 1, orphanRows.length, 8).setBackgrounds(orphanBgs);
+    if (dismissedOrphans.length > 0) {
+      groupSpecs.push({
+        startRow: startOrphanRow + activeOrphans.length,
+        numRows: dismissedOrphans.length,
+        collapse: true
+      });
+    }
   }
 
   // 7. Active Installments & Statement EMI Reconciliation (Table 4)
@@ -2116,36 +2191,13 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     }
     sheet.getRange(startInstRow, 6, instRows.length, 1).setDataValidations(instValidations);
     sheet.getRange(startInstRow, 1, instRows.length, 8).setBackgrounds(instBgs);
-  }
 
-  const pendingTotalFixed = (ledger.pendingTotal || 0).toFixed(2);
-  // 8. Pending — Next Statement Panel (Post-closing purchases — NOT billed on current statement)
-  if (hasPendingTable) {
-    sheet.getRange(startPendingHeaderRow, 1, 1, 8).merge()
-      .setValue(`⏳ Pending — Next Statement (${numPending} Purchases = ${pendingTotalFixed} EGP — Dated after statement cutoff; NOT billed now)`)
-      .setFontWeight("bold")
-      .setFontSize(10)
-      .setBackground("#e8eaed");
-
-    const pendingHeaders = ["#", "Date", "Description", "Amount (EGP)", "Person", "Target Cycle", "Note", "Status", "_Subject_ID"];
-    sheet.getRange(startPendingHeaderRow + 1, 1, 1, 8).setFontWeight("bold").setFontSize(9).setBackground(CONFIG.COLORS.HEADER);
-    sheet.getRange(startPendingHeaderRow + 1, 1, 1, pendingHeaders.length).setValues([pendingHeaders]);
-
-    const pendingRows = pendingList.map(p => [
-      p.id,
-      p.date,
-      p.desc,
-      p.amount,
-      p.person,
-      p.cycleLabel || "",
-      "Post-closing purchase",
-      "⏳ Next Statement",
-      p.txId || ""
-    ]);
-    sheet.getRange(startPendingRow, 1, pendingRows.length, pendingHeaders.length).setValues(pendingRows);
-    sheet.getRange(startPendingRow, 1, pendingRows.length, 8).setFontSize(9).setBackground("#f8f9fa");
-    sheet.getRange(startPendingRow, 2, pendingRows.length, 1).setNumberFormat("yyyy-MM-dd");
-    sheet.getRange(startPendingRow, 4, pendingRows.length, 1).setNumberFormat("#,##0.00");
+    const hasUnresolvedInst = instReconList.some(it => !String(it.action || "").trim());
+    groupSpecs.push({
+      startRow: startInstRow,
+      numRows: instRows.length,
+      collapse: !hasUnresolvedInst
+    });
   }
 
   try { sheet.hideColumns(9); } catch (e) { }
@@ -2161,7 +2213,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
     bannerHeight: 30,
-    customRowHeights: { 2: 20, 3: 12, 4: 24, 8: 10, 9: 24, 10: 22, 11: 22, 12: 12, 13: 26, 14: 24 },
+    customRowHeights: { 2: 20, 3: 10, 4: 24, 8: 22, 9: 10, 10: 26, 11: 24 },
     explicitColWidths: {
       1: 55,  // #
       2: 125, // Date / Member
@@ -2173,6 +2225,8 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       8: 155  // Status
     }
   });
+
+  applyCollapsibleRowGroups_(sheet, groupSpecs);
 
   return healthModel;
 }
@@ -2226,7 +2280,7 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
 
   const futureKeys = Object.keys(futureForecasts).sort().slice(0, 4);
 
-  // Build union of active payers + historical members
+  // Build union of active payers + historical members, hiding all-zero inactive members
   const payerSet = new Set(getAllUniquePayers(ss));
   histKeys.forEach(k => {
     Object.keys((history[k] && history[k].people) || {}).forEach(p => {
@@ -2234,6 +2288,44 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
     });
   });
   const allPayers = Array.from(payerSet).sort((a, b) => a.localeCompare(b));
+
+  const futureTxPayers = new Set();
+  const futureRanges = futureKeys.map(k => getCycleDateRange(k, tz)).filter(Boolean);
+  if (futureRanges.length > 0) {
+    const txSheetHist = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+    if (txSheetHist && txSheetHist.getLastRow() >= 2) {
+      const txHistData = txSheetHist.getRange(2, 1, txSheetHist.getLastRow() - 1, 5).getValues();
+      txHistData.forEach(row => {
+        const pDate = parseDateValue(row[1], tz);
+        const amt = parseFloat(row[4]);
+        const payer = String(row[3] || "").trim();
+        if (!pDate || isNaN(amt) || amt <= 0 || !payer) return;
+        const inFuture = futureRanges.some(dr => pDate >= dr.start && pDate <= dr.end);
+        if (inFuture) {
+          splitPayerNames(payer).forEach(p => { if (p) futureTxPayers.add(p); });
+        }
+      });
+    }
+  }
+
+  const activeNonZeroMap = {};
+  (ledger.personShares || []).forEach(ps => {
+    activeNonZeroMap[ps.person] = Math.abs(ps.purchases || 0) >= 0.005 ||
+      Math.abs(ps.installments || 0) >= 0.005 ||
+      Math.abs(ps.fees || 0) >= 0.005 ||
+      Math.abs(ps.unrecorded || 0) >= 0.005 ||
+      Math.abs(ps.refunds || 0) >= 0.005 ||
+      Math.abs(ps.netTotal || 0) >= 0.005;
+  });
+
+  const filteredPayers = allPayers.filter(p => {
+    if (activeNonZeroMap[p]) return true;
+    if (histKeys.some(k => Math.abs((history[k] && history[k].people && history[k].people[p]) || 0) >= 0.005)) return true;
+    if (futureKeys.some(k => Math.abs((futureForecasts[k] && futureForecasts[k].people && futureForecasts[k].people[p]) || 0) >= 0.005)) return true;
+    if (futureTxPayers.has(p)) return true;
+    return false;
+  });
+  const visiblePayers = filteredPayers.length > 0 ? filteredPayers : allPayers;
 
   const activeAlreadyClosed = Boolean(history[ledger.activeCycleKey]);
   const headers = [
@@ -2252,7 +2344,7 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
     .setFontColor("#ffffff");
 
   sheet.getRange(`A2:${bannerEndCol}2`).merge()
-    .setValue("Closed billing cycles from immutable History alongside active statement debt and future projected installment commitments.")
+    .setValue("Closed billing cycles alongside active statement debt and future projected installment commitments.")
     .setFontStyle("italic")
     .setFontSize(9)
     .setFontColor(CONFIG.COLORS.TEXT_MUTED);
@@ -2264,12 +2356,12 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
     .setWrap(true);
 
   const startDataRow = 5;
-  const lastDataRow = startDataRow + Math.max(1, allPayers.length) - 1;
+  const lastDataRow = startDataRow + Math.max(1, visiblePayers.length) - 1;
   const startShareRow = getActiveReconStartShareRow();
   const activeShareCount = (ledger.personShares && ledger.personShares.length) || allPayers.length;
   const endShareRow = startShareRow + Math.max(1, activeShareCount) - 1;
 
-  const rows = allPayers.map((p, idx) => {
+  const rows = visiblePayers.map((p, idx) => {
     const r = startDataRow + idx;
     const row = [p];
 
@@ -2315,8 +2407,13 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
     .setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
 
   if (headers.length > 1) {
-    sheet.getRange(5, 2, rows.length + 1, headers.length - 1).setNumberFormat("#,##0.00");
+    if (rows.length > 0) {
+      sheet.getRange(5, 2, rows.length, headers.length - 1).setNumberFormat('#,##0.00;-#,##0.00;"—"');
+    }
+    sheet.getRange(5 + rows.length, 2, 1, headers.length - 1).setNumberFormat("#,##0.00");
   }
+
+  try { sheet.setFrozenRows(4); } catch (e) { }
 
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
@@ -2329,9 +2426,113 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
   });
 }
 
+function shouldRedrawMonthlyHistory_(ss, ledger) {
+  const sheet = ss && ss.getSheetByName(CONFIG.SHEETS.HISTORY_FORECAST);
+  if (!sheet || sheet.getLastRow() < 5 || sheet.getLastColumn() < 2) return true;
+  const lastCol = sheet.getLastColumn();
+  const headerVals = sheet.getRange(4, 1, 1, lastCol).getValues()[0].map(h => String(h || ""));
+  const closedCycle = typeof isCycleClosed === "function" ? isCycleClosed(ss, ledger.activeCycleKey) : false;
+
+  if (closedCycle) {
+    const hasClosedCol = headerVals.some(h => h.includes(ledger.activeCycleLabel) && h.includes("(Closed)"));
+    const hasDupActive = headerVals.some(h => h.includes("(Active)"));
+    if (!hasClosedCol || hasDupActive) return true;
+    return false;
+  }
+
+  const activeColIdx = headerVals.findIndex(h => h.includes(ledger.activeCycleLabel) && h.includes("(Active)")) + 1;
+  if (activeColIdx <= 1) return true;
+
+  const startShareRow = getActiveReconStartShareRow();
+  const numPayers = (ledger.personShares && ledger.personShares.length) || 0;
+  if (numPayers === 0) return true;
+  const endShareRow = startShareRow + numPayers - 1;
+  const expectedRange = `$H$${startShareRow}:$H$${endShareRow}`;
+
+  const sampleFormula = String(sheet.getRange(5, activeColIdx).getFormula() || sheet.getRange(5, activeColIdx).getValue() || "");
+  if (!sampleFormula.includes(expectedRange)) return true;
+
+  const visibleRowCount = Math.max(0, sheet.getLastRow() - 5);
+  const visibleMembers = new Set(
+    visibleRowCount > 0
+      ? sheet.getRange(5, 1, visibleRowCount, 1).getValues().map(r => String(r[0] || "").trim()).filter(Boolean)
+      : []
+  );
+  return (ledger.personShares || []).some(ps =>
+    (Math.abs(ps.netTotal || 0) >= 0.005 || Math.abs(ps.purchases || 0) >= 0.005) &&
+    !visibleMembers.has(ps.person)
+  );
+}
+
 // ==========================================
 // 10B. UI: MEMBER BREAKDOWN (INTERACTIVE FILTER)
 // ==========================================
+
+function buildMemberBreakdownSpillFormulas_(ss, bounds) {
+  const txRef = `'${CONFIG.SHEETS.TRANSACTIONS}'`;
+  const instRef = `'${CONFIG.SHEETS.INSTALLMENTS}'`;
+  const arRef = `'${CONFIG.SHEETS.ACTIVE_RECON}'`;
+
+  const txColsExpr = `ARRAYFORMULA({${txRef}!$A$2:$C, IFERROR(${txRef}!$E$2:$E / IF($B$3="All Family Members", 1, LEN(${txRef}!$D$2:$D) - LEN(SUBSTITUTE(${txRef}!$D$2:$D, "+", "")) + 1), 0), ${txRef}!$D$2:$D, IF(${txRef}!$A$2:$A<>"","✅ Recorded","")})`;
+  const txBaseCond = `(${txRef}!$A$2:$A<>"") * (${txRef}!$E$2:$E>0) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${txRef}!$D$2:$D)))) * (${txRef}!$B$2:$B>=$Z$1) * (${txRef}!$B$2:$B<($Z$2+1))`;
+  const txNotOrphanCond = bounds.hasOrphanTable
+    ? ` * MAP(${txRef}!$B$2:$B, ${txRef}!$C$2:$C, ${txRef}!$D$2:$D, LAMBDA(dt, dc, pr, IF(dc="", FALSE, COUNTIFS(${arRef}!$B$${bounds.startOrphanRow}:$B$${bounds.endOrphanRow}, dt, ${arRef}!$C$${bounds.startOrphanRow}:$C$${bounds.endOrphanRow}, dc & "*", ${arRef}!$E$${bounds.startOrphanRow}:$E$${bounds.endOrphanRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", pr)), "*", "*" & TRIM(pr) & "*"), "*" & TRIM($B$3) & "*")) < IF($B$3="All Family Members", LEN(pr) - LEN(SUBSTITUTE(pr, "+", "")) + 1, 1))))`
+    : "";
+  const purchFilterPart = `IFERROR(FILTER(${txColsExpr}, ${txBaseCond}${txNotOrphanCond}), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
+
+  let exFilterPart;
+  if (bounds.numExceptions > 0) {
+    const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, IF(ISNUMBER(SEARCH("Credit", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow})), -1, 1) * ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}, ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}})`;
+    const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (ISERROR(SEARCH("🚫", ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))) * (ISERROR(SEARCH("🔗", ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))) * (ISERROR(SEARCH("Installment", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}))) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
+    exFilterPart = `IFERROR(FILTER(${exColsExpr}, ${exFilterCond}), {"—", "—", "No unrecorded statement items, fees, or refunds", 0, "—", "—"})`;
+  } else {
+    exFilterPart = `{"—", "—", "No statement adjustments for this cycle", 0, "—", "—"}`;
+  }
+
+  const purchSpillFormula = `=VSTACK(${purchFilterPart}, {"", "", "", "", "", ""}, {"#", "Tx Date", "🧾 Unrecorded Statement Items, Fees & Refunds", "Amount (EGP)", "Assigned Payer", "Category"}, ${exFilterPart})`;
+
+  let instColsExpr;
+  const instSheetObj = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
+  const instColsInfo = instSheetObj ? getOrCreateInstallmentProgressCols(instSheetObj) : null;
+  if (instColsInfo && instColsInfo.progressCol === 10 && instColsInfo.statusCol === 11) {
+    instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$K})`;
+  } else if (instColsInfo && instColsInfo.progressCol > 11 && instColsInfo.statusCol > 11) {
+    const progLet = getColumnLetter(instColsInfo.progressCol);
+    const statLet = getColumnLetter(instColsInfo.statusCol);
+    instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$I, ${instRef}!$${progLet}$2:$${progLet}, ${instRef}!$${statLet}$2:$${statLet}})`;
+  } else {
+    instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$K})`;
+  }
+  const statColLet = getColumnLetter((instColsInfo && instColsInfo.statusCol) || 11);
+  const instFilterCond = bounds.hasTable4
+    ? `(${instRef}!$A$2:$A<>"") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1)) * MAP(${instRef}!$C$2:$C, ${instRef}!$I$2:$I, LAMBDA(d, p, IF(d="", FALSE, COUNTIFS(${arRef}!$C$${bounds.startInstRow}:$C$${bounds.endInstRow}, d & " (*", ${arRef}!$F$${bounds.startInstRow}:$F$${bounds.endInstRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", p)), "✅*", "✅*" & TRIM(p) & "*"), "✅*" & TRIM($B$3) & "*"))>0)))`
+    : `(${instRef}!$A$2:$A<>"") * (${instRef}!$${statColLet}$2:$${statColLet}<>"Completed") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1))`;
+  const instSpillFormula = `=IFERROR(FILTER(${instColsExpr}, ${instFilterCond}), {"—", "—", "No active installments for this cycle", 0, 0, 0, "—", "—", "—"})`;
+
+  return { purchSpillFormula, instSpillFormula };
+}
+
+function syncMemberBreakdownSpillFormulas_(ss, tz, ledger, recon) {
+  const mbSheet = ss && ss.getSheetByName(CONFIG.SHEETS.MEMBER_BREAKDOWN);
+  if (!mbSheet || mbSheet.getLastRow() < 10) {
+    renderMemberBreakdownSheet(ss, tz, ledger, recon);
+    return;
+  }
+
+  const bounds = getReconTableBounds(ledger, recon);
+  const a6Formula = String(mbSheet.getRange("A6").getFormula() || mbSheet.getRange("A6").getValue() || "");
+  const expectedTotalRef = `$H$${bounds.totShareRow}`;
+  const expectedShareRange = `$H$${bounds.startShareRow}:$H$${bounds.endShareRow}`;
+
+  if (!a6Formula.includes(expectedTotalRef) || !a6Formula.includes(expectedShareRange)) {
+    renderMemberBreakdownSheet(ss, tz, ledger, recon);
+    return;
+  }
+
+  const spills = buildMemberBreakdownSpillFormulas_(ss, bounds);
+  mbSheet.getRange("A10").setFormula(spills.purchSpillFormula);
+  mbSheet.getRange("H10").setFormula(spills.instSpillFormula);
+}
 
 function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
   const sheet = getOrCreateSheet(ss, CONFIG.SHEETS.MEMBER_BREAKDOWN);
@@ -2469,28 +2670,8 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
 
-  const txRef = `'${CONFIG.SHEETS.TRANSACTIONS}'`;
-  const instRef = `'${CONFIG.SHEETS.INSTALLMENTS}'`;
-  const arRef = `'${CONFIG.SHEETS.ACTIVE_RECON}'`;
-
-  const txColsExpr = `ARRAYFORMULA({${txRef}!$A$2:$C, IFERROR(${txRef}!$E$2:$E / IF($B$3="All Family Members", 1, LEN(${txRef}!$D$2:$D) - LEN(SUBSTITUTE(${txRef}!$D$2:$D, "+", "")) + 1), 0), ${txRef}!$D$2:$D, IF(${txRef}!$A$2:$A<>"","✅ Recorded","")})`;
-  const txBaseCond = `(${txRef}!$A$2:$A<>"") * (${txRef}!$E$2:$E>0) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${txRef}!$D$2:$D)))) * (${txRef}!$B$2:$B>=$Z$1) * (${txRef}!$B$2:$B<($Z$2+1))`;
-  const txNotOrphanCond = bounds.hasOrphanTable
-    ? ` * MAP(${txRef}!$B$2:$B, ${txRef}!$C$2:$C, ${txRef}!$D$2:$D, LAMBDA(dt, dc, pr, IF(dc="", FALSE, COUNTIFS(${arRef}!$B$${bounds.startOrphanRow}:$B$${bounds.endOrphanRow}, dt, ${arRef}!$C$${bounds.startOrphanRow}:$C$${bounds.endOrphanRow}, dc & "*", ${arRef}!$E$${bounds.startOrphanRow}:$E$${bounds.endOrphanRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", pr)), "*", "*" & TRIM(pr) & "*"), "*" & TRIM($B$3) & "*")) < IF($B$3="All Family Members", LEN(pr) - LEN(SUBSTITUTE(pr, "+", "")) + 1, 1))))`
-    : "";
-  const purchFilterPart = `IFERROR(FILTER(${txColsExpr}, ${txBaseCond}${txNotOrphanCond}), {"—", "—", "No direct purchases recorded in this billing cycle", 0, "—", "—"})`;
-
-  let exFilterPart;
-  if (bounds.numExceptions > 0) {
-    const exColsExpr = `ARRAYFORMULA({${arRef}!$A$${bounds.startExRow}:$C$${bounds.endExRow}, IF(ISNUMBER(SEARCH("Credit", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow})), -1, 1) * ${arRef}!$D$${bounds.startExRow}:$D$${bounds.endExRow}, ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}, ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}})`;
-    const exFilterCond = `(${arRef}!$A$${bounds.startExRow}:$A$${bounds.endExRow}<>"") * (${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}<>"") * (ISERROR(SEARCH("🚫", ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))) * (ISERROR(SEARCH("🔗", ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))) * (ISERROR(SEARCH("Installment", ${arRef}!$E$${bounds.startExRow}:$E$${bounds.endExRow}))) * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${arRef}!$F$${bounds.startExRow}:$F$${bounds.endExRow}))))`;
-    exFilterPart = `IFERROR(FILTER(${exColsExpr}, ${exFilterCond}), {"—", "—", "No unrecorded statement items, fees, or refunds", 0, "—", "—"})`;
-  } else {
-    exFilterPart = `{"—", "—", "No statement adjustments for this cycle", 0, "—", "—"}`;
-  }
-
-  const purchSpillFormula = `=VSTACK(${purchFilterPart}, {"", "", "", "", "", ""}, {"#", "Tx Date", "🧾 Unrecorded Statement Items, Fees & Refunds", "Amount (EGP)", "Assigned Payer", "Category"}, ${exFilterPart})`;
-  sheet.getRange("A10").setFormula(purchSpillFormula).setFontSize(9);
+  const spills = buildMemberBreakdownSpillFormulas_(ss, bounds);
+  sheet.getRange("A10").setFormula(spills.purchSpillFormula).setFontSize(9);
   sheet.getRange("D10:D250").setNumberFormat("#,##0.00");
   sheet.getRange("B10:B250").setNumberFormat("yyyy-MM-dd");
 
@@ -2519,27 +2700,12 @@ function renderMemberBreakdownSheet(ss, tz, ledger, recon) {
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
 
-  let instColsExpr;
-  const instSheetObj = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
-  const instColsInfo = instSheetObj ? getOrCreateInstallmentProgressCols(instSheetObj) : null;
-  if (instColsInfo && instColsInfo.progressCol === 10 && instColsInfo.statusCol === 11) {
-    instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$K})`;
-  } else if (instColsInfo && instColsInfo.progressCol > 11 && instColsInfo.statusCol > 11) {
-    const progLet = getColumnLetter(instColsInfo.progressCol);
-    const statLet = getColumnLetter(instColsInfo.statusCol);
-    instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$I, ${instRef}!$${progLet}$2:$${progLet}, ${instRef}!$${statLet}$2:$${statLet}})`;
-  } else {
-    instColsExpr = `ARRAYFORMULA({${instRef}!$A$2:$E, ROUND(${instRef}!$H$2:$H, 2) / IF($B$3="All Family Members", 1, LEN(${instRef}!$I$2:$I) - LEN(SUBSTITUTE(${instRef}!$I$2:$I, "+", "")) + 1), ${instRef}!$I$2:$K})`;
-  }
-  const statColLet = getColumnLetter((instColsInfo && instColsInfo.statusCol) || 11);
-  const instFilterCond = bounds.hasTable4
-    ? `(${instRef}!$A$2:$A<>"") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1)) * MAP(${instRef}!$C$2:$C, ${instRef}!$I$2:$I, LAMBDA(d, p, IF(d="", FALSE, COUNTIFS(${arRef}!$C$${bounds.startInstRow}:$C$${bounds.endInstRow}, d & " (*", ${arRef}!$F$${bounds.startInstRow}:$F$${bounds.endInstRow}, IF($B$3="All Family Members", IF(ISNUMBER(FIND("+", p)), "✅*", "✅*" & TRIM(p) & "*"), "✅*" & TRIM($B$3) & "*"))>0)))`
-    : `(${instRef}!$A$2:$A<>"") * (${instRef}!$${statColLet}$2:$${statColLet}<>"Completed") * (IF($B$3="All Family Members", 1, ISNUMBER(SEARCH(TRIM($B$3), ${instRef}!$I$2:$I)))) * (${instRef}!$B$2:$B<($Z$2+1))`;
-  const instSpillFormula = `=IFERROR(FILTER(${instColsExpr}, ${instFilterCond}), {"—", "—", "No active installments for this cycle", 0, 0, 0, "—", "—", "—"})`;
-  sheet.getRange("H10").setFormula(instSpillFormula).setFontSize(9);
+  sheet.getRange("H10").setFormula(spills.instSpillFormula).setFontSize(9);
   sheet.getRange("K10:K150").setNumberFormat("#,##0.00");
   sheet.getRange("M10:M150").setNumberFormat("#,##0.00").setFontWeight("bold");
   sheet.getRange("I10:I150").setNumberFormat("yyyy-MM-dd");
+
+  try { sheet.setFrozenRows(3); } catch (e) { }
 
   // 9. Layout Fitting & Ergonomics
   applySheetLayoutFitting(sheet, {
@@ -2757,6 +2923,26 @@ function handleActiveReconEdit(e) {
 
   if (modified) {
     saveDecisions(ss, decisions);
+    if (!needsRefresh) {
+      const targetPayers = new Set();
+      for (let row = loopStart; row <= loopEnd; row++) {
+        const rawPayer = String((allRows[row - 1] && allRows[row - 1][5]) || "").trim();
+        if (rawPayer && !isNeglectedPayer(rawPayer) && !/^🔗/.test(rawPayer)) {
+          const cleanStr = rawPayer.replace(/^✅\s*Billed\s+to\s+/i, "");
+          splitPayerNames(cleanStr).forEach(p => { if (p) targetPayers.add(p); });
+        }
+      }
+      if (targetPayers.size > 0) {
+        const startShareRow = getActiveReconStartShareRow();
+        for (let sr = startShareRow; sr <= allRows.length; sr++) {
+          const rowArr = allRows[sr - 1];
+          if (!rowArr || String(rowArr[0] || "") === "TOTAL") break;
+          if (targetPayers.has(String(rowArr[1] || "").trim())) {
+            try { sheet.showRows(sr); } catch (e) { }
+          }
+        }
+      }
+    }
   }
   if (needsRefresh) {
     try {
@@ -2915,8 +3101,15 @@ function updateLiveDashboard(options) {
   const ledger = buildDebtLedger(ss, tz, recon);
 
   const health = renderActiveReconciliationSheet(ss, tz, ledger, recon);
-  renderMonthlyHistoryForecastSheet(ss, tz, ledger);
-  renderMemberBreakdownSheet(ss, tz, ledger, recon);
+  if (fromEdit) {
+    syncMemberBreakdownSpillFormulas_(ss, tz, ledger, recon);
+    if (shouldRedrawMonthlyHistory_(ss, ledger)) {
+      renderMonthlyHistoryForecastSheet(ss, tz, ledger);
+    }
+  } else {
+    renderMonthlyHistoryForecastSheet(ss, tz, ledger);
+    renderMemberBreakdownSheet(ss, tz, ledger, recon);
+  }
 
   return { blocked: false, parseHealth, recon, ledger, health };
 }

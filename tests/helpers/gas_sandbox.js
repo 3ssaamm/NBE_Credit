@@ -37,6 +37,7 @@ function formatDateMock(date, tz, fmt) {
   const monthName = months[parseInt(mm2, 10) - 1];
 
   if (fmt === "yyyy-MM-dd") return `${y}-${mm2}-${dd2}`;
+  if (fmt === "yyyy-MM-dd HH:mm") return `${y}-${mm2}-${dd2} ${hh}:${min}`;
   if (fmt === "yyyy-MM-dd HH:mm:ss") return `${y}-${mm2}-${dd2} ${hh}:${min}:${ss}`;
   if (fmt === "yyyy-MM") return `${y}-${mm2}`;
   if (fmt === "MMMM yyyy") return `${monthName} ${y}`;
@@ -94,6 +95,10 @@ class MockRange {
   getNumRows() { return this.nr; }
   getNumColumns() { return this.nc; }
   getValue() { return this.sheet._getCell(this.r, this.c); }
+  getFormula() {
+    const v = this.getValue();
+    return typeof v === "string" && v.startsWith("=") ? v : "";
+  }
   getFormulas() {
     const out = [];
     for (let i = 0; i < this.nr; i++) {
@@ -194,6 +199,22 @@ class MockRange {
   clearFormat() { return this; }
   setWrap() { return this; }
   setWrapStrategy() { return this; }
+  shiftRowGroupDepth(delta) {
+    const endRow = this.r + this.nr - 1;
+    if (delta > 0) {
+      this.sheet.rowGroups.push({
+        startRow: this.r,
+        endRow,
+        depth: delta,
+        collapsed: false
+      });
+    } else if (delta < 0) {
+      this.sheet.rowGroups = this.sheet.rowGroups.filter(
+        g => !(g.startRow === this.r && g.endRow === endRow)
+      );
+    }
+    return this;
+  }
 }
 
 class MockSheet {
@@ -210,6 +231,9 @@ class MockSheet {
     this.colWidths = {};
     this.hidden = false;
     this.hiddenCols = new Set();
+    this.hiddenRows = new Set();
+    this.rowGroups = [];
+    this.frozenRows = 0;
   }
   getName() { return this.name; }
   getParent() { return this.ss; }
@@ -295,7 +319,7 @@ class MockSheet {
   }
   hideSheet() { this.hidden = true; }
   showSheet() { this.hidden = false; }
-  setFrozenRows() {}
+  setFrozenRows(n) { this.frozenRows = n; }
   setHiddenGridlines() {}
   setRowHeight() {}
   setRowHeights() {}
@@ -311,6 +335,28 @@ class MockSheet {
     const count = num || 1;
     for (let i = 0; i < count; i++) this.hiddenCols.delete(col + i);
   }
+  hideRows(row, num) {
+    const count = num || 1;
+    for (let i = 0; i < count; i++) this.hiddenRows.add(row + i);
+  }
+  showRows(row, num) {
+    const count = num || 1;
+    for (let i = 0; i < count; i++) this.hiddenRows.delete(row + i);
+  }
+  setRowGroupControlPosition() {}
+  getRowGroup(rowIndex, depth) {
+    const d = depth || 1;
+    const sheet = this;
+    const grp = this.rowGroups.find(g => rowIndex >= g.startRow && rowIndex <= g.endRow && g.depth === d) || null;
+    if (!grp) return null;
+    return {
+      collapse() { grp.collapsed = true; },
+      expand() { grp.collapsed = false; },
+      remove() { sheet.rowGroups = sheet.rowGroups.filter(x => x !== grp); }
+    };
+  }
+  collapseAllRowGroups() { this.rowGroups.forEach(g => { g.collapsed = true; }); }
+  expandAllRowGroups() { this.rowGroups.forEach(g => { g.collapsed = false; }); }
   setConditionalFormatRules(rules) { this.cfRules = rules || []; }
   getConditionalFormatRules() { return this.cfRules; }
   protect() {
@@ -382,6 +428,7 @@ function createGasSandbox() {
     Logger: { log: () => {} },
     Utilities: { formatDate: formatDateMock },
     SpreadsheetApp: {
+      GroupControlTogglePosition: { BEFORE: "BEFORE", AFTER: "AFTER" },
       getActiveSpreadsheet: () => currentSs,
       flush: () => { sandbox.__flushCount = (sandbox.__flushCount || 0) + 1; },
       newDataValidation: () => {

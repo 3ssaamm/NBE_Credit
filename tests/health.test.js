@@ -15,7 +15,7 @@ function colLetterToIdx(letters) {
 }
 
 // ==========================================
-// Test 1: Real Fixture (2026-11-real.json) All-Green Health Panel & Layout Anchors
+// Test 1: Real Fixture (2026-11-real.json) Unified Overview + 1-Line Health Strip & Layout Polish
 // ==========================================
 {
   const realFixture = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "2026-11-real.json"), "utf8"));
@@ -38,38 +38,30 @@ function colLetterToIdx(letters) {
   const ar = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
   assert.ok(ar, "Active Bill & Reconciliation sheet must exist");
 
-  // Verify Health Panel cells (Rows 9-11)
-  const a9 = String(ar._getCell(9, 1) || "");
-  const a10 = String(ar._getCell(10, 1) || "");
-  const c10 = String(ar._getCell(10, 3) || "");
-  const e10 = String(ar._getCell(10, 5) || "");
-  const g10 = String(ar._getCell(10, 7) || "");
-  const a11 = String(ar._getCell(11, 1) || "");
-  const c11 = String(ar._getCell(11, 3) || "");
-  const e11 = String(ar._getCell(11, 5) || "");
-  const g11 = String(ar._getCell(11, 7) || "");
+  // Verify Unified Executive Header (Row 4) + Single-Line Diagnostic Health Strip (Row 8)
+  const a4 = String(ar._getCell(4, 1) || "");
+  const a8 = String(ar._getCell(8, 1) || "");
+  const c8 = String(ar._getCell(8, 3) || "");
+  const e8 = String(ar._getCell(8, 5) || "");
+  const g8 = String(ar._getCell(8, 7) || "");
 
-  assert.ok(a9.includes("🩺 Reconciliation Health Check") && a9.includes("All Checks Passed"), `Unexpected A9: ${a9}`);
-  assert.strictEqual(a10, "Parse Tie-Out: ✅ Passed");
-  assert.ok(c10.includes("Unresolved Bank Lines:"), `Unexpected C10: ${c10}`);
-  assert.ok(e10.includes("Orphan Logs:"), `Unexpected E10: ${e10}`);
-  assert.ok(g10.includes("Unlinked Installments:"), `Unexpected G10: ${g10}`);
+  assert.ok(a4.includes("📊 Statement Overview & Health") && a4.includes("All Checks Passed"), `Unexpected A4: ${a4}`);
+  assert.ok(a8.includes("Unresolved"), `Unexpected A8: ${a8}`);
+  assert.ok(c8.includes("Orphan Logs"), `Unexpected C8: ${c8}`);
+  assert.ok(e8.includes("Unlinked Inst") && e8.includes("Carryover"), `Unexpected E8: ${e8}`);
   assert.ok(
-    g10.includes("COUNTIF(") && g10.includes('"🚫*"') && g10.includes('"🔗*"') && !g10.includes('"<>🚫*"'),
-    `G10 must subtract 🚫* and 🔗* rather than using <>🚫*: ${g10}`
+    e8.includes("COUNTIF(") && e8.includes('"🚫*"') && e8.includes('"🔗*"') && !e8.includes('"<>🚫*"'),
+    `E8 must subtract 🚫* and 🔗* rather than using <>🚫*: ${e8}`
   );
-  assert.ok(a11.includes("Stmt Check:"), `Unexpected A11: ${a11}`);
-  assert.ok(c11.includes("Carryover:") && c11.includes("Pending:"), `Unexpected C11: ${c11}`);
-  assert.match(e11, /^Last Refresh: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, `Unexpected E11: ${e11}`);
-  assert.strictEqual(g11, `Code Version: ${sandbox.getCodeVersion()}`, `Unexpected G11: ${g11}`);
+  assert.match(g8, /^🕒 \d{4}-\d{2}-\d{2} \d{2}:\d{2} · v.+$/, `Unexpected G8: ${g8}`);
+  assert.ok(g8.endsWith(`v${sandbox.getCodeVersion()}`), `G8 must display getCodeVersion: ${g8}`);
 
-  // Green backgrounds when healthy
-  assert.strictEqual(ar.backgrounds["9_1"], "#e8f5e9");
-  assert.strictEqual(ar.backgrounds["10_1"], "#e8f5e9");
-  assert.strictEqual(ar.backgrounds["10_3"], "#e8f5e9");
-  assert.strictEqual(ar.backgrounds["10_5"], "#e8f5e9");
-  assert.strictEqual(ar.backgrounds["10_7"], "#e8f5e9");
-  assert.strictEqual(ar.backgrounds["11_1"], "#e8f5e9");
+  // Green backgrounds when healthy + neutral timestamp pill
+  assert.strictEqual(ar.backgrounds["4_1"], "#e8f5e9");
+  assert.strictEqual(ar.backgrounds["8_1"], "#e8f5e9");
+  assert.strictEqual(ar.backgrounds["8_3"], "#e8f5e9");
+  assert.strictEqual(ar.backgrounds["8_5"], "#e8f5e9");
+  assert.strictEqual(ar.backgrounds["8_7"], "#f8f9fa");
 
   // Conditional format rules registered & no broken LEFT(,1) emoji surrogate check anywhere
   const cfRules = ar.getConditionalFormatRules();
@@ -78,6 +70,7 @@ function colLetterToIdx(letters) {
     for (let c = 1; c <= 8; c++) {
       const val = String(ar._getCell(r, c) || "");
       assert.ok(!/LEFT\([^)]+,\s*1\)/.test(val), `Found forbidden LEFT(,1) formula at (${r},${c}): ${val}`);
+      assert.ok(!val.includes("Pending — Next Statement"), `31-row Pending table must be omitted from Active Bill, found at (${r},${c})`);
     }
   }
 
@@ -91,30 +84,46 @@ function colLetterToIdx(letters) {
   assert.ok(String(ar._getCell(6, 6)).includes("D5"), "F6 must keep Statement Check formula");
   assert.ok(String(ar._getCell(7, 8)).includes("ISBLANK(H6)"), "H7 must keep Payment Status formula");
 
-  // Verify Table 1 moved cleanly to startShareRow = 15 & cross-sheet formulas point to $H$15:$H$...
-  assert.strictEqual(sandbox.getActiveReconStartShareRow(), 15);
-  assert.ok(String(ar._getCell(13, 1)).includes("Family Member Active Debt Shares"), "Row 13 must be Table 1 banner");
-  assert.strictEqual(ar._getCell(14, 1), "#", "Row 14 must be Table 1 header");
-  assert.strictEqual(ar._getCell(15, 1), 1, "Row 15 must be first family member row");
+  // Verify Table 1 is back at startShareRow = 12 & cross-sheet formulas point to $H$12:$H$...
+  assert.strictEqual(sandbox.getActiveReconStartShareRow(), 12);
+  assert.ok(String(ar._getCell(10, 1)).includes("Family Member Active Debt Shares"), "Row 10 must be Table 1 banner");
+  assert.strictEqual(ar._getCell(11, 1), "#", "Row 11 must be Table 1 header");
+  assert.strictEqual(ar._getCell(12, 1), 1, "Row 12 must be first family member row");
 
-  const totShareRow = 15 + dash.ledger.personShares.length;
+  // Verify zero-activity members (P4, P9) are hidden while active members remain visible
+  for (let i = 0; i < dash.ledger.personShares.length; i++) {
+    const ps = dash.ledger.personShares[i];
+    const r = 12 + i;
+    if (ps.person === "P4" || ps.person === "P9") {
+      assert.ok(ar.hiddenRows.has(r), `Inactive 0.00 member ${ps.person} (row ${r}) must be hidden`);
+    } else {
+      assert.ok(!ar.hiddenRows.has(r), `Active member ${ps.person} (row ${r}) must remain visible`);
+    }
+  }
+
+  // Verify resolved Table 2, Dismissed Orphans, and Table 4 Installments are collapsed
+  assert.ok(ar.rowGroups.length >= 2 && ar.rowGroups.every(g => g.collapsed), `Expected collapsed audit groups when healthy: ${JSON.stringify(ar.rowGroups)}`);
+
+  const totShareRow = 12 + dash.ledger.personShares.length;
   const forecastSheet = ss.getSheetByName(CONFIG.SHEETS.HISTORY_FORECAST);
+  assert.strictEqual(forecastSheet.frozenRows, 4, "Monthly History & Forecast must freeze Row 4");
   const fHeaders = forecastSheet.getRange(4, 1, 1, forecastSheet.getLastColumn()).getValues()[0];
   const activeColIdx = fHeaders.findIndex(h => String(h).includes("(Active)")) + 1;
   assert.ok(activeColIdx > 1, "Monthly History & Forecast must include Active cycle column");
   const activeFormula = String(forecastSheet._getCell(5, activeColIdx) || "");
-  assert.ok(activeFormula.includes("$H$15:$H$"), `Forecast Active formula must reference $H$15:$H$: ${activeFormula}`);
+  assert.ok(activeFormula.includes("$H$12:$H$"), `Forecast Active formula must reference $H$12:$H$: ${activeFormula}`);
 
   const memberSheet = ss.getSheetByName(CONFIG.SHEETS.MEMBER_BREAKDOWN);
+  assert.strictEqual(memberSheet.frozenRows, 3, "Member Breakdown must freeze Row 3");
   const a6Formula = String(memberSheet._getCell(6, 1) || "");
   assert.ok(
-    a6Formula.includes(`$H$${totShareRow}`) && a6Formula.includes("$H$15:$H$"),
-    `Member Breakdown A6 formula must reference row 15 and total row ${totShareRow}: ${a6Formula}`
+    a6Formula.includes(`$H$${totShareRow}`) && a6Formula.includes("$H$12:$H$"),
+    `Member Breakdown A6 formula must reference row 12 and total row ${totShareRow}: ${a6Formula}`
   );
 }
 
 // ==========================================
-// Test 2: Warning States (Unresolved, Orphan, Unlinked Installment) & Live Recovery
+// Test 2: Warning States, Action-First Sorting, Live Recovery & Unhiding 0.00 Member
 // ==========================================
 {
   const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
@@ -124,19 +133,26 @@ function colLetterToIdx(letters) {
   const stmt = ss.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
   stmt.getRange(2, 1, 3, 6).setValues([
     ["Statement Date:", new Date(2026, 9, 31, 12, 0, 0), "Due Date:", new Date(2026, 10, 27, 12, 0, 0), "Credit Limit:", 100000],
-    ["Opening Balance:", 0, "Closing Balance:", 450, "Total Debit:", 450],
-    ["Total Credit:", 0, "Card Number:", "1234", "Net:", 450]
+    ["Opening Balance:", 0, "Closing Balance:", 500, "Total Debit:", 500],
+    ["Total Credit:", 0, "Card Number:", "1234", "Net:", 500]
   ]);
   stmt.getRange(6, 1, 1, 7).setValues([["#", "Tx Date", "Post Date", "Description", "Type", "Amount", "Status"]]);
-  stmt.getRange(7, 1, 2, 7).setValues([
-    [1, new Date(2026, 9, 10, 12, 0, 0), new Date(2026, 9, 10, 12, 0, 0), "MYSTERY SHOP", "DEBIT", 150, ""],
-    [2, new Date(2026, 9, 12, 12, 0, 0), new Date(2026, 9, 12, 12, 0, 0), "PHONE PLAN 2 OF 6", "INSTALLMENT", 300, ""]
+  stmt.getRange(7, 1, 3, 7).setValues([
+    [1, new Date(2026, 9, 5, 12, 0, 0), new Date(2026, 9, 5, 12, 0, 0), "FEE LINE", "FEE", 50, ""],
+    [2, new Date(2026, 9, 10, 12, 0, 0), new Date(2026, 9, 10, 12, 0, 0), "MYSTERY SHOP", "DEBIT", 150, ""],
+    [3, new Date(2026, 9, 12, 12, 0, 0), new Date(2026, 9, 12, 12, 0, 0), "PHONE PLAN 2 OF 6", "INSTALLMENT", 300, ""]
   ]);
+
+  const decInit = sandbox.loadDecisions(ss);
+  const idsInit = sandbox.ensureAllSheetRowIds(ss, decInit);
+  sandbox.setStmtAssign(decInit, idsInit.stmt.ids[0], "P1", "Resolved fee first in array", "user");
+  sandbox.saveDecisions(ss, decInit);
 
   const txSheet = ss.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
   txSheet.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
-  txSheet.getRange(2, 1, 1, 5).setValues([
-    [1, new Date(2026, 9, 15, 12, 0, 0), "CAFE SPOT", "P1", 90]
+  txSheet.getRange(2, 1, 2, 5).setValues([
+    [1, new Date(2026, 9, 15, 12, 0, 0), "CAFE SPOT", "P1", 90],
+    [2, new Date(2026, 11, 5, 12, 0, 0), "FUTURE ITEM", "P2", 120] // Pending next cycle -> P2 has 0.00 active share
   ]);
 
   const instSheet = ss.insertSheet(CONFIG.SHEETS.INSTALLMENTS);
@@ -144,7 +160,7 @@ function colLetterToIdx(letters) {
     ["#", "Start Date", "Description", "Total Price", "Months", "C6", "C7", "EMI", "Payer", "Paid", "Status"]
   ]);
 
-  // Phase 2a: All three warning categories active
+  // Phase 2a: All three warning categories active; resolved F-1 must sort BELOW unresolved I-1 & M-1 and collapse
   const res1 = sandbox.updateLiveDashboard({ ss });
   assert.strictEqual(res1.health.overallStatus, "WARNING");
   assert.strictEqual(res1.health.allHealthy, false);
@@ -157,25 +173,38 @@ function colLetterToIdx(letters) {
   assert.strictEqual(res1.health.orphanAmount, 90);
 
   const ar = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
-  assert.strictEqual(ar.backgrounds["9_1"], "#fff2cc");
-  assert.strictEqual(ar.backgrounds["10_3"], "#fff8e1");
-  assert.strictEqual(ar.backgrounds["10_5"], "#fff8e1");
-  assert.strictEqual(ar.backgrounds["10_7"], "#fff8e1");
+  assert.strictEqual(ar.backgrounds["4_1"], "#fff2cc");
+  assert.strictEqual(ar.backgrounds["8_1"], "#fff8e1");
+  assert.strictEqual(ar.backgrounds["8_3"], "#fff8e1");
+  assert.strictEqual(ar.backgrounds["8_5"], "#fff8e1");
 
-  // Phase 2b: Assign I-1 directly to payer P1 (NOT linked to plan), assign M-1 to P1, dismiss ORPH-1
   let rowM1 = -1;
   let rowI1 = -1;
+  let rowF1 = -1;
   let rowOrph1 = -1;
-  for (let r = 15; r <= ar.getLastRow(); r++) {
+  let rowP2Share = -1;
+  for (let r = 12; r <= ar.getLastRow(); r++) {
     const id = String(ar._getCell(r, 1) || "");
+    if (/^\d+$/.test(id) && ar._getCell(r, 2) === "P2") rowP2Share = r;
     if (id === "M-1") rowM1 = r;
     if (id === "I-1") rowI1 = r;
+    if (id === "F-1") rowF1 = r;
     if (id === "ORPH-1") rowOrph1 = r;
   }
-  assert.ok(rowM1 > 0 && rowI1 > 0 && rowOrph1 > 0, "Expected M-1, I-1, ORPH-1 rows on sheet");
+  assert.ok(rowM1 > 0 && rowI1 > 0 && rowF1 > 0 && rowOrph1 > 0 && rowP2Share > 0);
+  assert.ok(rowM1 < rowF1 && rowI1 < rowF1, "Unresolved M-1/I-1 must appear ABOVE resolved F-1 in Needs Pairing");
+  assert.ok(ar.hiddenRows.has(rowP2Share), "Zero-active-balance P2 row must start hidden");
+  assert.ok(
+    ar.rowGroups.some(g => g.startRow === rowF1 && g.endRow === rowF1 && g.collapsed),
+    "Resolved F-1 row must be tucked into a collapsed row group while M-1/I-1 stay visible"
+  );
 
-  ar._setCell(rowM1, 6, "P1");
+  // Assign M-1 to P2 -> must immediately unhide P2's row in Table 1 without full refresh
+  ar._setCell(rowM1, 6, "P2");
   sandbox.handleActiveReconEdit({ range: ar.getRange(rowM1, 6) });
+  assert.ok(!ar.hiddenRows.has(rowP2Share), "Assigning M-1 to P2 must immediately reveal hidden Table 1 row for P2");
+
+  // Assign I-1 directly to payer P1 (NOT linked to plan), dismiss ORPH-1
   ar._setCell(rowI1, 6, "P1");
   sandbox.handleActiveReconEdit({ range: ar.getRange(rowI1, 6) });
   ar._setCell(rowOrph1, 6, "🚫 Dismiss / Duplicate Log");
@@ -187,13 +216,13 @@ function colLetterToIdx(letters) {
   assert.strictEqual(res2.health.unlinkedInstCount, 1, "Unlinked installment metric must stay 1 until linked to a plan");
   assert.strictEqual(res2.health.overallStatus, "WARNING", "Panel must still warn while unlinkedInstCount > 0");
 
-  // Phase 2c: Add Installment plan & link S-00002 -> I-00001
+  // Phase 2c: Add Installment plan & link S-00003 -> I-00001
   instSheet.getRange(2, 1, 1, 11).setValues([
     [1, new Date(2026, 7, 15, 12, 0, 0), "Phone Plan", 1800, 6, 0, 0, 300, "P1", 1, "Ongoing"]
   ]);
   const decisions = sandbox.loadDecisions(ss);
   const idInfo = sandbox.ensureAllSheetRowIds(ss, decisions);
-  const phoneStmtId = idInfo.stmt.ids[1];
+  const phoneStmtId = idInfo.stmt.ids[2];
   const phoneInstId = idInfo.inst.ids[0];
   sandbox.setStmtInstLink(decisions, phoneStmtId, [phoneInstId], "Phone Plan", "user");
   sandbox.saveDecisions(ss, decisions);
@@ -205,7 +234,8 @@ function colLetterToIdx(letters) {
   assert.strictEqual(res3.health.statementCheckOk, true);
   assert.strictEqual(res3.health.allHealthy, true);
   assert.strictEqual(res3.health.overallStatus, "HEALTHY");
-  assert.strictEqual(ar.backgrounds["9_1"], "#e8f5e9");
+  assert.strictEqual(ar.backgrounds["4_1"], "#e8f5e9");
+  assert.ok(ar.rowGroups.every(g => g.collapsed), "All audit groups (Table 2, Orphans, Table 4) collapse when healthy");
 }
 
 // ==========================================
@@ -236,9 +266,9 @@ function colLetterToIdx(letters) {
   assert.strictEqual(resErr.health.parsePassed, false);
   assert.strictEqual(resErr.health.overallStatus, "ERROR");
   const arInline = ssInline.getSheetByName(envInline.CONFIG.SHEETS.ACTIVE_RECON);
-  assert.ok(String(arInline._getCell(10, 1)).startsWith("Parse Tie-Out: ❌ Failed"), `Expected A10 Failed, got: ${arInline._getCell(10, 1)}`);
-  assert.strictEqual(arInline.backgrounds["10_1"], "#fce8e6");
-  assert.strictEqual(arInline.backgrounds["9_1"], "#fce8e6");
+  assert.ok(String(arInline._getCell(8, 1)).startsWith("Parse Tie-Out: ❌ Failed"), `Expected A8 Failed, got: ${arInline._getCell(8, 1)}`);
+  assert.strictEqual(arInline.backgrounds["8_1"], "#fce8e6");
+  assert.strictEqual(arInline.backgrounds["4_1"], "#fce8e6");
 
   // 3b: Statement import WITH META_IMPORT & failed tie-out triggers blocked error screen with Row 3 diagnostic strip
   const envBlocked = createGasSandbox();
@@ -294,7 +324,7 @@ function colLetterToIdx(letters) {
 }
 
 // ==========================================
-// Test 5: Editing Inside Health Panel Rows (Rows 9-11) Is Safe
+// Test 5: Editing Inside Unified Overview & Health Strip Rows (Rows 4-8) Is Safe
 // ==========================================
 {
   const realFixture = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "2026-11-real.json"), "utf8"));
@@ -309,12 +339,13 @@ function colLetterToIdx(letters) {
 
   const ar = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
   assert.doesNotThrow(() => {
-    sandbox.handleActiveReconEdit({ range: ar.getRange(10, colLetterToIdx("C")) });
-    sandbox.handleActiveReconEdit({ range: ar.getRange(11, colLetterToIdx("A")) });
-  }, "Editing cells inside Health Check panel (Rows 9-11) must not throw");
+    sandbox.handleActiveReconEdit({ range: ar.getRange(4, colLetterToIdx("A")) });
+    sandbox.handleActiveReconEdit({ range: ar.getRange(8, colLetterToIdx("C")) });
+    sandbox.handleActiveReconEdit({ range: ar.getRange(8, colLetterToIdx("E")) });
+  }, "Editing cells inside Health strip rows (Row 4 & Row 8) must not throw");
 
   const decAfter = JSON.stringify(decSheet.getRange(1, 1, decSheet.getLastRow(), 7).getValues());
-  assert.strictEqual(decAfter, decBefore, "Editing Health Check panel rows must not mutate _Decisions");
+  assert.strictEqual(decAfter, decBefore, "Editing Health strip rows must not mutate _Decisions");
 }
 
-console.log("health.test.js: all Health Check panel, live formula, tie-out, version stamp, and edit safety assertions passed.");
+console.log("health.test.js: all unified Health strip, live formula, collapsible drawer, zero-row hiding, tie-out, version stamp, and edit safety assertions passed.");

@@ -79,6 +79,7 @@ const tz = "Africa/Cairo";
 
   const histSheet = ss.getSheetByName(CONFIG.SHEETS.HISTORY);
   assert.ok(histSheet, "History sheet must be created");
+  assert.strictEqual(histSheet.hidden, true, "History sheet must be hidden in the background");
 
   const archive = sandbox.readHistoryArchive(ss);
   assert.ok(archive["2026-11"], "History archive must contain 2026-11");
@@ -203,6 +204,8 @@ const tz = "Africa/Cairo";
   assert.strictEqual(archive["2026-08"].people["Carol"], 750.75);
 
   const forecastOut = ss.getSheetByName(CONFIG.SHEETS.HISTORY_FORECAST);
+  assert.strictEqual(ss.getSheetByName(CONFIG.SHEETS.HISTORY).hidden, true, "Migrated History sheet must stay hidden");
+  assert.strictEqual(forecastOut.frozenRows, 4, "Monthly History & Forecast must freeze header row 4");
   const outHeaders = forecastOut.getRange(4, 1, 1, forecastOut.getLastColumn()).getValues()[0];
   assert.ok(outHeaders.some(h => String(h).includes("March 2026\n(Paid)")));
   assert.ok(outHeaders.some(h => String(h).includes("August 2026\n(Settled)")));
@@ -249,4 +252,71 @@ const tz = "Africa/Cairo";
   });
 }
 
-console.log("history.test.js: all Close Statement gating, immutable History archive, legacy migration, and zero-hardcoded-history assertions passed.");
+// ==========================================
+// Test 5: Date Coercion Self-Heal, Chronological Sorting & Zero-Balance Member Hiding
+// ==========================================
+{
+  const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
+  const ss = new MockSpreadsheet();
+  setActiveSpreadsheet(ss);
+
+  const histSheet = ss.insertSheet(CONFIG.SHEETS.HISTORY);
+  histSheet.getRange(1, 1, 1, 13).setValues([[
+    "CycleKey", "CycleLabel", "RecordType", "Status", "Member / SubjectId",
+    "Purchases / DecisionType", "Installments / Target", "Fees (EGP)", "Unrecorded (EGP)",
+    "Refunds (EGP)", "Net Total (EGP)", "Audit / Note", "ClosedAt"
+  ]]);
+  // Simulate Google Sheets coercing CycleKey & CycleLabel into out-of-order Date objects / strings
+  histSheet.getRange(2, 1, 5, 13).setValues([
+    [new Date(2026, 4, 1, 12, 0, 0), new Date(2026, 4, 1, 12, 0, 0), "MEMBER_SHARE", "Paid", "Alice", 500, 0, 0, 0, 0, 500, "", ""],
+    [new Date(2026, 2, 1, 12, 0, 0), new Date(2026, 2, 1, 12, 0, 0), "MEMBER_SHARE", "Paid", "Alice", 300, 0, 0, 0, 0, 300, "", ""],
+    [new Date(2026, 3, 1, 12, 0, 0), new Date(2026, 3, 1, 12, 0, 0), "MEMBER_SHARE", "Paid", "Alice", 400, 0, 0, 0, 0, 400, "", ""],
+    ["Sat Aug 01 2026 00:00:00 GMT+0300 (Eastern European Summer Time)", "Sat Aug 01 2026 00:00:00 GMT+0300 (Eastern European Summer Time)", "MEMBER_SHARE", "Paid", "Alice", 600, 0, 0, 0, 0, 600, "", ""],
+    ["2026-08", "August 2026", "MEMBER_SHARE", "Paid", "IdleMember", 0, 0, 0, 0, 0, 0, "", ""]
+  ]);
+
+  const stmt = ss.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
+  stmt.getRange(2, 1, 3, 6).setValues([
+    ["Statement Date:", new Date(2026, 9, 31, 12, 0, 0), "Due Date:", new Date(2026, 10, 27, 12, 0, 0), "Credit Limit:", 100000],
+    ["Opening Balance:", 0, "Closing Balance:", 100, "Total Debit:", 100],
+    ["Total Credit:", 0, "Card Number:", "1234", "Net:", 100]
+  ]);
+  stmt.getRange(6, 1, 1, 7).setValues([["#", "Tx Date", "Post Date", "Description", "Type", "Amount", "Status"]]);
+  stmt.getRange(7, 1, 1, 7).setValues([[1, new Date(2026, 9, 5, 12, 0, 0), new Date(2026, 9, 5, 12, 0, 0), "SHOP", "DEBIT", 100, ""]]);
+  const tx = ss.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
+  tx.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
+  tx.getRange(2, 1, 1, 5).setValues([[1, new Date(2026, 9, 5, 0, 0, 0), "Shop", "Alice", 100]]);
+
+  // Pre-seed migration flag so updateLiveDashboard skips empty legacy forecast migration
+  const dec = sandbox.loadDecisions(ss);
+  dec.isHistoryMigrated = true;
+  sandbox.saveDecisions(ss, dec);
+
+  sandbox.updateLiveDashboard({ ss });
+
+  const archive = sandbox.readHistoryArchive(ss);
+  assert.deepStrictEqual(Object.keys(archive), ["2026-03", "2026-04", "2026-05", "2026-08"], "Coerced history dates must heal and sort chronologically");
+  assert.strictEqual(histSheet.hidden, true, "History sheet must auto-hide");
+  assert.strictEqual(histSheet._getCell(2, 1), "2026-05", "History Col A Date must be repaired in-place to plain text yyyy-MM");
+  assert.strictEqual(histSheet._getCell(2, 2), "May 2026", "History Col B Date must be repaired in-place to May 2026");
+  assert.strictEqual(histSheet._getCell(5, 1), "2026-08", "GMT+ string in Col A must repair to 2026-08");
+  assert.strictEqual(histSheet._getCell(5, 2), "August 2026", "GMT+ string in Col B must repair to August 2026");
+
+  const forecast = ss.getSheetByName(CONFIG.SHEETS.HISTORY_FORECAST);
+  const fHeaders = forecast.getRange(4, 1, 1, forecast.getLastColumn()).getValues()[0].map(String);
+  assert.deepStrictEqual(
+    fHeaders.slice(0, 5),
+    ["Family Member", "March 2026\n(Paid)", "April 2026\n(Paid)", "May 2026\n(Paid)", "August 2026\n(Paid)"],
+    `Unexpected Forecast headers: ${JSON.stringify(fHeaders)}`
+  );
+  assert.ok(!fHeaders.some(h => h.includes("GMT")), "No GMT string allowed in headers");
+
+  const renderedNames = [];
+  for (let r = 5; r <= forecast.getLastRow(); r++) {
+    renderedNames.push(forecast._getCell(r, 1));
+  }
+  assert.ok(renderedNames.includes("Alice"), "Active/historical member Alice must be shown");
+  assert.ok(!renderedNames.includes("IdleMember"), "All-zero member IdleMember must be omitted from Monthly History & Forecast");
+}
+
+console.log("history.test.js: all Close Statement gating, immutable History archive, date self-heal, legacy migration, and zero-hardcoded-history assertions passed.");
