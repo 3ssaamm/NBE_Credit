@@ -181,9 +181,10 @@ class MockRange {
 }
 
 class MockSheet {
-  constructor(name, ss) {
+  constructor(name, ss, sheetId) {
     this.name = name;
     this.ss = ss;
+    this.sheetId = sheetId || 101;
     this.grid = {};
     this.backgrounds = {};
     this.validations = {};
@@ -196,6 +197,7 @@ class MockSheet {
   }
   getName() { return this.name; }
   getParent() { return this.ss; }
+  getSheetId() { return this.sheetId; }
   _getCell(r, c) {
     const k = `${r}_${c}`;
     return Object.prototype.hasOwnProperty.call(this.grid, k) ? this.grid[k] : "";
@@ -315,11 +317,13 @@ class MockSpreadsheet {
     this.sheets = {};
     this.toasts = [];
     this.activeSheet = null;
+    this._nextSheetId = 101;
   }
+  getId() { return "mock-spreadsheet-id"; }
   getSpreadsheetTimeZone() { return "Africa/Cairo"; }
   getSheetByName(name) { return this.sheets[name] || null; }
   insertSheet(name) {
-    const s = new MockSheet(name, this);
+    const s = new MockSheet(name, this, this._nextSheetId++);
     this.sheets[name] = s;
     return s;
   }
@@ -363,6 +367,7 @@ function createGasSandbox() {
     Utilities: { formatDate: formatDateMock },
     SpreadsheetApp: {
       getActiveSpreadsheet: () => currentSs,
+      flush: () => { sandbox.__flushCount = (sandbox.__flushCount || 0) + 1; },
       newDataValidation: () => {
         const dv = { values: null, allowInvalid: true };
         const builder = {

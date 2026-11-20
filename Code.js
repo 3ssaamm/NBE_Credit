@@ -3380,6 +3380,7 @@ function onOpen() {
     .createMenu("💳 NBE Tracker")
     .addItem("🔄 Refresh Dashboard & Reconciliation", "updateLiveDashboard")
     .addItem("👥 View Member Breakdown Sheet", "navToMemberBreakdown")
+    .addItem("📤 Share Member Statement...", "menuShareMemberStatement")
     .addItem("📥 Process New Bank Statements from Drive", "manualProcessStatements")
     .addSeparator()
     .addItem("⚡ Apply Payment Date to Installments Now", "applyPaymentDateNow")
