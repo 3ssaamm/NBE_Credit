@@ -352,4 +352,182 @@ const tz = "Africa/Cairo";
   });
 }
 
-console.log("matcher.test.js: all 6 confidence-tiered matching, learning, Q5c, and October replay assertions passed.");
+// ==========================================
+// Test 7: 3-Way Split Pairing from Orphan Logs (Partial Match Protection, Add All, Sequential/Batch Append, Full Replace)
+// ==========================================
+{
+  function makeSplitFixtureSpreadsheet(sandbox, CONFIG, setActiveSpreadsheet) {
+    const ss = new MockSpreadsheet();
+    setActiveSpreadsheet(ss);
+    const stmt = ss.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
+    stmt.getRange(2, 1, 3, 6).setValues([
+      ["Statement Date:", new Date(2026, 9, 31, 12, 0, 0), "Due Date:", new Date(2026, 10, 27, 12, 0, 0), "Credit Limit:", 100000],
+      ["Opening Balance:", 0, "Closing Balance:", 667.00, "Total Debit:", 667.00],
+      ["Total Credit:", 0, "Card Number:", "1234", "Net:", 667.00]
+    ]);
+    stmt.getRange(7, 1, 1, 7).setValues([
+      [1, new Date(2026, 9, 14, 12, 0, 0), new Date(2026, 9, 15, 12, 0, 0), "TE DATA", "DEBIT", 667.00, ""]
+    ]);
+    const tx = ss.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
+    tx.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
+    tx.getRange(2, 1, 3, 5).setValues([
+      [1, new Date(2026, 9, 14, 0, 0, 0), "We Internet", "Mai", 100.00],
+      [2, new Date(2026, 9, 14, 0, 0, 0), "We Internet", "Dad", 200.00],
+      [3, new Date(2026, 9, 14, 0, 0, 0), "We Internet", "Mido", 367.00]
+    ]);
+    return ss;
+  }
+
+  // 7a. Partial match (Mido 367 vs Bank 667): Mido NOT overbilled, split remainder hints surfaced, 1-click Add all completes split
+  {
+    const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
+    const ss = makeSplitFixtureSpreadsheet(sandbox, CONFIG, setActiveSpreadsheet);
+    sandbox.updateLiveDashboard({ ss });
+
+    const ar = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+    const startRow = sandbox.getActiveReconStartShareRow();
+    let rowOrphMido = -1;
+    for (let r = startRow; r <= ar.getLastRow(); r++) {
+      if (String(ar._getCell(r, 1)).startsWith("ORPH-") && ar._getCell(r, 5) === "Mido") {
+        rowOrphMido = r;
+        break;
+      }
+    }
+    assert.ok(rowOrphMido > 0, "Should find Mido orphan row");
+
+    ar._setCell(rowOrphMido, 6, "🔗 Pair with: S-00001 (667.00 · TE DATA)");
+    sandbox.handleActiveReconEdit({ range: ar.getRange(rowOrphMido, 6) });
+
+    let recon = sandbox.reconcileActiveStatement(ss, tz);
+    let ledger = sandbox.buildDebtLedger(ss, tz, recon);
+
+    const st1 = recon.stmtDebits.find(s => s.stmtId === "S-00001");
+    assert.strictEqual(st1.isPartialMatch, true, "Single 367 tx on 667 stmt line must flag isPartialMatch");
+    assert.strictEqual(st1.matchedSum, 367.00);
+    assert.strictEqual(st1.remainingAmount, 300.00);
+    assert.strictEqual(Number(ledger.personShares.find(p => p.person === "Mido").purchases.toFixed(2)), 367.00, "Partial match must bill Mido 367.00 (NOT 667.00!)");
+    assert.strictEqual(Number(ledger.auditDifference.toFixed(2)), -300.00, "Unpaired split remainder shows -300.00 Statement Check");
+
+    const midoShare = sandbox.shareMemberStatement(ss, tz, "Mido", { skipPdf: true, context: { recon, ledger } });
+    assert.strictEqual(midoShare.memberData.totals.purchases, 367.00, "WhatsApp share must also bill Mido only 367.00 during partial match");
+
+    assert.strictEqual(recon.orphanLogs.length, 2, "Mai (100) and Dad (200) must remain in Orphan Logs");
+    const maiOrph = recon.orphanLogs.find(o => o.person === "Mai");
+    const dadOrph = recon.orphanLogs.find(o => o.person === "Dad");
+    const maiLabels = maiOrph.suggestedStmts.map(s => s.dropdownLabel);
+    const dadLabels = dadOrph.suggestedStmts.map(s => s.dropdownLabel);
+    assert.ok(maiLabels.some(l => l.startsWith("🔗 Add all to: S-00001")), `Mai should get Add all hint: ${JSON.stringify(maiLabels)}`);
+    assert.ok(maiLabels.some(l => l.startsWith("🔗 Add to: S-00001 (rem 300.00")), `Mai should get Add to hint: ${JSON.stringify(maiLabels)}`);
+    assert.ok(dadLabels.some(l => l.startsWith("🔗 Add all to: S-00001")), `Dad should get Add all hint: ${JSON.stringify(dadLabels)}`);
+
+    let rowOrphMai = -1;
+    for (let r = startRow; r <= ar.getLastRow(); r++) {
+      if (String(ar._getCell(r, 1)).startsWith("ORPH-") && ar._getCell(r, 5) === "Mai") {
+        rowOrphMai = r;
+        break;
+      }
+    }
+    const addAllLabel = maiLabels.find(l => l.startsWith("🔗 Add all to: S-00001"));
+    ar._setCell(rowOrphMai, 6, addAllLabel);
+    sandbox.handleActiveReconEdit({ range: ar.getRange(rowOrphMai, 6) });
+
+    recon = sandbox.reconcileActiveStatement(ss, tz);
+    ledger = sandbox.buildDebtLedger(ss, tz, recon);
+    const dec = sandbox.loadDecisions(ss);
+    assert.strictEqual(dec.stmtMatch["S-00001"].targetIds.length, 3, "All 3 txs must be stored on S-00001");
+    assert.strictEqual(recon.orphanLogs.length, 0, "Zero orphans after Add all");
+    assert.strictEqual(recon.stmtDebits[0].isPartialMatch, false);
+    assert.strictEqual(Number(ledger.auditDifference.toFixed(2)), 0.00);
+    assert.strictEqual(Number(ledger.personShares.find(p => p.person === "Mai").purchases.toFixed(2)), 100.00);
+    assert.strictEqual(Number(ledger.personShares.find(p => p.person === "Dad").purchases.toFixed(2)), 200.00);
+    assert.strictEqual(Number(ledger.personShares.find(p => p.person === "Mido").purchases.toFixed(2)), 367.00);
+    assert.ok(Object.keys(dec.merchantAliases).length >= 1, "Merchant alias te data <-> we internet should be learned");
+  }
+
+  // 7b. Batch paste AND sequential "🔗 Pair with: S-00001" across all 3 rows appends without overwriting
+  {
+    const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
+    const ss = makeSplitFixtureSpreadsheet(sandbox, CONFIG, setActiveSpreadsheet);
+    sandbox.updateLiveDashboard({ ss });
+    const ar = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+    const startRow = sandbox.getActiveReconStartShareRow();
+
+    const orphRows = [];
+    for (let r = startRow; r <= ar.getLastRow(); r++) {
+      if (String(ar._getCell(r, 1)).startsWith("ORPH-")) orphRows.push(r);
+    }
+    assert.strictEqual(orphRows.length, 3);
+    const pairStr = "🔗 Pair with: S-00001 (667.00 · TE DATA)";
+    orphRows.forEach(r => ar._setCell(r, 6, pairStr));
+    sandbox.handleActiveReconEdit({ range: ar.getRange(orphRows[0], 6, 3, 1) });
+
+    const decBatch = sandbox.loadDecisions(ss);
+    assert.strictEqual(decBatch.stmtMatch["S-00001"].targetIds.length, 3, "Batch Pair with on 3 rows must append all 3 IDs");
+    const reconBatch = sandbox.reconcileActiveStatement(ss, tz);
+    const ledgerBatch = sandbox.buildDebtLedger(ss, tz, reconBatch);
+    assert.strictEqual(Number(ledgerBatch.personShares.find(p => p.person === "Mai").purchases.toFixed(2)), 100.00);
+    assert.strictEqual(Number(ledgerBatch.personShares.find(p => p.person === "Dad").purchases.toFixed(2)), 200.00);
+    assert.strictEqual(Number(ledgerBatch.personShares.find(p => p.person === "Mido").purchases.toFixed(2)), 367.00);
+
+    // Sequential one-by-one test on fresh sheet
+    const envSeq = createGasSandbox();
+    const ssSeq = makeSplitFixtureSpreadsheet(envSeq.sandbox, envSeq.CONFIG, envSeq.setActiveSpreadsheet);
+    envSeq.sandbox.updateLiveDashboard({ ss: ssSeq });
+    const arSeq = ssSeq.getSheetByName(envSeq.CONFIG.SHEETS.ACTIVE_RECON);
+    const startSeq = envSeq.sandbox.getActiveReconStartShareRow();
+    for (let step = 0; step < 3; step++) {
+      let targetRow = -1;
+      for (let r = startSeq; r <= arSeq.getLastRow(); r++) {
+        if (String(arSeq._getCell(r, 1)).startsWith("ORPH-")) { targetRow = r; break; }
+      }
+      assert.ok(targetRow > 0, `Sequential step ${step} must locate remaining ORPH row`);
+      arSeq._setCell(targetRow, 6, pairStr);
+      envSeq.sandbox.handleActiveReconEdit({ range: arSeq.getRange(targetRow, 6) });
+    }
+    const decSeq = envSeq.sandbox.loadDecisions(ssSeq);
+    assert.strictEqual(decSeq.stmtMatch["S-00001"].targetIds.length, 3, "Sequential Pair with across 3 turns must keep all 3 IDs");
+  }
+
+  // 7c. Full 1-to-1 match replacement still works when statement line is already full
+  {
+    const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
+    const ss = new MockSpreadsheet();
+    setActiveSpreadsheet(ss);
+    const stmt = ss.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
+    stmt.getRange(2, 1, 3, 6).setValues([
+      ["Statement Date:", new Date(2026, 9, 31, 12, 0, 0), "Due Date:", new Date(2026, 10, 27, 12, 0, 0), "Credit Limit:", 100000],
+      ["Opening Balance:", 0, "Closing Balance:", 100.00, "Total Debit:", 100.00],
+      ["Total Credit:", 0, "Card Number:", "1234", "Net:", 100.00]
+    ]);
+    stmt.getRange(7, 1, 1, 7).setValues([
+      [1, new Date(2026, 9, 10, 12, 0, 0), new Date(2026, 9, 10, 12, 0, 0), "ONLINE SHOP", "DEBIT", 100.00, ""]
+    ]);
+    const tx = ss.insertSheet(CONFIG.SHEETS.TRANSACTIONS);
+    tx.getRange(1, 1, 1, 5).setValues([["#", "Date", "Description", "Person", "Amount"]]);
+    tx.getRange(2, 1, 2, 5).setValues([
+      [1, new Date(2026, 9, 10, 0, 0, 0), "Shop A", "Mai", 100.00],
+      [2, new Date(2026, 9, 10, 0, 0, 0), "Shop B", "Mido", 100.00]
+    ]);
+
+    const decInit = sandbox.loadDecisions(ss);
+    const idInfo = sandbox.ensureAllSheetRowIds(ss, decInit);
+    sandbox.setStmtMatch(decInit, idInfo.stmt.ids[0], [idInfo.tx.ids[0]], "Initial full match", "user");
+    sandbox.saveDecisions(ss, decInit);
+
+    sandbox.updateLiveDashboard({ ss });
+    const ar = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
+    const startRow = sandbox.getActiveReconStartShareRow();
+    let rowOrphMido = -1;
+    for (let r = startRow; r <= ar.getLastRow(); r++) {
+      if (String(ar._getCell(r, 1)).startsWith("ORPH-")) { rowOrphMido = r; break; }
+    }
+    assert.ok(rowOrphMido > 0);
+    ar._setCell(rowOrphMido, 6, "🔗 Pair with: S-00001 (100.00 · ONLINE SHOP)");
+    sandbox.handleActiveReconEdit({ range: ar.getRange(rowOrphMido, 6) });
+
+    const decAfter = sandbox.loadDecisions(ss);
+    assert.deepStrictEqual(Array.from(decAfter.stmtMatch["S-00001"].targetIds), [idInfo.tx.ids[1]], "Full 100 match must replace T-00001 with T-00002");
+  }
+}
+
+console.log("matcher.test.js: all 7 confidence-tiered matching, split orphan pairing, learning, Q5c, and October replay assertions passed.");

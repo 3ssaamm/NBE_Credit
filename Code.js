@@ -1326,6 +1326,11 @@ function buildDebtLedger(ss, tz, recon) {
           addShare(tx.person, tx.amount, "MatchedPurchase");
         }
       });
+    } else if (st.isPartialMatch && st.matchedItems && st.matchedItems.length === 1) {
+      const tx = st.matchedItems[0];
+      if (tx.person && !isNeglectedPayer(tx.person)) {
+        addShare(tx.person, tx.amount, "MatchedPurchase");
+      }
     } else if (st.assignedPayer && !isNeglectedPayer(st.assignedPayer)) {
       addShare(st.assignedPayer, st.amount, "MatchedPurchase");
     }
@@ -1978,8 +1983,11 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       const r = startOrphanRow + idx;
       const statusFormula = `=IF(ISNUMBER(SEARCH("🚫", F${r})), "🚫 Dismissed", IF(ISNUMBER(SEARCH("🔗", F${r})), "🔗 Pairing...", "🔎 Unpaired (Not Billed)"))`;
       const defaultAction = tx.isNeglected ? "🚫 Dismiss / Duplicate Log" : "⏳ Not on Statement Yet (Ignored)";
-      const hintNote = (tx.suggestedStmts && tx.suggestedStmts.length > 0)
-        ? `💡 ${tx.suggestedStmts[0].reason} → ${tx.suggestedStmts[0].stmtId} (${tx.suggestedStmts[0].stmt.amount.toFixed(2)})`
+      const topHint = (tx.suggestedStmts && tx.suggestedStmts.length > 0) ? tx.suggestedStmts[0] : null;
+      const hintNote = topHint
+        ? (topHint.isPartialAppend
+          ? `💡 ${topHint.reason} → ${topHint.stmtId} (rem ${Number(topHint.remainingAmount || 0).toFixed(2)})`
+          : `💡 ${topHint.reason} → ${topHint.stmtId} (${topHint.stmt.amount.toFixed(2)})`)
         : "Not found on current statement";
       return [
         tx.id,
@@ -1999,12 +2007,18 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     sheet.getRange(startOrphanRow, 2, orphanRows.length, 1).setNumberFormat("yyyy-MM-dd");
     sheet.getRange(startOrphanRow, 4, orphanRows.length, 1).setNumberFormat("#,##0.00");
 
+    const partialStmtDebits = (recon.stmtDebits || []).filter(st => st.matched && st.remainingAmount > 0.10 && st.stmtId);
     const unassignedStmtDebits = (recon.missingInSheet || []).filter(m => !m.assignedPayer);
     for (let i = 0; i < orphanList.length; i++) {
       const r = startOrphanRow + i;
       const orph = orphanList[i];
       const sugLabels = (orph.suggestedStmts || []).map(s => s.dropdownLabel);
-      if (sugLabels.length === 0 && unassignedStmtDebits.length > 0) {
+      if (sugLabels.length === 0) {
+        partialStmtDebits
+          .slice()
+          .sort((a, b) => Math.abs(a.remainingAmount - orph.amount) - Math.abs(b.remainingAmount - orph.amount))
+          .slice(0, 2)
+          .forEach(st => sugLabels.push(formatOrphanAddDropdownLabel(st, st.remainingAmount)));
         unassignedStmtDebits
           .slice()
           .sort((a, b) => Math.abs(a.amount - orph.amount) - Math.abs(b.amount - orph.amount))

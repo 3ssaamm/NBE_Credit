@@ -122,6 +122,15 @@ function buildMemberStatementData(ss, tz, personName, optContext) {
           }, targetTz);
         }
       });
+    } else if (st.isPartialMatch && st.matchedItems && st.matchedItems.length === 1) {
+      const tx = st.matchedItems[0];
+      if (tx.person && !isNeglectedPayer(tx.person)) {
+        rawPurchases += pushMemberSplitItem_(purchases, canonicalPerson, tx.person, tx.amount, {
+          date: tx.date || st.date,
+          dateStr: st.dateStr,
+          desc: tx.desc || st.desc
+        }, targetTz);
+      }
     } else if (st.assignedPayer && !isNeglectedPayer(st.assignedPayer)) {
       const firstTx = st.matchedItems && st.matchedItems[0];
       rawPurchases += pushMemberSplitItem_(purchases, canonicalPerson, st.assignedPayer, st.amount, {

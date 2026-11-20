@@ -660,6 +660,44 @@ function lookupStmtDescriptionById_(ss, stmtId) {
   return "";
 }
 
+function lookupStmtAmountById_(ss, stmtId) {
+  if (!ss || !stmtId) return 0;
+  const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
+  if (!stmtSheet || stmtSheet.getLastRow() < 7) return 0;
+  const idCol = findExistingIdColumn(stmtSheet, 6);
+  if (!idCol) return 0;
+  const numRows = stmtSheet.getLastRow() - 6;
+  const amts = stmtSheet.getRange(7, 6, numRows, 1).getValues();
+  const ids = stmtSheet.getRange(7, idCol, numRows, 1).getValues();
+  const targetId = String(stmtId || "").trim().toUpperCase();
+  for (let i = 0; i < numRows; i++) {
+    if (String(ids[i][0] || "").trim().toUpperCase() === targetId) {
+      return Math.abs(parseFloat(amts[i][0])) || 0;
+    }
+  }
+  return 0;
+}
+
+function lookupTxAmountMapByIds_(ss, txIds) {
+  const byId = {};
+  if (!ss || !txIds || txIds.length === 0) return byId;
+  const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
+  if (!txSheet || txSheet.getLastRow() < 2) return byId;
+  const idCol = findExistingIdColumn(txSheet, 1);
+  if (!idCol) return byId;
+  const numRows = txSheet.getLastRow() - 1;
+  const amts = txSheet.getRange(2, 5, numRows, 1).getValues();
+  const ids = txSheet.getRange(2, idCol, numRows, 1).getValues();
+  const wanted = new Set(txIds.map(t => String(t || "").trim().toUpperCase()).filter(Boolean));
+  for (let i = 0; i < numRows; i++) {
+    const id = String(ids[i][0] || "").trim().toUpperCase();
+    if (id && wanted.has(id)) {
+      byId[id] = Math.abs(parseFloat(amts[i][0])) || 0;
+    }
+  }
+  return byId;
+}
+
 function readLegacyReconStoreRaw_(ss) {
   const sheet = ss.getSheetByName(CONFIG.SHEETS.RECON_STORE);
   if (!sheet || sheet.getLastRow() < 2) return null;
@@ -1087,37 +1125,89 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
   // Case 2: Edit in Orphan Logs panel (ORPH-* and legacy TX-*)
   if (/^(?:ORPH|TX)-/i.test(firstCol)) {
     const actionVal = String(rowVals[5] || "").trim();
-    const orphanPairMatch = actionVal.match(/^🔗\s*Pair(?:\s+with)?:\s*(S-\d+)/i);
-    if (orphanPairMatch) {
-      const stmtId = orphanPairMatch[1].toUpperCase();
+    const groupPairMatch = actionVal.match(/^🔗\s*(Add\s+all\s+to|Pair\s+group):\s*(S-\d+)\s*\(((?:T-\d+)(?:\s*\+\s*T-\d+)*)/i);
+    const singlePairMatch = !groupPairMatch ? actionVal.match(/^🔗\s*(Pair(?:\s+with)?|Add(?:\s+to)?):\s*(S-\d+)/i) : null;
+    if (groupPairMatch || singlePairMatch) {
       const baseTxId = subjectId.split(":")[0].toUpperCase();
       if (!baseTxId) return noChange;
 
+      let stmtId = "";
+      let isExplicitAdd = false;
+      let incomingIds = [];
+      if (groupPairMatch) {
+        isExplicitAdd = /^add/i.test(groupPairMatch[1]);
+        stmtId = groupPairMatch[2].toUpperCase();
+        const extraIds = groupPairMatch[3].split("+").map(s => s.trim().toUpperCase()).filter(Boolean);
+        incomingIds = [...new Set([baseTxId, ...extraIds])];
+      } else {
+        isExplicitAdd = /^add/i.test(singlePairMatch[1]);
+        stmtId = singlePairMatch[2].toUpperCase();
+        incomingIds = [baseTxId];
+      }
+      if (!stmtId || incomingIds.length === 0) return noChange;
+
+      const ss = sheet.getParent();
       const existingMatch = decisions.stmtMatch && decisions.stmtMatch[stmtId];
-      if (!forceStyle && existingMatch && existingMatch.targetIds && existingMatch.targetIds.includes(baseTxId)) {
+      const existingIds = (existingMatch && Array.isArray(existingMatch.targetIds))
+        ? existingMatch.targetIds.map(id => String(id || "").trim().toUpperCase()).filter(Boolean)
+        : [];
+
+      if (!forceStyle && existingIds.length > 0 && incomingIds.every(id => existingIds.includes(id))) {
         return noChange;
       }
 
+      let finalTxIds;
+      if (existingIds.length === 0) {
+        finalTxIds = incomingIds;
+      } else if (isExplicitAdd) {
+        finalTxIds = [...new Set([...existingIds, ...incomingIds])];
+      } else {
+        const stmtAmt = lookupStmtAmountById_(ss, stmtId);
+        const amtMap = lookupTxAmountMapByIds_(ss, [...existingIds, ...incomingIds]);
+        const newUnique = incomingIds.filter(id => !existingIds.includes(id));
+        if (newUnique.length === 0) {
+          finalTxIds = existingIds;
+        } else {
+          const existingSum = existingIds.reduce((s, id) => s + (amtMap[id] || 0), 0);
+          const newSum = newUnique.reduce((s, id) => s + (amtMap[id] || 0), 0);
+          if (stmtAmt > 0 && (existingSum + newSum) <= stmtAmt + 0.50) {
+            finalTxIds = [...existingIds, ...newUnique];
+          } else {
+            finalTxIds = incomingIds;
+          }
+        }
+      }
+
+      const finalSet = new Set(finalTxIds);
       Object.keys(decisions.stmtMatch || {}).forEach(otherStmtId => {
         if (otherStmtId === stmtId) return;
         const other = decisions.stmtMatch[otherStmtId];
-        if (other && other.targetIds && other.targetIds.includes(baseTxId)) {
-          delete decisions.stmtMatch[otherStmtId];
-          decisions._dirty = true;
+        if (other && other.targetIds && other.targetIds.some(tid => finalSet.has(tid))) {
+          const remaining = other.targetIds.filter(tid => !finalSet.has(tid));
+          if (remaining.length === 0) {
+            delete decisions.stmtMatch[otherStmtId];
+            decisions._dirty = true;
+          } else {
+            setStmtMatch(decisions, otherStmtId, remaining, other.note, other.source);
+          }
         }
       });
 
-      setStmtMatch(decisions, stmtId, [baseTxId], String(rowVals[6] || "").trim() || "Paired from orphan log", "user");
+      setStmtMatch(decisions, stmtId, finalTxIds, String(rowVals[6] || "").trim() || "Paired from orphan log", "user");
       clearStmtAssign(decisions, stmtId);
-      clearTxNeglect(decisions, subjectId);
+      Object.keys(decisions.txNeglect || {}).forEach(negSubj => {
+        if (finalTxIds.some(tid => negSubj === tid || negSubj.startsWith(tid + ":"))) {
+          clearTxNeglect(decisions, negSubj);
+        }
+      });
 
-      const ss = sheet.getParent();
       const stmtDesc = lookupStmtDescriptionById_(ss, stmtId);
+      const txDescs = lookupTxDescriptionsByIds_(ss, finalTxIds);
       const learned = maybeLearnMerchantAlias(
         decisions,
         stmtDesc,
-        [String(rowVals[2] || "").trim()],
-        "Learned from " + stmtId + " <-> " + baseTxId
+        txDescs.length > 0 ? txDescs : [String(rowVals[2] || "").trim()],
+        "Learned from " + stmtId + " <-> " + finalTxIds.join("+")
       );
       if (learned && learned.learned) {
         syncDecisionsMerchantAliasesToSettings(ss, decisions);
@@ -1128,7 +1218,7 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
       return {
         changed: true,
         needsRefresh: true,
-        toastMsg: "🔗 Paired " + stmtId + " ↔ " + baseTxId +
+        toastMsg: "🔗 Paired " + stmtId + " ↔ " + finalTxIds.join("+") +
           (learned && learned.learned ? " (learned alias: " + learned.stmtKey + " ↔ " + learned.txKey + ")" : "")
       };
     }

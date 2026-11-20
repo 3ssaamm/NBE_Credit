@@ -115,12 +115,39 @@ function formatOrphanPairDropdownLabel(st) {
   return `🔗 Pair with: ${(st && st.stmtId) || ""} (${amt} · ${descShort})`;
 }
 
+function formatOrphanPairGroupDropdownLabel(st, txs) {
+  const list = txs || [];
+  const ids = list.map(t => t.txId).join("+");
+  const sum = list.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0).toFixed(2);
+  return `🔗 Pair group: ${(st && st.stmtId) || ""} (${ids} · ${sum})`;
+}
+
+function formatOrphanAddDropdownLabel(st, remainingAmt) {
+  const descShort = String((st && st.desc) || "").trim().substring(0, 22);
+  const rem = Number(remainingAmt || 0).toFixed(2);
+  return `🔗 Add to: ${(st && st.stmtId) || ""} (rem ${rem} · ${descShort})`;
+}
+
+function formatOrphanAddAllDropdownLabel(st, txs) {
+  const list = txs || [];
+  const ids = list.map(t => t.txId).join("+");
+  const sum = list.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0).toFixed(2);
+  return `🔗 Add all to: ${(st && st.stmtId) || ""} (${ids} · +${sum})`;
+}
+
 function matchStatementDebits(stmtDebits, txDebits, decisions, tz) {
   function markMatch(st, items, tier, reason) {
+    const matchedSum = Number(items.reduce((s, tx) => s + (parseFloat(tx.amount) || 0), 0).toFixed(2));
+    const remainingAmount = Number(((parseFloat(st.amount) || 0) - matchedSum).toFixed(2));
+    const partialCap = Math.max(5.0, (parseFloat(st.amount) || 0) * 0.05);
+
     st.matched = true;
     st.matchedItems = items;
     st.matchTier = tier;
     st.matchReason = reason;
+    st.matchedSum = matchedSum;
+    st.remainingAmount = remainingAmount;
+    st.isPartialMatch = Boolean(remainingAmount > partialCap);
     items.forEach(tx => {
       tx.matched = true;
       tx.matchedStmtId = st.stmtId;
@@ -276,15 +303,61 @@ function matchStatementDebits(stmtDebits, txDebits, decisions, tz) {
       .slice(0, 3);
   });
 
-  // Reverse hints for Orphan Logs: which unresolved statement lines suggest each unmatched tx
+  // Reverse hints for Orphan Logs: unresolved and partially-matched statement lines for each unmatched tx
+  const partialHintMetaByStmtId = {};
+  stmtDebits.forEach(st => {
+    if (!st.matched || !st.stmtId || !(st.remainingAmount > 0.10)) return;
+    const pool = txDebits.filter(tx => {
+      if (tx.matched || !tx.txId) return false;
+      if (daysBetweenDates(st.date, tx.date) > 5) return false;
+      return (parseFloat(tx.amount) || 0) <= st.remainingAmount + 0.10;
+    });
+    if (pool.length === 0) return;
+
+    const sameShopPool = pool.filter(tx => {
+      if (hasMerchantMatch(st.desc, tx.desc, decisions)) return true;
+      const txClean = cleanMerchantName(tx.desc) || makeNormDesc(tx.desc);
+      return (st.matchedItems || []).some(mt => {
+        const mtClean = cleanMerchantName(mt.desc) || makeNormDesc(mt.desc);
+        return Boolean((txClean && mtClean && txClean === mtClean) || hasMerchantMatch(mt.desc, tx.desc, decisions));
+      });
+    });
+
+    let combo = sameShopPool.length >= 2 ? findSubsetCombination(sameShopPool, st.remainingAmount, 6, 0.10) : null;
+    if (!combo && pool.length >= 2) {
+      combo = findSubsetCombination(pool, st.remainingAmount, 5, 0.10);
+    }
+    partialHintMetaByStmtId[st.stmtId] = {
+      combo: (combo && combo.length >= 2) ? combo : null,
+      comboIds: new Set((combo && combo.length >= 2 ? combo : []).map(t => t.txId))
+    };
+  });
+
   txDebits.forEach(tx => {
     if (tx.matched || !tx.txId) return;
-    const hints = [];
+    const hintsByLabel = {};
+    function pushHint(h) {
+      if (!h || !h.dropdownLabel) return;
+      const prev = hintsByLabel[h.dropdownLabel];
+      if (!prev || h.score > prev.score) {
+        hintsByLabel[h.dropdownLabel] = h;
+      }
+    }
+
     stmtDebits.forEach(st => {
       if (st.matched || !st.stmtId || !st.suggestedPairs) return;
       const matchCand = st.suggestedPairs.find(c => c.txIds.includes(tx.txId));
       if (matchCand) {
-        hints.push({
+        if (matchCand.txIds.length > 1) {
+          pushHint({
+            stmtId: st.stmtId,
+            stmt: st,
+            score: matchCand.score + 5,
+            reason: matchCand.reason,
+            dropdownLabel: formatOrphanPairGroupDropdownLabel(st, matchCand.txs)
+          });
+        }
+        pushHint({
           stmtId: st.stmtId,
           stmt: st,
           score: matchCand.score,
@@ -293,8 +366,46 @@ function matchStatementDebits(stmtDebits, txDebits, decisions, tz) {
         });
       }
     });
-    hints.sort((a, b) => b.score - a.score);
-    tx.suggestedStmts = hints.slice(0, 3);
+
+    stmtDebits.forEach(st => {
+      if (!st.matched || !st.stmtId || !(st.remainingAmount > 0.10)) return;
+      const dateDiff = daysBetweenDates(st.date, tx.date);
+      if (dateDiff > 5 || (parseFloat(tx.amount) || 0) > st.remainingAmount + 0.10) return;
+
+      const pMeta = partialHintMetaByStmtId[st.stmtId];
+      if (pMeta && pMeta.combo && pMeta.comboIds.has(tx.txId)) {
+        const comboSum = pMeta.combo.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+        pushHint({
+          stmtId: st.stmtId,
+          stmt: st,
+          score: 115,
+          isPartialAppend: true,
+          remainingAmount: st.remainingAmount,
+          reason: `Completes split remainder (+${comboSum.toFixed(2)})`,
+          dropdownLabel: formatOrphanAddAllDropdownLabel(st, pMeta.combo)
+        });
+      }
+
+      const txClean = cleanMerchantName(tx.desc) || makeNormDesc(tx.desc);
+      const descMatches = hasMerchantMatch(st.desc, tx.desc, decisions) || (st.matchedItems || []).some(mt => {
+        const mtClean = cleanMerchantName(mt.desc) || makeNormDesc(mt.desc);
+        return Boolean((txClean && mtClean && txClean === mtClean) || hasMerchantMatch(mt.desc, tx.desc, decisions));
+      });
+      const exactRem = Math.abs((parseFloat(tx.amount) || 0) - st.remainingAmount) <= 0.10;
+      const score = (exactRem ? 105 : (descMatches ? 90 : 70)) - dateDiff * 5;
+      pushHint({
+        stmtId: st.stmtId,
+        stmt: st,
+        score: score,
+        isPartialAppend: true,
+        remainingAmount: st.remainingAmount,
+        reason: `Partial split (${st.remainingAmount.toFixed(2)} left)`,
+        dropdownLabel: formatOrphanAddDropdownLabel(st, st.remainingAmount)
+      });
+    });
+
+    const hints = Object.values(hintsByLabel).sort((a, b) => b.score - a.score);
+    tx.suggestedStmts = hints.slice(0, 4);
   });
 
   return {
