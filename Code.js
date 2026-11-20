@@ -1509,7 +1509,7 @@ function buildDebtLedger(ss, tz, recon) {
 
 function getReconTableBounds(ledger, recon) {
   const numPayers = ledger.personShares.length;
-  const startShareRow = 12;
+  const startShareRow = getActiveReconStartShareRow();
   const endShareRow = startShareRow + numPayers - 1;
   const totShareRow = endShareRow + 1;
 
@@ -1690,20 +1690,14 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const stmtDateStr = recon.cardBal.statementDate ? Utilities.formatDate(recon.cardBal.statementDate, tz, "yyyy-MM-dd") : "N/A";
   const dueDateStr = Utilities.formatDate(ledger.activeDueDate, tz, "MMMM d, yyyy");
 
-  const t2UnresolvedCount = numExceptions > 0 ? `COUNTIFS(F${startExRow}:F${endExRow}, "")` : "0";
-  const t2UnresolvedAmt = numExceptions > 0
-    ? `(SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "", E${startExRow}:E${endExRow}, "<>*Credit*") - SUMIFS(D${startExRow}:D${endExRow}, F${startExRow}:F${endExRow}, "", E${startExRow}:E${endExRow}, "*Credit*"))`
-    : "0";
-  const t4UnresolvedCount = hasTable4 ? `COUNTIFS(E${startInstRow}:E${endInstRow}, "⚠️*", F${startInstRow}:F${endInstRow}, "")` : "0";
-  const t4UnresolvedAmt = hasTable4 ? `SUMIFS(D${startInstRow}:D${endInstRow}, E${startInstRow}:E${endInstRow}, "⚠️*", F${startInstRow}:F${endInstRow}, "")` : "0";
-
-  const unresolvedCountExpr = hasTable4 ? `(${t2UnresolvedCount} + ${t4UnresolvedCount})` : t2UnresolvedCount;
-  const unresolvedAmtExpr = hasTable4 ? `(${t2UnresolvedAmt} + ${t4UnresolvedAmt})` : t2UnresolvedAmt;
-
-  const negPayExpr = numExceptions > 0
-    ? `SUMIFS(D${startExRow}:D${endExRow}, E${startExRow}:E${endExRow}, "Bill Payment (Credit)", F${startExRow}:F${endExRow}, "🚫*")`
-    : "0";
-  const carriedOverExpr = `(${(ledger.openingBalance || 0).toFixed(2)} - ${negPayExpr})`;
+  const healthModel = buildHealthCheckModel(ss, tz, ledger, recon, { bounds });
+  const {
+    t2UnresolvedCount,
+    t2UnresolvedAmt,
+    unresolvedCountExpr,
+    unresolvedAmtExpr,
+    carriedOverExpr
+  } = healthModel.expressions;
 
   const badgeFormula = `=IF(AND(${unresolvedCountExpr}=0, ABS(F6)<0.5), "✅ Balanced (0 unresolved · 0.00 diff)", IF(${unresolvedCountExpr}>0, "⚠️ Unresolved: " & ${unresolvedCountExpr} & " line(s) (" & TEXT(${unresolvedAmtExpr},"#,##0.00") & " EGP)", IF(F6>0, "ℹ️ Statement Check: +" & TEXT(F6,"#,##0.00") & " EGP", "⚠️ Statement Check: -" & TEXT(ABS(F6),"#,##0.00") & " EGP")))`;
 
@@ -1767,20 +1761,11 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   sheet.getRange("D5:D7").setNumberFormat("#,##0.00");
   sheet.getRange("F6:F7").setNumberFormat("#,##0.00");
 
-  // Live Statement Check & Audit Bar (Row 8)
-  const orphanActiveCountExpr = hasOrphanTable ? `COUNTIFS(F${startOrphanRow}:F${endOrphanRow}, "<>🚫*")` : "0";
-  const orphanActiveAmtExpr = hasOrphanTable ? `SUMIFS(D${startOrphanRow}:D${endOrphanRow}, F${startOrphanRow}:F${endOrphanRow}, "<>🚫*")` : "0";
-  const pendingTotalFixed = (ledger.pendingTotal || 0).toFixed(2);
-  const auditBarFormula = `="🔍 Unresolved bank lines: " & ${unresolvedCountExpr} & " (" & TEXT(${unresolvedAmtExpr},"#,##0.00") & " EGP) → target 0 | Statement check: " & TEXT(F6,"+#,##0.00;-#,##0.00;0.00") & " EGP | Carryover: " & TEXT(${carriedOverExpr},"+#,##0.00;-#,##0.00;0.00") & " | Orphan logs: " & ${orphanActiveCountExpr} & " (" & TEXT(${orphanActiveAmtExpr},"#,##0.00") & " EGP) | Pending next cycle: ${ledger.pendingCount || 0} (${pendingTotalFixed} EGP)"`;
-  sheet.getRange("A8:H8").merge()
-    .setFormula(auditBarFormula)
-    .setFontSize(8)
-    .setFontStyle("italic")
-    .setFontColor(CONFIG.COLORS.TEXT_MUTED)
-    .setBackground("#f9fbe7");
+  // Live Health Check Panel (Rows 9-11)
+  renderHealthCheckPanel(sheet, healthModel);
 
   // 4. Family Member Shares Table (Table 1 - Fully Formula-Driven)
-  sheet.getRange("A10:H10").merge()
+  sheet.getRange(startShareRow - 2, 1, 1, 8).merge()
     .setValue("👥 Family Member Active Debt Shares (Billed on Current Statement)")
     .setFontWeight("bold")
     .setFontSize(11)
@@ -1788,7 +1773,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     .setFontColor("#ffffff");
 
   const sharesHeaders = ["#", "Family Member", "Purchases (EGP)", "Installments (EGP)", "Bank Fees & Taxes (EGP)", "Unrecorded Assigned (EGP)", "Refunds / Credits (EGP)", "Net Total Due (EGP)"];
-  sheet.getRange(11, 1, 1, sharesHeaders.length).setValues([sharesHeaders])
+  sheet.getRange(startShareRow - 1, 1, 1, sharesHeaders.length).setValues([sharesHeaders])
     .setFontWeight("bold")
     .setFontSize(9)
     .setBackground(CONFIG.COLORS.HEADER);
@@ -2108,6 +2093,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     }
   }
 
+  const pendingTotalFixed = (ledger.pendingTotal || 0).toFixed(2);
   // 8. Pending — Next Statement Panel (Post-closing purchases — NOT billed on current statement)
   if (hasPendingTable) {
     sheet.getRange(startPendingHeaderRow, 1, 1, 8).merge()
@@ -2150,7 +2136,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   applySheetLayoutFitting(sheet, {
     bannerRow: 1,
     bannerHeight: 30,
-    customRowHeights: { 2: 20, 4: 24, 10: 26 },
+    customRowHeights: { 2: 20, 3: 12, 4: 24, 8: 10, 9: 24, 10: 22, 11: 22, 12: 12, 13: 26, 14: 24 },
     explicitColWidths: {
       1: 55,  // #
       2: 125, // Date / Member
@@ -2162,6 +2148,8 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       8: 155  // Status
     }
   });
+
+  return healthModel;
 }
 
 // ==========================================
@@ -2252,7 +2240,7 @@ function renderMonthlyHistoryForecastSheet(ss, tz, ledger) {
 
   const startDataRow = 5;
   const lastDataRow = startDataRow + Math.max(1, allPayers.length) - 1;
-  const startShareRow = 12;
+  const startShareRow = getActiveReconStartShareRow();
   const activeShareCount = (ledger.personShares && ledger.personShares.length) || allPayers.length;
   const endShareRow = startShareRow + Math.max(1, activeShareCount) - 1;
 
@@ -2605,12 +2593,13 @@ function syncInstallmentsFromStatement(ss, tz, isBillPaid, optDecisions) {
 
   // 4. Keep Bank Progress (Col J) / Bank Status (Col K) formula columns synced to active Table 4 rows
   let arBounds = null;
+  const startShareRow = getActiveReconStartShareRow();
   const arSheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
-  if (arSheet && arSheet.getLastRow() >= 12) {
+  if (arSheet && arSheet.getLastRow() >= startShareRow) {
     let startInstRow = -1;
     let endInstRow = -1;
     const colA = arSheet.getRange(1, 1, arSheet.getLastRow(), 1).getValues();
-    for (let r = 12; r <= colA.length; r++) {
+    for (let r = startShareRow; r <= colA.length; r++) {
       if (/^INST-\d+/i.test(String(colA[r - 1][0] || "").trim())) {
         if (startInstRow === -1) startInstRow = r;
         endInstRow = r;
@@ -2713,7 +2702,7 @@ function handleActiveReconEdit(e) {
   }
 
   const lastR = sheet.getLastRow();
-  const loopStart = Math.max(12, startRow);
+  const loopStart = Math.max(getActiveReconStartShareRow(), startRow);
   const loopEnd = Math.min(lastR, startRow + numRows - 1);
   if (loopStart > loopEnd) return;
 
@@ -2895,11 +2884,11 @@ function updateLiveDashboard(options) {
 
   const ledger = buildDebtLedger(ss, tz, recon);
 
-  renderActiveReconciliationSheet(ss, tz, ledger, recon);
+  const health = renderActiveReconciliationSheet(ss, tz, ledger, recon);
   renderMonthlyHistoryForecastSheet(ss, tz, ledger);
   renderMemberBreakdownSheet(ss, tz, ledger, recon);
 
-  return { blocked: false, parseHealth, recon, ledger };
+  return { blocked: false, parseHealth, recon, ledger, health };
 }
 
 function navToMemberBreakdown() {
@@ -3036,8 +3025,9 @@ function buildAnonymizedFixture(ss, tz) {
       collectDataPayers(t.replace(/^✅\s*Billed\s+to\s+/i, ""));
     }
   });
-  if (activeReconSheet && activeReconSheet.getLastRow() >= 12) {
-    const arVals = activeReconSheet.getRange(12, 1, activeReconSheet.getLastRow() - 11, 6).getValues();
+  const fixtureStartShareRow = getActiveReconStartShareRow();
+  if (activeReconSheet && activeReconSheet.getLastRow() >= fixtureStartShareRow) {
+    const arVals = activeReconSheet.getRange(fixtureStartShareRow, 1, activeReconSheet.getLastRow() - fixtureStartShareRow + 1, 6).getValues();
     arVals.forEach(r => {
       const colA = String(r[0] || "").trim();
       if (/^[FCM]-\d+/i.test(colA) && r[5] && !isNeglectedPayer(r[5])) {

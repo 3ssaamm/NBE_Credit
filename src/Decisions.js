@@ -1200,8 +1200,9 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
 }
 
 function syncActiveReconSheetToDecisions(ss, tz) {
+  const startRow = typeof getActiveReconStartShareRow === "function" ? getActiveReconStartShareRow() : 15;
   const sheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
-  if (!sheet || sheet.getLastRow() < 12) return;
+  if (!sheet || sheet.getLastRow() < startRow) return;
 
   const lastR = sheet.getLastRow();
   const colsToRead = Math.min(9, Math.max(8, sheet.getLastColumn() || 8));
@@ -1213,7 +1214,7 @@ function syncActiveReconSheetToDecisions(ss, tz) {
   const decisions = loadDecisions(ss);
   let changed = false;
 
-  for (let row = 12; row <= lastR; row++) {
+  for (let row = startRow; row <= lastR; row++) {
     const res = processActiveReconRowChange(sheet, allRows, row, decisions, tz, { allowDelete: false, forceStyle: false });
     if (res && res.changed) {
       changed = true;

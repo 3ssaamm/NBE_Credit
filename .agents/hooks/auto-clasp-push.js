@@ -58,6 +58,10 @@ function main() {
       execSync("npm test", { cwd: projectRoot, stdio: "pipe", timeout: 25000 });
     }
 
+    if (relPath !== "src/Version.js" && fs.existsSync(path.join(projectRoot, "tools", "stamp_version.js"))) {
+      execSync("node tools/stamp_version.js", { cwd: projectRoot, stdio: "pipe", timeout: 5000 });
+    }
+
     execSync("clasp push -f", { cwd: projectRoot, stdio: "pipe", timeout: 25000 });
   } catch (_) {
     // Never block or break tool execution if syntax is mid-edit or clasp fails

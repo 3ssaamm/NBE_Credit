@@ -379,6 +379,7 @@ function createGasSandbox() {
           whenFormulaSatisfied: (f) => { rule.formula = f; return builder; },
           setBold: (b) => { rule.bold = b; return builder; },
           setBackground: (bg) => { rule.bg = bg; return builder; },
+          setFontColor: (c) => { rule.fontColor = c; return builder; },
           setRanges: (r) => { rule.ranges = r; return builder; },
           build: () => rule
         };

@@ -99,8 +99,9 @@ assert.strictEqual(reconSheet._getCell(rowI1, 5), "Installment (Unlinked)");
 assert.ok(startInstRow > rowI1, "Table 4 should be rendered below Needs Pairing");
 assert.strictEqual(endInstRow - startInstRow + 1, 13, "Table 4 should have 13 rows");
 
+const startShareRow1 = sandbox.getActiveReconStartShareRow();
 for (let i = 0; i < ledger1.personShares.length; i++) {
-  const r = 12 + i;
+  const r = startShareRow1 + i;
   const person = reconSheet._getCell(r, 2);
   const formula = String(reconSheet._getCell(r, 4) || "");
   assert.ok(formula.startsWith("=SUMIFS("), `Table 1 Col D row ${r} must be SUMIFS formula, got: ${formula}`);
@@ -159,8 +160,9 @@ for (let r = 1; r <= reconSheet.getLastRow(); r++) {
     endInstRow2 = r;
   }
 }
+const startShareRow2 = sandbox.getActiveReconStartShareRow();
 for (let i = 0; i < ledger2.personShares.length; i++) {
-  const r = 12 + i;
+  const r = startShareRow2 + i;
   const person = reconSheet._getCell(r, 2);
   let expectedSum = evalTable4Sumifs(reconSheet, person, startInstRow2, endInstRow2);
   if (person === "Abdo") expectedSum = Number((expectedSum + 350.00).toFixed(2));
@@ -214,8 +216,9 @@ assert.ok(gymItems.every(it => !it.note.includes("⚠️")), "Exact 100/3 roundi
 
 assert.strictEqual(recon4.unlinkedStmtInstallments[0].assignedPayer, "", "Cleared I-1 override should revert to blank");
 
+const startShareRow4 = sandbox.getActiveReconStartShareRow();
 for (let i = 0; i < ledger4.personShares.length; i++) {
-  const r = 12 + i;
+  const r = startShareRow4 + i;
   const person = reconSheet._getCell(r, 2);
   const expected = Number(ledger4.personShares[i].installments.toFixed(2));
   const evalSum = evalTable4Sumifs(reconSheet, person, startInst4, endInst4);

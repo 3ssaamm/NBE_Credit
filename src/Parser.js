@@ -686,6 +686,16 @@ function renderStatementParseErrorSheet(ss, tz, health) {
     .setFontColor("#b71c1c")
     .setBackground(CONFIG.COLORS.OVERDUE);
 
+  const errTz = tz || (ss && ss.getSpreadsheetTimeZone()) || "Africa/Cairo";
+  const errRefreshTime = Utilities.formatDate(new Date(), errTz, "yyyy-MM-dd HH:mm:ss");
+  const errCodeVersion = typeof getCodeVersion === "function" ? getCodeVersion() : "unknown";
+  sheet.getRange("A3:H3").merge()
+    .setValue("🩺 Parse Tie-Out: ❌ FAILED | Last Refresh: " + errRefreshTime + " | Code Version: " + errCodeVersion)
+    .setFontWeight("bold")
+    .setFontSize(9)
+    .setFontColor("#7f6000")
+    .setBackground("#fff2cc");
+
   sheet.getRange("A4:H4").merge()
     .setValue("📊 Mathematical Tie-Out & Line Count Diagnostics")
     .setFontWeight("bold")
