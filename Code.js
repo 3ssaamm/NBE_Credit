@@ -798,7 +798,7 @@ function calculateCardBalance(ss, tz) {
 // 7. ACTIVE RECONCILIATION & WATERFALL ENGINE
 // ==========================================
 
-function reconcileActiveStatement(ss, tz) {
+function reconcileActiveStatement(ss, tz, optContext) {
   const stmtSheet = ss.getSheetByName(CONFIG.SHEETS.BANK_STATEMENT);
   const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
   const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
@@ -812,7 +812,7 @@ function reconcileActiveStatement(ss, tz) {
   }
 
   const idInfo = ensureAllSheetRowIds(ss, decisions);
-  const parseHealth = evaluateBankStatementHealth(ss, tz, decisions);
+  const parseHealth = (optContext && optContext.parseHealth) || evaluateBankStatementHealth(ss, tz, decisions);
 
   // 1. Read Statement Rows (respect explicit Col E Type — no hardcoded amount/merchant flips)
   const stmtLastRow = stmtSheet.getLastRow();
@@ -1888,7 +1888,6 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       .requireValueInList(standardOptions, true)
       .setAllowInvalid(true)
       .build();
-    sheet.getRange(startExRow, 6, exRows.length, 1).setDataValidation(defaultValidation);
 
     const activeOrphanPool = orphanList.filter(o => !o.isNeglected && o.txId);
     const seenOrphanTx = new Set();
@@ -1901,18 +1900,19 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     });
 
     const activeUnmatchedSheetInsts = (recon.unmatchedSheetInstallments || []).filter(sh => sh.instId);
+    const exValidations = [];
+    const exBgs = [];
 
     for (let i = 0; i < exceptionItems.length; i++) {
       const ex = exceptionItems[i];
-      const r = startExRow + i;
+      let rowVal = defaultValidation;
 
       if (ex.suggestedInstLinks && ex.suggestedInstLinks.length > 0) {
         const sugLabels = ex.suggestedInstLinks.map(sl => sl.dropdownLabel);
-        const rowVal = SpreadsheetApp.newDataValidation()
+        rowVal = SpreadsheetApp.newDataValidation()
           .requireValueInList([...sugLabels, ...standardOptions], true)
           .setAllowInvalid(true)
           .build();
-        sheet.getRange(r, 6).setDataValidation(rowVal);
       } else if (/^I-/.test(ex.id) && !ex.assignedPayer && activeUnmatchedSheetInsts.length > 0) {
         const closest = activeUnmatchedSheetInsts
           .slice()
@@ -1920,19 +1920,17 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
           .slice(0, 3)
           .map(sh => formatInstLinkDropdownLabel([sh]));
         if (closest.length > 0) {
-          const rowVal = SpreadsheetApp.newDataValidation()
+          rowVal = SpreadsheetApp.newDataValidation()
             .requireValueInList([...standardOptions, ...closest], true)
             .setAllowInvalid(true)
             .build();
-          sheet.getRange(r, 6).setDataValidation(rowVal);
         }
       } else if (ex.suggestedPairs && ex.suggestedPairs.length > 0) {
         const sugLabels = ex.suggestedPairs.map(sp => sp.dropdownLabel);
-        const rowVal = SpreadsheetApp.newDataValidation()
+        rowVal = SpreadsheetApp.newDataValidation()
           .requireValueInList([...sugLabels, ...standardOptions], true)
           .setAllowInvalid(true)
           .build();
-        sheet.getRange(r, 6).setDataValidation(rowVal);
       } else if (/^M-/.test(ex.id) && !ex.assignedPayer && uniqueActiveOrphans.length > 0) {
         const closest = uniqueActiveOrphans
           .slice()
@@ -1940,31 +1938,34 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
           .slice(0, 3)
           .map(o => formatPairDropdownLabel([o]));
         if (closest.length > 0) {
-          const rowVal = SpreadsheetApp.newDataValidation()
+          rowVal = SpreadsheetApp.newDataValidation()
             .requireValueInList([...standardOptions, ...closest], true)
             .setAllowInvalid(true)
             .build();
-          sheet.getRange(r, 6).setDataValidation(rowVal);
         }
       }
+      exValidations.push([rowVal]);
 
       const cat = ex.category;
       const payer = ex.assignedPayer;
       const hasSugs = (ex.suggestedPairs && ex.suggestedPairs.length > 0) || (ex.suggestedInstLinks && ex.suggestedInstLinks.length > 0);
+      let bg = "#ffffff";
       if (isNeglectedPayer(payer)) {
-        sheet.getRange(r, 1, 1, 8).setBackground("#eeeeee");
+        bg = "#eeeeee";
       } else if (cat.includes("Credit")) {
-        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.PRIMARY_LIGHT);
+        bg = CONFIG.COLORS.PRIMARY_LIGHT;
       } else if (payer) {
-        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
+        bg = CONFIG.COLORS.PAID;
       } else if (hasSugs) {
-        sheet.getRange(r, 1, 1, 8).setBackground("#e8f0fe");
+        bg = "#e8f0fe";
       } else if (/^I-/.test(ex.id)) {
-        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.DUE_SOON);
-      } else {
-        sheet.getRange(r, 1, 1, 8).setBackground("#ffffff");
+        bg = CONFIG.COLORS.DUE_SOON;
       }
+      exBgs.push([bg, bg, bg, bg, bg, bg, bg, bg]);
     }
+
+    sheet.getRange(startExRow, 6, exRows.length, 1).setDataValidations(exValidations);
+    sheet.getRange(startExRow, 1, exRows.length, 8).setBackgrounds(exBgs);
   }
 
   // 6. Orphan Logs Panel (In-period transactions without a paired bank line — NOT billed)
@@ -2009,8 +2010,9 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
 
     const partialStmtDebits = (recon.stmtDebits || []).filter(st => st.matched && st.remainingAmount > 0.10 && st.stmtId);
     const unassignedStmtDebits = (recon.missingInSheet || []).filter(m => !m.assignedPayer);
+    const orphanValidations = [];
+    const orphanBgs = [];
     for (let i = 0; i < orphanList.length; i++) {
-      const r = startOrphanRow + i;
       const orph = orphanList[i];
       const sugLabels = (orph.suggestedStmts || []).map(s => s.dropdownLabel);
       if (sugLabels.length === 0) {
@@ -2029,16 +2031,18 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
         .requireValueInList([...sugLabels, "⏳ Not on Statement Yet (Ignored)", "🚫 Dismiss / Duplicate Log"], true)
         .setAllowInvalid(true)
         .build();
-      sheet.getRange(r, 6).setDataValidation(orphanValidation);
+      orphanValidations.push([orphanValidation]);
 
+      let bg = "#fff8e1";
       if (orph.isNeglected) {
-        sheet.getRange(r, 1, 1, 8).setBackground("#eeeeee");
+        bg = "#eeeeee";
       } else if (orph.suggestedStmts && orph.suggestedStmts.length > 0) {
-        sheet.getRange(r, 1, 1, 8).setBackground("#e8f0fe");
-      } else {
-        sheet.getRange(r, 1, 1, 8).setBackground("#fff8e1");
+        bg = "#e8f0fe";
       }
+      orphanBgs.push([bg, bg, bg, bg, bg, bg, bg, bg]);
     }
+    sheet.getRange(startOrphanRow, 6, orphanRows.length, 1).setDataValidations(orphanValidations);
+    sheet.getRange(startOrphanRow, 1, orphanRows.length, 8).setBackgrounds(orphanBgs);
   }
 
   // 7. Active Installments & Statement EMI Reconciliation (Table 4)
@@ -2075,36 +2079,43 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
     sheet.getRange(startInstRow, 4, instRows.length, 1).setNumberFormat("#,##0.00");
 
     const instPayersList = getAllUniquePayers(ss);
+    const instValCache = {};
+    const instValidations = [];
+    const instBgs = [];
     for (let i = 0; i < instReconList.length; i++) {
-      const r = startInstRow + i;
       const inst = instReconList[i];
-      const options = [];
-      if (inst.defaultPayer) {
-        options.push(`✅ Billed to ${inst.defaultPayer}`);
+      const defKey = inst.defaultPayer || "";
+      if (!instValCache[defKey]) {
+        const options = [];
+        if (inst.defaultPayer) {
+          options.push(`✅ Billed to ${inst.defaultPayer}`);
+        }
+        instPayersList.forEach(p => {
+          const opt = `✅ Billed to ${p}`;
+          if (!options.includes(opt)) options.push(opt);
+        });
+        options.push("🚫 Neglect / Skip This Cycle");
+        options.push("🚫 Not on Statement (Skip)");
+
+        instValCache[defKey] = SpreadsheetApp.newDataValidation()
+          .requireValueInList(options, true)
+          .setAllowInvalid(true)
+          .build();
       }
-      instPayersList.forEach(p => {
-        const opt = `✅ Billed to ${p}`;
-        if (!options.includes(opt)) options.push(opt);
-      });
-      options.push("🚫 Neglect / Skip This Cycle");
-      options.push("🚫 Not on Statement (Skip)");
+      instValidations.push([instValCache[defKey]]);
 
-      const instValidation = SpreadsheetApp.newDataValidation()
-        .requireValueInList(options, true)
-        .setAllowInvalid(true)
-        .build();
-      sheet.getRange(r, 6).setDataValidation(instValidation);
-
+      let bg = "#f8f9fa";
       if (!inst.action) {
-        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.DUE_SOON);
+        bg = CONFIG.COLORS.DUE_SOON;
       } else if (isNeglectedPayer(inst.action)) {
-        sheet.getRange(r, 1, 1, 8).setBackground("#eeeeee");
+        bg = "#eeeeee";
       } else if (inst.sourceCategory && inst.sourceCategory.includes("Statement Only")) {
-        sheet.getRange(r, 1, 1, 8).setBackground(CONFIG.COLORS.PAID);
-      } else {
-        sheet.getRange(r, 1, 1, 8).setBackground("#f8f9fa");
+        bg = CONFIG.COLORS.PAID;
       }
+      instBgs.push([bg, bg, bg, bg, bg, bg, bg, bg]);
     }
+    sheet.getRange(startInstRow, 6, instRows.length, 1).setDataValidations(instValidations);
+    sheet.getRange(startInstRow, 1, instRows.length, 8).setBackgrounds(instBgs);
   }
 
   const pendingTotalFixed = (ledger.pendingTotal || 0).toFixed(2);
@@ -2728,6 +2739,9 @@ function handleActiveReconEdit(e) {
   const allRows = colsToRead >= 9
     ? rawRows
     : rawRows.map(r => [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], ""]);
+  if (numRows === 1 && numCols === 1 && e.value !== undefined && allRows[startRow - 1] && col <= allRows[startRow - 1].length) {
+    allRows[startRow - 1][col - 1] = e.value;
+  }
   let modified = false;
   let needsRefresh = false;
   let toastMsg = "";
@@ -2745,9 +2759,20 @@ function handleActiveReconEdit(e) {
     saveDecisions(ss, decisions);
   }
   if (needsRefresh) {
-    updateLiveDashboard({ skipPDF: true, ss: ss });
-    if (toastMsg) {
-      try { ss.toast(toastMsg, "💳 NBE Tracker", 4); } catch (err) { }
+    try {
+      ss.toast("⏳ " + (toastMsg || "Updating reconciliation..."), "💳 NBE Tracker", 10);
+    } catch (err) { }
+    try {
+      updateLiveDashboard({ skipPDF: true, fromEdit: true, ss: ss });
+      SpreadsheetApp.flush();
+      if (toastMsg) {
+        try { ss.toast(toastMsg, "💳 NBE Tracker", 4); } catch (err) { }
+      }
+    } catch (err) {
+      Logger.log("[handleActiveReconEdit] Refresh error: " + err);
+      try {
+        ss.toast("⚠️ Decision saved, but auto-refresh hit an error (" + (err && err.message ? err.message : err) + "). Please click Refresh Dashboard.", "⚠️ NBE Tracker", 8);
+      } catch (e2) { }
     }
   }
   // ZERO SCREEN WIPE on normal edits: Declarative formulas in Table 1, Totals, and KPIs recalculate in sub-50ms!
@@ -2863,13 +2888,16 @@ function onEdit(e) {
 function updateLiveDashboard(options) {
   const ss = (options && options.ss) || SpreadsheetApp.getActiveSpreadsheet();
   const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
+  const fromEdit = Boolean(options && options.fromEdit);
 
   invalidateSettingsCache_();
   loadSettings(ss);
-  cleanupDeprecatedSheets(ss);
-  sanitizeAllPayerNames(ss);
-  sanitizeTransactionDates(ss);
-  syncActiveReconSheetToDecisions(ss, tz);
+  if (!fromEdit) {
+    cleanupDeprecatedSheets(ss);
+    sanitizeAllPayerNames(ss);
+    sanitizeTransactionDates(ss);
+    syncActiveReconSheetToDecisions(ss, tz);
+  }
 
   const parseHealth = evaluateBankStatementHealth(ss, tz);
   const enforceGate = Boolean((options && options.enforceParseGate) || (parseHealth && parseHealth.hasImportMeta));
@@ -2878,19 +2906,7 @@ function updateLiveDashboard(options) {
     return { blocked: true, parseHealth };
   }
 
-  // Check active payment state from Active Bill & Reconciliation cell H6
-  let isBillPaid = false;
-  const reconSheet = ss.getSheetByName(CONFIG.SHEETS.ACTIVE_RECON);
-  if (reconSheet) {
-    const h6Val = reconSheet.getRange(6, 8).getValue();
-    const h6Date = parseDateValue(h6Val, tz);
-    if (h6Date && !isNaN(h6Date.getTime())) {
-      isBillPaid = true;
-    }
-  }
-  syncInstallmentsFromStatement(ss, tz, isBillPaid);
-
-  const recon = reconcileActiveStatement(ss, tz);
+  const recon = reconcileActiveStatement(ss, tz, { parseHealth });
   if (recon.error) {
     Logger.log(recon.error);
     return { blocked: false, parseHealth, error: recon.error };

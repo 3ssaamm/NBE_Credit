@@ -149,10 +149,26 @@ class MockRange {
     }
     return this;
   }
+  setBackgrounds(arr) {
+    for (let i = 0; i < arr.length; i++) {
+      for (let j = 0; j < arr[i].length; j++) {
+        this.sheet.backgrounds[`${this.r + i}_${this.c + j}`] = arr[i][j];
+      }
+    }
+    return this;
+  }
   setDataValidation(dv) {
     for (let i = 0; i < this.nr; i++) {
       for (let j = 0; j < this.nc; j++) {
         this.sheet.validations[`${this.r + i}_${this.c + j}`] = dv;
+      }
+    }
+    return this;
+  }
+  setDataValidations(arr) {
+    for (let i = 0; i < arr.length; i++) {
+      for (let j = 0; j < arr[i].length; j++) {
+        this.sheet.validations[`${this.r + i}_${this.c + j}`] = arr[i][j];
       }
     }
     return this;

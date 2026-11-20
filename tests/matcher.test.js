@@ -428,8 +428,28 @@ const tz = "Africa/Cairo";
       }
     }
     const addAllLabel = maiLabels.find(l => l.startsWith("🔗 Add all to: S-00001"));
-    ar._setCell(rowOrphMai, 6, addAllLabel);
-    sandbox.handleActiveReconEdit({ range: ar.getRange(rowOrphMai, 6) });
+    const flushBefore = sandbox.__flushCount || 0;
+    ss.toasts.length = 0;
+    // Call full onEdit entry point with e.value overlay WITHOUT manually calling updateLiveDashboard afterward
+    sandbox.onEdit({ range: ar.getRange(rowOrphMai, 6), value: addAllLabel });
+
+    assert.ok((sandbox.__flushCount || 0) > flushBefore, "onEdit auto-refresh must flush updated sheet");
+    let remainingOrphRowsOnAr = 0;
+    const arTable1Purchases = {};
+    for (let r = startRow; r <= ar.getLastRow(); r++) {
+      const colA = String(ar._getCell(r, 1) || "");
+      if (/^ORPH-/i.test(colA)) remainingOrphRowsOnAr++;
+      if (/^\d+$/.test(colA)) {
+        const memberName = ar._getCell(r, 2);
+        if (memberName) arTable1Purchases[memberName] = ar._getCell(r, 3);
+      }
+    }
+    assert.strictEqual(remainingOrphRowsOnAr, 0, "onEdit must automatically re-render Active Bill & clear Orphan rows immediately");
+    assert.strictEqual(arTable1Purchases["Mai"], "=100.00", "onEdit auto-refresh must immediately update Mai Table 1 purchases");
+    assert.strictEqual(arTable1Purchases["Dad"], "=200.00", "onEdit auto-refresh must immediately update Dad Table 1 purchases");
+    assert.strictEqual(arTable1Purchases["Mido"], "=367.00", "onEdit auto-refresh must immediately update Mido Table 1 purchases");
+    assert.ok(ss.toasts.some(t => t.includes("⏳") && t.includes("S-00001")), "Should show immediate progress toast");
+    assert.ok(ss.toasts.some(t => !t.startsWith("⏳") && t.includes("🔗 Paired S-00001")), "Should show completion toast after refresh");
 
     recon = sandbox.reconcileActiveStatement(ss, tz);
     ledger = sandbox.buildDebtLedger(ss, tz, recon);
