@@ -7,7 +7,7 @@ const CONFIG = {
   FOLDER_NAME: "NBE Statements",
   PROCESSED_SUBFOLDER: "Processed",
   CREDIT_LIMIT: 100000.00,
-  DEFAULT_FEE_PAYER: "Mai",
+  DEFAULT_FEE_PAYER: "",
   SHEETS: {
     TRANSACTIONS: "Transactions",
     INSTALLMENTS: "Installments",
@@ -15,6 +15,7 @@ const CONFIG = {
     ACTIVE_RECON: "Active Bill & Reconciliation",
     HISTORY_FORECAST: "Monthly History & Forecast",
     HISTORY: "History",
+    SETTINGS: "Settings",
     MEMBER_BREAKDOWN: "Member Breakdown",
     RECON_STORE: "_Recon_Store",
     DECISIONS: "_Decisions",
@@ -145,63 +146,28 @@ function cleanMerchantName(str) {
   return s.trim();
 }
 
-const MERCHANT_ALIAS_GROUPS = [
-  { key: "internet", terms: ["internet", "we-fbb", "we-mobile", "vodafone", "telecom", "we"] },
-  { key: "cavalli", terms: ["cavalli"] },
-  { key: "amazon", terms: ["amazon"] },
-  { key: "uber", terms: ["uber"] },
-  { key: "careem", terms: ["careem"] },
-  { key: "fathalla", terms: ["fathalla"] },
-  { key: "buffalo", terms: ["buffalo"] },
-  { key: "caribou", terms: ["caribou"] },
-  { key: "basilico", terms: ["basilico", "bazlykwa", "bazlikwa"] },
-  { key: "rabbit", terms: ["rabbit", "sahl"] },
-  { key: "maria", terms: ["maria"] },
-  { key: "lail", terms: ["lail"] },
-  { key: "asteria", terms: ["asteria"] },
-  { key: "instashop", terms: ["instashop"] },
-  { key: "shein", terms: ["shein"] },
-  { key: "google", terms: ["google"] },
-  { key: "microsoft", terms: ["microsoft"] },
-  { key: "nutopia", terms: ["nutopia", "sutherland"] },
-  { key: "fawry", terms: ["fawry"] },
-  { key: "paymob", terms: ["paymob"] },
-  { key: "geidea", terms: ["geidea"] },
-  { key: "basata", terms: ["basata"] },
-  { key: "elabd", terms: ["elabd", "el abd"] },
-  { key: "viacaffe", terms: ["via caffe", "viacaffe", "caffe"] },
-  { key: "wave", terms: ["wave"] }
-];
-
-function getMerchantAliasKey(desc) {
-  const raw = String(desc || "").toLowerCase();
-  const full = raw + " " + cleanMerchantName(desc);
-  for (const a of MERCHANT_ALIAS_GROUPS) {
-    if (a.terms.some(t => full.includes(t))) {
-      return a.key;
-    }
-  }
-  return null;
-}
-
 function hasMerchantKeywordOverlap(desc1, desc2) {
   const raw1 = String(desc1 || "").toLowerCase();
   const raw2 = String(desc2 || "").toLowerCase();
   const c1 = cleanMerchantName(desc1);
   const c2 = cleanMerchantName(desc2);
-  const full1 = raw1 + " " + c1;
-  const full2 = raw2 + " " + c2;
 
-  for (const a of MERCHANT_ALIAS_GROUPS) {
-    const has1 = a.terms.some(t => full1.includes(t));
-    const has2 = a.terms.some(t => full2.includes(t));
-    if (has1 && has2) return true;
+  const words1 = c1.match(/[a-z0-9\u0600-\u06FF]{4,}/g) || [];
+  const words2 = c2.match(/[a-z0-9\u0600-\u06FF]{4,}/g) || [];
+  if (
+    words1.some(w => words2.includes(w) || c2.includes(w)) ||
+    words2.some(w => words1.includes(w) || c1.includes(w))
+  ) {
+    return true;
   }
 
-  const words1 = c1.match(/[a-z0-9]{4,}/g) || [];
-  const words2 = c2.match(/[a-z0-9]{4,}/g) || [];
-  return words1.some(w => words2.includes(w) || c2.includes(w)) ||
-         words2.some(w => words1.includes(w) || c1.includes(w));
+  const gateways = ["fawry", "paymob", "geidea", "basata"];
+  const strip1 = c1.replace(/[^a-z0-9]/g, "");
+  const strip2 = c2.replace(/[^a-z0-9]/g, "");
+  if (gateways.includes(strip1) && raw2.includes(strip1)) return true;
+  if (gateways.includes(strip2) && raw1.includes(strip2)) return true;
+
+  return false;
 }
 
 function isNeglectedPayer(name) {
@@ -214,26 +180,20 @@ function isPaymentCreditDesc(desc) {
   return /\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|سداد|إيداع|تسوية)\b/i.test(String(desc || ""));
 }
 
-function normalizePersonName(name) {
+function normalizePersonName(name, optSettings) {
   if (!name) return "";
   // Strip any parenthetical suffix like (split), (Split), (cart), etc.
-  let cleaned = String(name).replace(/\s*\([^)]*\)/g, " ").replace(/[\u00A0\s]+/g, " ").trim();
+  const cleaned = String(name).replace(/\s*\([^)]*\)/g, " ").replace(/[\u00A0\s]+/g, " ").trim();
   if (!cleaned) return "";
 
   if (isNeglectedPayer(cleaned)) return "";
   const lower = cleaned.toLowerCase();
   if (lower === "shared") return "";
 
-  if (lower === "me" || lower === "myself" || lower === "ahmed" || lower === "mido") return "Mido";
-  if (lower === "abd" || lower === "abdelrahman" || lower === "abdo") return "Abdo";
-  if (lower === "zozza" || lower === "zoza") return "Zoza";
-  if (lower === "mohanad" || lower === "muhanad") return "Muhanad";
-  if (lower === "mom" || lower === "mum") return "Mum";
-  if (lower === "father" || lower === "dad") return "Dad";
-  if (lower === "nour" || lower === "nourween") return "Nourween";
-  if (lower === "mai") return "Mai";
-  if (lower === "hager") return "Hager";
-  if (lower === "nevin" || lower === "neveen") return "Nevin";
+  const aliasMap = (optSettings && optSettings.nameAliases) ? optSettings.nameAliases : getActiveNameAliasMap_();
+  if (aliasMap && aliasMap[lower]) {
+    return aliasMap[lower];
+  }
 
   return cleaned
     .toLowerCase()
@@ -336,7 +296,7 @@ function sanitizeTransactionDates(ss) {
 }
 
 function getAllUniquePayers(ss) {
-  const peopleSet = new Set(["Abdo", "Dad", "Mai", "Mido", "Muhanad", "Mum", "Zoza"]);
+  const peopleSet = new Set();
 
   const txSheet = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
   if (txSheet && txSheet.getLastRow() >= 2) {
@@ -356,6 +316,26 @@ function getAllUniquePayers(ss) {
         if (name && !isNeglectedPayer(name) && name.toLowerCase() !== "shared") peopleSet.add(name);
       });
     });
+  }
+
+  try {
+    const decisions = loadDecisions(ss);
+    Object.values(decisions.stmtAssign || {}).forEach(a => {
+      if (a && a.target && !a.isNeglected && !isNeglectedPayer(a.target)) {
+        splitPayerNames(a.target).forEach(name => { if (name) peopleSet.add(name); });
+      }
+    });
+    Object.values(decisions.instOverride || {}).forEach(o => {
+      if (o && o.target && !o.isNeglected && !isNeglectedPayer(o.target)) {
+        const cleaned = String(o.target).replace(/^✅\s*Billed\s+to\s+/i, "");
+        splitPayerNames(cleaned).forEach(name => { if (name) peopleSet.add(name); });
+      }
+    });
+  } catch (e) { }
+
+  const defFeePayer = getDefaultFeePayer(ss);
+  if (defFeePayer && !isNeglectedPayer(defFeePayer)) {
+    peopleSet.add(defFeePayer);
   }
 
   return Array.from(peopleSet).sort((a, b) => a.localeCompare(b));
@@ -634,7 +614,7 @@ function findSubsetCombination(items, targetAmt, maxK, tolerance) {
 // ==========================================
 
 function calculateCardBalance(ss, tz) {
-  const creditLimit = CONFIG.CREDIT_LIMIT;
+  const creditLimit = getEffectiveCreditLimit(ss);
   let billedBalance = 0;
   let statementDate = null;
   let statementDueDate = null;
@@ -824,6 +804,8 @@ function reconcileActiveStatement(ss, tz) {
   const instSheet = ss.getSheetByName(CONFIG.SHEETS.INSTALLMENTS);
 
   const decisions = loadDecisions(ss);
+  loadSettings(ss);
+  syncSettingsToDecisions(ss, decisions);
 
   if (!stmtSheet || stmtSheet.getLastRow() < 7) {
     return { error: "Please upload and process a bank statement to view active bill reconciliation." };
@@ -1211,9 +1193,10 @@ function reconcileActiveStatement(ss, tz) {
     });
   }
 
-  // 6. Fees Default to Mai (or restored from _Decisions)
+  // 6. Fees Default to configured defaultFeePayer (or restored from _Decisions)
+  const defaultFeePayer = getDefaultFeePayer(ss);
   applyTable2Decisions(stmtFees, {
-    defaultPayer: CONFIG.DEFAULT_FEE_PAYER,
+    defaultPayer: defaultFeePayer,
     defaultNote: () => "Bank Fee / Tax"
   });
 
@@ -1229,7 +1212,7 @@ function reconcileActiveStatement(ss, tz) {
 
   // 9. Refunds / Credits (payment credits neglected by default unless user assigns payer)
   applyTable2Decisions(stmtCredits, {
-    defaultPayer: cr => isPaymentCreditDesc(cr.desc) ? "🚫 Neglect / Ignore" : CONFIG.DEFAULT_FEE_PAYER,
+    defaultPayer: cr => isPaymentCreditDesc(cr.desc) ? "🚫 Neglect / Ignore" : defaultFeePayer,
     defaultNote: cr => isPaymentCreditDesc(cr.desc)
       ? "Bill Payment / Settlement (Neglected by default)"
       : "Merchant Refund (Reduces Debt)"
@@ -1383,7 +1366,7 @@ function buildDebtLedger(ss, tz, recon) {
     }
   });
 
-  // 3. Attributed Fees (Default: Mai or overridden)
+  // 3. Attributed Fees (Default: configured defaultFeePayer or overridden)
   let unassignedTotal = 0;
   let unassignedCount = 0;
   let unresolvedFeesCount = 0;
@@ -1597,6 +1580,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
   const totShareRow = bounds.totShareRow;
 
   // Build Unified Table 2 Needs Pairing & Statement Review Items
+  const defaultFeePayer = getDefaultFeePayer(ss);
   const exceptionItems = [];
   recon.stmtFees.forEach((f, idx) => {
     exceptionItems.push({
@@ -1606,7 +1590,7 @@ function renderActiveReconciliationSheet(ss, tz, ledger, recon) {
       desc: f.desc,
       amount: f.amount,
       category: "Bank Fee / Tax",
-      assignedPayer: f.assignedPayer || CONFIG.DEFAULT_FEE_PAYER,
+      assignedPayer: f.assignedPayer || defaultFeePayer,
       suggestedPairs: [],
       note: f.note || "Auto-assigned fee"
     });
@@ -2774,6 +2758,20 @@ function onEdit(e) {
   const col = e.range.getColumn();
   const row = e.range.getRow();
 
+  if (sheetName === CONFIG.SHEETS.SETTINGS) {
+    invalidateSettingsCache_();
+    loadSettings(ss);
+    if (row === 6 && col === 2) {
+      const val = e.range.getValue();
+      const clean = formatPayerCell(val);
+      if (clean !== val) e.range.setValue(clean);
+      invalidateSettingsCache_();
+    } else if (row >= 6 && col >= 7 && col <= 9) {
+      syncSettingsToDecisions(ss, null, { replaceAll: true });
+    }
+    return;
+  }
+
   if (sheetName === CONFIG.SHEETS.TRANSACTIONS && row >= 2) {
     if (col >= 1 && col <= 5) {
       try { ensureSingleRowId(ss, sheet, 1, 6, row, "T"); } catch (err) { }
@@ -2790,6 +2788,7 @@ function onEdit(e) {
       return;
     }
     if (col === 4) {
+      loadSettings(ss);
       const val = e.range.getValue();
       const clean = formatPayerCell(val);
       if (clean !== val) e.range.setValue(clean);
@@ -2803,6 +2802,7 @@ function onEdit(e) {
       try { ensureSingleRowId(ss, sheet, 1, 12, row, "I"); } catch (err) { }
     }
     if (col === 9) {
+      loadSettings(ss);
       const val = e.range.getValue();
       const clean = formatPayerCell(val);
       if (clean !== val) e.range.setValue(clean);
@@ -2861,6 +2861,8 @@ function updateLiveDashboard(options) {
   const ss = (options && options.ss) || SpreadsheetApp.getActiveSpreadsheet();
   const tz = ss.getSpreadsheetTimeZone() || "Africa/Cairo";
 
+  invalidateSettingsCache_();
+  loadSettings(ss);
   cleanupDeprecatedSheets(ss);
   sanitizeAllPayerNames(ss);
   sanitizeTransactionDates(ss);
@@ -3000,11 +3002,14 @@ function buildAnonymizedFixture(ss, tz) {
 
   // 1. Deterministic Person Anonymizer (P1..Pn)
   const rawNames = new Set();
-  const knownAliases = [
-    "me", "myself", "ahmed", "mido", "abd", "abdelrahman", "abdo",
-    "zozza", "zoza", "mohanad", "muhanad", "mom", "mum", "father", "dad",
-    "nour", "nourween", "mai", "hager", "nevin", "neveen"
-  ];
+  const settings = loadSettings(ss);
+  const aliasKeys = [];
+  if (settings && settings.nameAliases) {
+    Object.keys(settings.nameAliases).forEach(k => {
+      aliasKeys.push(k);
+      aliasKeys.push(settings.nameAliases[k]);
+    });
+  }
   function collectPayers(val) {
     splitPayerNames(val).forEach(p => {
       if (p) rawNames.add(p);
@@ -3019,7 +3024,8 @@ function buildAnonymizedFixture(ss, tz) {
       }
     });
   }
-  collectPayers(CONFIG.DEFAULT_FEE_PAYER);
+  const activeDefaultFeePayer = getDefaultFeePayer(ss);
+  collectPayers(activeDefaultFeePayer);
   (ledger.personShares || []).forEach(ps => collectPayers(ps.person));
   txRaw.forEach(r => collectDataPayers(r[3]));
   instRaw.forEach(r => collectDataPayers(r[8]));
@@ -3051,7 +3057,7 @@ function buildAnonymizedFixture(ss, tz) {
   });
 
   function mapPerson(name) {
-    const norm = normalizePersonName(name);
+    const norm = normalizePersonName(name, settings);
     if (!norm) return "";
     if (!personMap[norm]) {
       const nextIdx = Object.keys(personMap).length + 1;
@@ -3075,9 +3081,9 @@ function buildAnonymizedFixture(ss, tz) {
   }
 
   // Build regex tokens for scrubbing person names embedded inside item descriptions
-  const nameTokens = new Set([...sortedPeople, ...knownAliases]);
+  const nameTokens = new Set([...sortedPeople, ...aliasKeys]);
   const escapedTokens = Array.from(nameTokens)
-    .filter(t => t && t.length >= 3 && t !== "me" && t !== "abd")
+    .filter(t => t && t.length >= 3 && t !== "me")
     .sort((a, b) => b.length - a.length)
     .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
   const embeddedNameRegex = escapedTokens.length > 0
@@ -3085,27 +3091,33 @@ function buildAnonymizedFixture(ss, tz) {
     : null;
 
   // 2. Lossless Merchant Anonymizer (MERCH01..)
-  // Pre-seed equivalent CLEAN buckets for pairs that matched by keyword overlap during recon
+  // Pre-seed equivalent CLEAN buckets for pairs that matched via overlap or merchant alias
   const cleanEquivalent = {};
-  function cleanBaseForKey(str) {
+  function normalizeForAnonBucket_(str) {
     let b = String(str || "");
     if (embeddedNameRegex) b = b.replace(embeddedNameRegex, "$1MEMBER");
     b = b.replace(/\b(\d+)\s+(?:OF|\/)\s+(\d+)\b/gi, " ")
       .replace(/\(\d+\s+of\s+\d+\)/gi, " ")
       .replace(/\(\d+\/\d+\s+Paid\)/gi, " ")
       .replace(/\(Split\s+\d+\/\d+\)/gi, " ")
+      .replace(/\b(?:THANK\s*YOU|MOBILE\s*TOKEN)\b/gi, " ")
       .replace(/\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|REFUND|CASHBACK|CASH\s*BACK|REVERSAL|REVERSED|DCC\s*MARKUP\s*FEES?|DCC\s*MARKUP|STAMP\s*TAX|STAMP\s*DUTY|FINANCE\s*CHARGE|INTEREST\s*CHARGE|LATE\s*PAYMENT|ANNUAL\s*MEMBERSHIP|FEES?)\b/gi, " ")
-      .replace(/\b\d{3,}[-\s]\d{3,}\b/g, " ")
+      .replace(/\b\d{3,}[-\s]?\d{3,}\b/g, " ")
       .replace(/\b\d{5,}\b/g, " ");
-    const cl = cleanMerchantName(b).replace(/\d+/g, " ").replace(/[^\w\u0600-\u06FF]+/g, " ").replace(/\s+/g, " ").trim();
-    return cl || makeNormDesc(b);
+    return cleanMerchantName(b)
+      .replace(/\d+/g, " ")
+      .replace(/[^\w\u0600-\u06FF]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  function cleanBaseForKey(str) {
+    return normalizeForAnonBucket_(str) || makeNormDesc(str);
   }
   (recon.stmtDebits || []).forEach(st => {
     if (!st.matched || !st.matchedItems) return;
-    if (getMerchantAliasKey(st.desc)) return;
     const stClean = cleanBaseForKey(st.desc);
     st.matchedItems.forEach(tx => {
-      if (!getMerchantAliasKey(tx.desc) && hasMerchantKeywordOverlap(st.desc, tx.desc)) {
+      if (hasMerchantMatch(st.desc, tx.desc, recon.decisions)) {
         const txClean = cleanBaseForKey(tx.desc);
         if (txClean && stClean && txClean !== stClean) {
           cleanEquivalent[txClean] = stClean;
@@ -3146,41 +3158,16 @@ function buildAnonymizedFixture(ss, tz) {
     else if (/\bLATE\s*PAYMENT\b/i.test(raw)) bankKeywords.push("LATE PAYMENT");
     else if (/\bANNUAL\s*MEMBERSHIP\b/i.test(raw)) bankKeywords.push("ANNUAL MEMBERSHIP");
 
-    const isUnr = /nutopia|sutherland|google\s*one|unr_/i.test(raw);
-    let stripped = raw
-      .replace(/\b(\d+)\s+(?:OF|\/)\s+(\d+)\b/gi, " ")
-      .replace(/\(\d+\s+of\s+\d+\)/gi, " ")
-      .replace(/\(\d+\/\d+\s+Paid\)/gi, " ")
-      .replace(/\(Split\s+\d+\/\d+\)/gi, " ")
-      .replace(/\b(?:THANK\s*YOU|MOBILE\s*TOKEN)\b/gi, " ")
-      .replace(/\b(?:PAYMENT|DIRECT\s*DEBIT|SETTLEMENT|DEPOSIT|REFUND|CASHBACK|CASH\s*BACK|REVERSAL|REVERSED|DCC\s*MARKUP\s*FEES?|DCC\s*MARKUP|STAMP\s*TAX|STAMP\s*DUTY|FINANCE\s*CHARGE|INTEREST\s*CHARGE|LATE\s*PAYMENT|ANNUAL\s*MEMBERSHIP|FEES?)\b/gi, " ")
-      .replace(/[\-\*\".,\/]+/g, " ")
-      .replace(/\b\d{3,}[-\s]?\d{3,}\b/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    if (embeddedNameRegex) {
-      stripped = stripped.replace(embeddedNameRegex, "$1MEMBER").replace(/\s+/g, " ").trim();
-    }
+    const isUnr = /\bunr_/i.test(raw);
+    const cleaned = normalizeForAnonBucket_(raw);
 
     // Pure bank fee or pure generic bank payment line with no merchant name
-    if ((!stripped || /^(?:egy|cairo|alex|giza|thank\s*you)$/i.test(stripped)) && bankKeywords.length > 0) {
+    if (!cleaned && bankKeywords.length > 0) {
       return `${bankKeywords.join(" ")}${instSuffix}${parenSuffix}`.trim();
     }
 
-    const aliasKey = getMerchantAliasKey(raw);
-    let bucketKey;
-    if (aliasKey) {
-      bucketKey = `ALIAS:${aliasKey}`;
-    } else {
-      const cleaned = cleanMerchantName(stripped)
-        .replace(/\d+/g, " ")
-        .replace(/[^\w\u0600-\u06FF]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-      const canonical = cleanEquivalent[cleaned] || cleaned;
-      bucketKey = canonical ? `CLEAN:${canonical}` : `RAW:${makeNormDesc(stripped || raw)}`;
-    }
+    const canonical = cleanEquivalent[cleaned] || cleaned;
+    const bucketKey = canonical ? `CLEAN:${canonical}` : `RAW:${makeNormDesc(raw)}`;
 
     if (!merchantMap[bucketKey]) {
       const tag = `MERCH${String(nextMerchNum++).padStart(2, "0")}`;
@@ -3338,7 +3325,7 @@ function buildAnonymizedFixture(ss, tz) {
     cycleKey: ledger.activeCycleKey,
     cycleLabel: ledger.activeCycleLabel,
     timeZone: targetTz,
-    defaultFeePayer: mapPerson(CONFIG.DEFAULT_FEE_PAYER),
+    defaultFeePayer: mapPerson(activeDefaultFeePayer),
     exportedAt: new Date().toISOString(),
     bankStatement: {
       meta: {
@@ -3408,6 +3395,7 @@ function onOpen() {
     .addItem("⚡ Apply Payment Date to Installments Now", "applyPaymentDateNow")
     .addItem("✅ Verify & Record Bill Payment...", "recordActiveBillPaymentPrompt")
     .addItem("🔒 Close Active Statement to History...", "menuCloseActiveStatement")
+    .addItem("⚙️ Open / Create Settings Sheet", "menuOpenSettingsSheet")
     .addSeparator()
     .addItem("🧪 Export Anonymized Test Fixture", "menuExportAnonymizedFixture")
     .addToUi();

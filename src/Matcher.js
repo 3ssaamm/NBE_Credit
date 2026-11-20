@@ -30,7 +30,7 @@ function daysBetweenDates(d1, d2) {
 
 function isDedicatedUnrecordedMerchant(desc) {
   const d = String(desc || "").toLowerCase();
-  return d.includes("nutopia") || d.includes("sutherland") || d.includes("google one") || d.includes("stamp tax") || d.includes("unr_");
+  return d.includes("stamp tax") || d.includes("stamp duty") || d.includes("finance charge") || d.includes("unr_");
 }
 
 function extractLearnableMerchantKey(desc) {
@@ -191,6 +191,7 @@ function matchStatementDebits(stmtDebits, txDebits, decisions, tz) {
 
   stmtDebits.forEach(st => {
     if (st.matched || isDedicatedUnrecordedMerchant(st.desc)) return;
+    if (st.stmtId && decisions && decisions.stmtAssign && decisions.stmtAssign[st.stmtId]) return;
 
     const candByKey = {};
     function pushCandidate(txs, score, reason) {

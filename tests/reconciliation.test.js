@@ -348,6 +348,13 @@ assert.ok(creditsFinal.every(r => r.payer === "Mido"), "Both credit rows from mu
 const ss6 = new MockSpreadsheet();
 setActiveSpreadsheet(ss6);
 
+const settings6 = sandbox.getOrCreateSettingsSheet(ss6);
+settings6.getRange(6, 7, 2, 3).setValues([
+  ["bazlykwa", "basilico", "test"],
+  ["el abd", "elabd", "test"]
+]);
+sandbox.invalidateSettingsCache_();
+
 const stmt6 = ss6.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
 stmt6.getRange(2, 1, 3, 6).setValues([
   ["Statement Date:", new Date(2026, 9, 30, 12, 0, 0), "Due Date:", new Date(2026, 10, 25, 12, 0, 0), "Credit Limit:", 100000],
@@ -464,6 +471,13 @@ assert.ok(instFormula6.includes("MAP(") && instFormula6.includes("LAMBDA(") && i
 const ss7 = new MockSpreadsheet();
 setActiveSpreadsheet(ss7);
 
+const settings7 = sandbox.getOrCreateSettingsSheet(ss7);
+settings7.getRange(6, 7, 2, 3).setValues([
+  ["bazlykwa", "basilico", "test"],
+  ["sahl", "rabbit", "test"]
+]);
+sandbox.invalidateSettingsCache_();
+
 const stmt7 = ss7.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
 stmt7.getRange(2, 1, 3, 6).setValues([
   ["Statement Date:", new Date(2026, 9, 30, 12, 0, 0), "Due Date:", new Date(2026, 10, 25, 12, 0, 0), "Credit Limit:", 100000],
@@ -526,6 +540,9 @@ assert.strictEqual(shares7["Muhanad"], 195.00, `Muhanad purchases mismatch: ${sh
 // ==========================================
 const ss8 = new MockSpreadsheet();
 setActiveSpreadsheet(ss8);
+const settings8 = sandbox.getOrCreateSettingsSheet(ss8);
+settings8.getRange("B6").setValue("Mai");
+sandbox.invalidateSettingsCache_();
 const stmt8 = ss8.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
 stmt8.getRange(2, 1, 3, 6).setValues([
   ["Statement Date:", new Date(2026, 9, 31, 12, 0, 0), "Due Date:", new Date(2026, 10, 27, 12, 0, 0), "Credit Limit:", 100000],
@@ -556,7 +573,7 @@ for (let r = 12; r <= ar8.getLastRow(); r++) {
 assert.strictEqual(cRows8.length, 3, `All 3 credits must be shown in Table 2, got ${cRows8.length}`);
 assert.strictEqual(cRows8[0].payer, "🚫 Neglect / Ignore", "Payment credit C-1 should default to Neglect");
 assert.strictEqual(cRows8[1].payer, "🚫 Neglect / Ignore", "Settlement credit C-2 should default to Neglect");
-assert.strictEqual(cRows8[2].payer, CONFIG.DEFAULT_FEE_PAYER, "Refund credit C-3 should default to DEFAULT_FEE_PAYER");
+assert.strictEqual(cRows8[2].payer, sandbox.getDefaultFeePayer(ss8), "Refund credit C-3 should default to configured Default Fee Payer");
 assert.strictEqual(Number(ledger8.refundsTotal.toFixed(2)), 200.00, "Only non-neglected credit (200) should count initially");
 
 ar8._setCell(cRows8[1].row, 6, "Mido");
@@ -570,7 +587,7 @@ ledger8 = sandbox.buildDebtLedger(ss8, tz, recon8);
 sandbox.renderActiveReconciliationSheet(ss8, tz, ledger8, recon8);
 
 const midoShare8 = ledger8.personShares.find(ps => ps.person === "Mido");
-const maiShare8 = ledger8.personShares.find(ps => ps.person === CONFIG.DEFAULT_FEE_PAYER);
+const maiShare8 = ledger8.personShares.find(ps => ps.person === sandbox.getDefaultFeePayer(ss8));
 assert.strictEqual(Number(midoShare8.refunds.toFixed(2)), 400.00, "Mido should receive C-2 (400.00) credit after refresh");
 assert.strictEqual(Number(maiShare8.refunds.toFixed(2)), 0.00, "Mai should have 0.00 credit after neglecting C-3");
 assert.strictEqual(Number(ledger8.refundsTotal.toFixed(2)), 400.00, "Total refunds should be 400.00");

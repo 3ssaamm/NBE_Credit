@@ -1008,7 +1008,9 @@ function getOrCreateFolder(parent, name) {
 }
 
 function checkAndProcessNewStatements() {
-  const rootFolder = getOrCreateFolder(null, CONFIG.FOLDER_NAME);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const folderName = getEffectiveFolderName(ss);
+  const rootFolder = getOrCreateFolder(null, folderName);
   const processedFolder = getOrCreateFolder(rootFolder, CONFIG.PROCESSED_SUBFOLDER);
 
   const files = rootFolder.getFiles();
@@ -1042,7 +1044,6 @@ function checkAndProcessNewStatements() {
   const result = { processedCount: 0, processedFiles: [], tieOutResults: [], hasTieOutFailure: false };
   if (pdfFiles.length === 0) return result;
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
   pdfFiles.forEach(file => {
     const text = extractTextFromPDF(file);
     const parsed = parseNBEStatementText(text);

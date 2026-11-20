@@ -7,6 +7,11 @@ const { sandbox, CONFIG, setActiveSpreadsheet } = createGasSandbox();
 const ss = new MockSpreadsheet();
 setActiveSpreadsheet(ss);
 
+const settingsSheet = sandbox.getOrCreateSettingsSheet(ss);
+settingsSheet.getRange("B6").setValue("Mai");
+settingsSheet.getRange(6, 4, 1, 2).setValues([["ahmed", "Mido"]]);
+sandbox.invalidateSettingsCache_();
+
 const stmtSheet = ss.insertSheet(CONFIG.SHEETS.BANK_STATEMENT);
 stmtSheet.getRange(2, 1, 3, 6).setValues([
   ["Statement Date:", new Date(2026, 9, 31, 12, 0, 0), "Due Date:", new Date(2026, 10, 27, 12, 0, 0), "Credit Limit:", 100000],

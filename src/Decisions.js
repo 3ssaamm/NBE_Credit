@@ -987,6 +987,9 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
         txDescs,
         "Learned from " + subjectId + " <-> " + txIds.join("+")
       );
+      if (learned && learned.learned) {
+        syncDecisionsMerchantAliasesToSettings(ss, decisions);
+      }
       if (forceStyle) {
         try { sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID); } catch (e) { }
       }
@@ -1050,7 +1053,8 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
       if (!payer) return noChange;
       const existing = decisions.stmtAssign && decisions.stmtAssign[subjectId];
       if (!existing) {
-        if ((prefix === "F" || (prefix === "C" && !isPaymentCreditDesc(origDesc))) && payer === CONFIG.DEFAULT_FEE_PAYER) {
+        const defaultFeePayer = getDefaultFeePayer(sheet.getParent());
+        if ((prefix === "F" || (prefix === "C" && !isPaymentCreditDesc(origDesc))) && defaultFeePayer && payer === defaultFeePayer) {
           return noChange;
         }
         if (prefix === "C" && isPaymentCreditDesc(origDesc) && isNeglectedPayer(payer)) {
@@ -1115,6 +1119,9 @@ function processActiveReconRowChange(sheet, allRows, row, decisions, tz, options
         [String(rowVals[2] || "").trim()],
         "Learned from " + stmtId + " <-> " + baseTxId
       );
+      if (learned && learned.learned) {
+        syncDecisionsMerchantAliasesToSettings(ss, decisions);
+      }
       if (forceStyle) {
         try { sheet.getRange(row, 1, 1, 8).setBackground(CONFIG.COLORS.PAID); } catch (e) { }
       }
